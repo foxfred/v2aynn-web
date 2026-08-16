@@ -57,11 +57,12 @@ func Fetch(cfg *config.Config) {
 
 	cfg.Lock()
 	// Preserve ping data and find old ActiveNode key
+	// 注意：保留所有非零 ping（含 -1 超时标记），否则 fetch 刷新后超时节点会退化为"未测"，导致排序变动
 	oldPings := make(map[string]int)
 	oldActiveKey := ""
 	for _, n := range cfg.Nodes {
 		key := n.Server + ":" + n.Port + ":" + n.Protocol
-		if n.Ping > 0 {
+		if n.Ping != 0 {
 			oldPings[key] = n.Ping
 		}
 		if n.ID == cfg.ActiveNode {

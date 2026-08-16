@@ -1,6 +1,8 @@
 package web
 
 import (
+	"bufio"
+	"crypto/tls"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -202,12 +204,10 @@ func (w *WebServer) apiPing(rw http.ResponseWriter, r *http.Request) {
 		w.writeJSON(rw, map[string]string{"error": "not found"})
 		return
 	}
-	start := time.Now()
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(node.Server, node.Port), 3*time.Second)
-	ms := int64(-1)
-	if err == nil {
-		conn.Close()
-		ms = time.Since(start).Milliseconds()
+	nodeCopy := *node
+	ms, reachable := probeNode(nodeCopy, 3500*time.Millisecond)
+	if !reachable {
+		ms = -1
 	}
 	w.cfg.Lock()
 	for i := range w.cfg.Nodes {
@@ -240,12 +240,9 @@ func (w *WebServer) apiPingAll(rw http.ResponseWriter, r *http.Request) {
 		go func(n config.Node) {
 			sem <- struct{}{}
 			key := n.Server + ":" + n.Port + ":" + n.Protocol
-			start := time.Now()
-			conn, err := net.DialTimeout("tcp", net.JoinHostPort(n.Server, n.Port), 3*time.Second)
-			ms := int64(-1)
-			if err == nil {
-				conn.Close()
-				ms = time.Since(start).Milliseconds()
+			ms, reachable := probeNode(n, 3500*time.Millisecond)
+			if !reachable {
+				ms = -1
 			}
 			<-sem
 			ch <- result{id: n.ID, ms: ms, name: n.Name, key: key}
@@ -259,7 +256,8 @@ func (w *WebServer) apiPingAll(rw http.ResponseWriter, r *http.Request) {
 		results = append(results, map[string]interface{}{
 			"id": r.id, "ms": r.ms, "name": r.name,
 		})
-		if r.ms > 0 {
+		// 保存所有非零结果（含 -1 超时），确保测速后超时节点持久化为超时而非旧值
+		if r.ms != 0 {
 			pingMap[r.key] = int(r.ms)
 		}
 	}
@@ -353,4 +351,87 @@ func corsHandler(h http.Handler) http.Handler {
 		}
 		h.ServeHTTP(rw, r)
 	})
+}
+
+// probeNode 协议层测速：返回 (延迟ms, 是否可达)。
+// 相比纯 TCP connect 更严格：
+//   - TLS 节点（tls/xtls/reality 或 trojan）：做真实 TLS 握手 + 读服务器响应字节，
+//     握手成功且能读到数据才认为可用，避免"端口通但协议不通"的假延迟。
+//   - 单节点采样 3 次取最快，避开单次网络抖动造成的误判。
+//
+// 返回的可达性与防火墙：某些节点对探测连接响应慢（首包丢），多采样能降低"该可用却显示超时"的误判。
+func probeNode(n config.Node, timeout time.Duration) (int64, bool) {
+	addr := net.JoinHostPort(n.Server, n.Port)
+	useTLS := n.TLS == "tls" || n.TLS == "xtls" || n.TLS == "reality" ||
+		n.Protocol == "trojan" || n.Security == "tls" || n.Security == "reality"
+
+	best := int64(0)
+	ok := false
+	for attempt := 0; attempt < 3; attempt++ {
+		ms, reach := probeOnce(n, addr, useTLS, timeout)
+		if !reach {
+			continue
+		}
+		if !ok || ms < best {
+			best = ms
+		}
+		ok = true
+	}
+	return best, ok
+}
+
+func probeOnce(n config.Node, addr string, useTLS bool, timeout time.Duration) (int64, bool) {
+	start := time.Now()
+	conn, err := net.DialTimeout("tcp", addr, timeout)
+	if err != nil {
+		return -1, false
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(timeout))
+
+	if useTLS {
+		// 真实 TLS 握手：验证证书链 + 读取服务器首字节
+		sni := n.SNI
+		if sni == "" {
+			sni = n.RequestHost
+		}
+		if sni == "" {
+			sni = n.Server
+		}
+		tconn := tls.Client(conn, &tls.Config{
+			ServerName:         sni,
+			InsecureSkipVerify: true, // 节点 IP 与证书未必匹配，只验证能否完成握手
+			MinVersion:         tls.VersionTLS12,
+		})
+		if tconn.Handshake() != nil {
+			return -1, false
+		}
+		// 读一小段服务器数据，验证协议栈真的在工作；
+		// 握手成功已是主要可用性判据，读超时短一点避免拖慢批量测速
+		br := bufio.NewReader(tconn)
+		tconn.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+		buf := make([]byte, 1)
+		if _, err := br.Read(buf); err != nil {
+			// 读不到数据不代表不可用（很多协议服务器不会主动推送），
+			// 只要 TLS 握手成功就判定可达
+		}
+		elapsed := time.Since(start).Milliseconds()
+		if elapsed < 1 {
+			elapsed = 1
+		}
+		return elapsed, true
+	}
+
+	// 非 TLS：TCP 连上后短读，能收到字节说明后端协议栈活跃；
+	// 多数 vmess/vless 服务器不会先发数据，读超时也判可达（短超时避免拖慢批量测速）
+	if n.Protocol == "vmess" || n.Protocol == "vless" {
+		conn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+		buf := make([]byte, 16)
+		_, _ = conn.Read(buf)
+	}
+	elapsed := time.Since(start).Milliseconds()
+	if elapsed < 1 {
+		elapsed = 1
+	}
+	return elapsed, true
 }

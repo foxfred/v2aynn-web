@@ -13,11 +13,13 @@ import (
 )
 
 type Manager struct {
-	mu      sync.Mutex
-	cfg     *config.Config
-	dataDir string
-	cmd     *exec.Cmd
-	running bool
+	mu          sync.Mutex
+	cfg         *config.Config
+	dataDir     string
+	cmd         *exec.Cmd
+	running     bool
+	activeName  string // 缓存实际启动节点的名称，避免依赖 cfg.Nodes 反查
+	activeNodeID string
 }
 
 func NewManager(dataDir string) *Manager {
@@ -56,6 +58,9 @@ func (m *Manager) Start() error {
 	if node == nil {
 		return fmt.Errorf("激活节点(%s)不在节点列表中", m.cfg.ActiveNode)
 	}
+	// 缓存实际启动节点信息，供 Status 状态栏显示，避免受 Fetch 后台刷新影响
+	m.activeName = node.Name
+	m.activeNodeID = node.ID
 
 	v2cfg := generateConfig(node, m.cfg.SocksPort, m.cfg.HttpPort, m.cfg.ProxyMode)
 	cfgPath := m.dataDir + "/v2ray.json"
@@ -117,15 +122,18 @@ func (m *Manager) SwitchNode(id string) error {
 func (m *Manager) Status() map[string]interface{} {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	activeName := ""
-	m.cfg.Lock()
-	for _, n := range m.cfg.Nodes {
-		if n.ID == m.cfg.ActiveNode {
-			activeName = n.Name
-			break
+	// 优先用缓存的启动节点名；兜底再反查 cfg.Nodes
+	activeName := m.activeName
+	if activeName == "" {
+		m.cfg.Lock()
+		for _, n := range m.cfg.Nodes {
+			if n.ID == m.cfg.ActiveNode {
+				activeName = n.Name
+				break
+			}
 		}
+		m.cfg.Unlock()
 	}
-	m.cfg.Unlock()
 	return map[string]interface{}{
 		"running":    m.running,
 		"activeNode": m.cfg.ActiveNode,

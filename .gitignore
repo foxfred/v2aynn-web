@@ -1,10 +1,11 @@
 # 构建产物
 v2aynn-web
 v2aynn-web.exe
+v2aynn-web.exe~
 v2aynn-web.log
 v2aynn-web.pid
 
-# 本地运行数据
+# 本地运行与测试数据
 data/
 sim-data/
 pkg/
