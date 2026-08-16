@@ -354,26 +354,23 @@ func corsHandler(h http.Handler) http.Handler {
 }
 
 // probeNode 测速：返回 (延迟ms, 是否可达)。
-// 方案：TCP 连接 + (若启用TLS)真实握手。3 次采样取最快。
-// 相比"临时起xray进程做HTTP探测"更轻、更快，不会在低配电视盒子上全部超时。
+// 方案：TCP 连接 + (若启用TLS)真实握手。
+// 采样策略：首次成功立即返回（快的节点一次搞定）；仅失败时重试一次，
+// 显著加快全量测速，避免每个节点的 3 次等待叠加。
 func probeNode(n config.Node, timeout time.Duration) (int64, bool) {
 	addr := net.JoinHostPort(n.Server, n.Port)
 	useTLS := n.TLS == "tls" || n.TLS == "xtls" || n.TLS == "reality" ||
 		n.Protocol == "trojan" || n.Security == "tls" || n.Security == "reality"
 
-	best := int64(0)
-	ok := false
-	for attempt := 0; attempt < 3; attempt++ {
-		ms, reach := probeOnce(n, addr, useTLS, timeout)
-		if !reach {
-			continue
-		}
-		if !ok || ms < best {
-			best = ms
-		}
-		ok = true
+	// 第一次尝试
+	if ms, reach := probeOnce(n, addr, useTLS, timeout); reach {
+		return ms, true
 	}
-	return best, ok
+	// 首次失败（可能瞬时网络抖动），再试一次
+	if ms, reach := probeOnce(n, addr, useTLS, timeout); reach {
+		return ms, true
+	}
+	return -1, false
 }
 
 func probeOnce(n config.Node, addr string, useTLS bool, timeout time.Duration) (int64, bool) {
