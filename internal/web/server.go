@@ -353,13 +353,9 @@ func corsHandler(h http.Handler) http.Handler {
 	})
 }
 
-// probeNode 协议层测速：返回 (延迟ms, 是否可达)。
-// 相比纯 TCP connect 更严格：
-//   - TLS 节点（tls/xtls/reality 或 trojan）：做真实 TLS 握手 + 读服务器响应字节，
-//     握手成功且能读到数据才认为可用，避免"端口通但协议不通"的假延迟。
-//   - 单节点采样 3 次取最快，避开单次网络抖动造成的误判。
-//
-// 返回的可达性与防火墙：某些节点对探测连接响应慢（首包丢），多采样能降低"该可用却显示超时"的误判。
+// probeNode 测速：返回 (延迟ms, 是否可达)。
+// 方案：TCP 连接 + (若启用TLS)真实握手。3 次采样取最快。
+// 相比"临时起xray进程做HTTP探测"更轻、更快，不会在低配电视盒子上全部超时。
 func probeNode(n config.Node, timeout time.Duration) (int64, bool) {
 	addr := net.JoinHostPort(n.Server, n.Port)
 	useTLS := n.TLS == "tls" || n.TLS == "xtls" || n.TLS == "reality" ||
@@ -390,7 +386,7 @@ func probeOnce(n config.Node, addr string, useTLS bool, timeout time.Duration) (
 	conn.SetDeadline(time.Now().Add(timeout))
 
 	if useTLS {
-		// 真实 TLS 握手：验证证书链 + 读取服务器首字节
+		// TLS 握手验证：能完成握手说明节点的 TLS 层真实可用
 		sni := n.SNI
 		if sni == "" {
 			sni = n.RequestHost
@@ -400,21 +396,16 @@ func probeOnce(n config.Node, addr string, useTLS bool, timeout time.Duration) (
 		}
 		tconn := tls.Client(conn, &tls.Config{
 			ServerName:         sni,
-			InsecureSkipVerify: true, // 节点 IP 与证书未必匹配，只验证能否完成握手
+			InsecureSkipVerify: true, // 节点IP与证书未必匹配，只验证握手
 			MinVersion:         tls.VersionTLS12,
 		})
-		if tconn.Handshake() != nil {
+		if err := tconn.Handshake(); err != nil {
 			return -1, false
 		}
-		// 读一小段服务器数据，验证协议栈真的在工作；
-		// 握手成功已是主要可用性判据，读超时短一点避免拖慢批量测速
+		// 读服务器首字节验证协议栈活跃；多数服务器不会主动推送，超时也算可达
 		br := bufio.NewReader(tconn)
-		tconn.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
-		buf := make([]byte, 1)
-		if _, err := br.Read(buf); err != nil {
-			// 读不到数据不代表不可用（很多协议服务器不会主动推送），
-			// 只要 TLS 握手成功就判定可达
-		}
+		tconn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+		_, _ = br.ReadByte()
 		elapsed := time.Since(start).Milliseconds()
 		if elapsed < 1 {
 			elapsed = 1
@@ -422,11 +413,10 @@ func probeOnce(n config.Node, addr string, useTLS bool, timeout time.Duration) (
 		return elapsed, true
 	}
 
-	// 非 TLS：TCP 连上后短读，能收到字节说明后端协议栈活跃；
-	// 多数 vmess/vless 服务器不会先发数据，读超时也判可达（短超时避免拖慢批量测速）
+	// 非 TLS：TCP 连上即认为可达（vless/vmess 服务器不会主动推送数据）
 	if n.Protocol == "vmess" || n.Protocol == "vless" {
-		conn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
-		buf := make([]byte, 16)
+		conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		buf := make([]byte, 1)
 		_, _ = conn.Read(buf)
 	}
 	elapsed := time.Since(start).Milliseconds()

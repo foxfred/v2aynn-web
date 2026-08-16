@@ -13,18 +13,22 @@ import (
 )
 
 type Manager struct {
-	mu          sync.Mutex
-	cfg         *config.Config
-	dataDir     string
-	cmd         *exec.Cmd
-	running     bool
-	activeName  string // 缓存实际启动节点的名称，避免依赖 cfg.Nodes 反查
+	mu           sync.Mutex
+	cfg          *config.Config
+	dataDir      string
+	xrayBin      string
+	cmd          *exec.Cmd
+	running      bool
+	activeName   string // 缓存实际启动节点的名称，避免依赖 cfg.Nodes 反查
 	activeNodeID string
 }
 
 func NewManager(dataDir string) *Manager {
-	return &Manager{dataDir: dataDir}
+	return &Manager{dataDir: dataDir, xrayBin: "/usr/local/bin/xray"}
 }
+
+// SetXrayBin 覆盖 xray 二进制路径（测试或异常环境下使用）
+func (m *Manager) SetXrayBin(p string) { m.xrayBin = p }
 
 func (m *Manager) SetConfig(cfg *config.Config) {
 	m.cfg = cfg
@@ -72,7 +76,7 @@ func (m *Manager) Start() error {
 		return err
 	}
 
-	m.cmd = exec.Command("/usr/local/bin/xray", "-config", cfgPath)
+	m.cmd = exec.Command(m.xrayBin, "-config", cfgPath)
 	if err := m.cmd.Start(); err != nil {
 		return err
 	}

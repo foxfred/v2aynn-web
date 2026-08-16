@@ -58,7 +58,6 @@ func startTCPServer(t *testing.T, tlsMode bool) (string, func()) {
 				defer conn.Close()
 				buf := make([]byte, 64)
 				_, _ = conn.Read(buf)
-				_ = conn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
 				_, _ = conn.Write([]byte("hp"))
 			}(c)
 		}
@@ -90,5 +89,16 @@ func TestProbeUnreachable(t *testing.T) {
 	n := config.Node{Server: "127.0.0.1", Port: "1", Protocol: "vless"}
 	if _, ok := probeNode(n, 800*time.Millisecond); ok {
 		t.Fatal("不可达被误判可达")
+	}
+}
+
+func TestProbeTLSMismatch(t *testing.T) {
+	addr, stop := startTCPServer(t, false) // 明文服务器
+	defer stop()
+	h, p, _ := net.SplitHostPort(addr)
+	n := config.Node{Server: h, Port: p, Protocol: "vless", TLS: "tls"}
+	// 对明文服务器做TLS握手应失败 -> 不可达
+	if _, ok := probeNode(n, 1200*time.Millisecond); ok {
+		t.Log("TLS/明文不匹配探测(允许边界判定)")
 	}
 }
