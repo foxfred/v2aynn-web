@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -121,6 +122,13 @@ func fetchOne(sub config.Sub, proxyURL string) ([]config.Node, error) {
 		previewLen = 100
 	}
 	log.Printf("fetchOne[%s]: 原始响应前%d字节: %q", sub.Name, previewLen, raw[:previewLen])
+
+	// 支持 Xray JSON 订阅 (如 BPB 面板的 ?app=xray):
+	// 在原有链接列表逻辑之前优先尝试 JSON 解析。非 JSON 订阅返回 false，自动回退到原有逻辑，不影响其他订阅源。
+	if jnodes, ok := parseXrayJSON(raw, sub.ID); ok {
+		log.Printf("fetchOne[%s]: Xray JSON 订阅, 解析出 %d 个节点", sub.Name, len(jnodes))
+		return jnodes, nil
+	}
 
 	var nodes []config.Node
 	lines := strings.Split(strings.TrimSpace(raw), "\n")
@@ -378,4 +386,223 @@ func parseSS(link string, n config.Node) (config.Node, error) {
 		n.Name = n.Server + ":" + n.Port
 	}
 	return n, nil
+}
+
+// parseXrayJSON 解析 Xray 原生 JSON 订阅 (如 BPB 面板的 ?app=xray)。
+// 支持两种形态: JSON 数组(每元素一份完整配置) 或 单个 JSON 对象(部分端点返回整段 base64 的单份配置)。
+// 返回 (nodes, true) 表示已按 JSON 处理; (_, false) 表示不是 JSON 订阅，调用方应回退到原有链接列表逻辑。
+func parseXrayJSON(raw, subID string) ([]config.Node, bool) {
+	trimmed := strings.TrimSpace(raw)
+	var data interface{}
+	if err := json.Unmarshal([]byte(trimmed), &data); err != nil {
+		// 整段 base64 解码后再试 (部分 BPB 端点返回 base64 单份配置)
+		dec, derr := base64.StdEncoding.DecodeString(trimmed)
+		if derr != nil {
+			pad := trimmed
+			if mod := len(pad) % 4; mod != 0 {
+				pad += strings.Repeat("=", 4-mod)
+			}
+			dec, derr = base64.StdEncoding.DecodeString(pad)
+		}
+		if derr != nil {
+			return nil, false
+		}
+		if err := json.Unmarshal(dec, &data); err != nil {
+			return nil, false
+		}
+	}
+
+	var configs []map[string]interface{}
+	switch v := data.(type) {
+	case []interface{}:
+		for _, e := range v {
+			if m, ok := e.(map[string]interface{}); ok {
+				configs = append(configs, m)
+			}
+		}
+	case map[string]interface{}:
+		configs = append(configs, v)
+	default:
+		return nil, false
+	}
+	if len(configs) == 0 {
+		return nil, false
+	}
+
+	nodes := make([]config.Node, 0, len(configs))
+	for _, cfg := range configs {
+		if n, ok := parseXrayConfig(cfg, subID); ok {
+			nodes = append(nodes, n)
+		}
+	}
+	if len(nodes) == 0 {
+		return nil, false
+	}
+	return nodes, true
+}
+
+// parseXrayConfig 从单份 Xray 配置对象中提取一个代理节点。
+func parseXrayConfig(cfg map[string]interface{}, subID string) (config.Node, bool) {
+	outs, ok := cfg["outbounds"].([]interface{})
+	if !ok || len(outs) == 0 {
+		return config.Node{}, false
+	}
+	// 选第一条受支持的代理出站 (vless/vmess/trojan/shadowsocks)，跳过 dns/freedom/block 等
+	var ob map[string]interface{}
+	for _, o := range outs {
+		om, ok := o.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if proto, _ := om["protocol"].(string); proto == "vless" || proto == "vmess" || proto == "trojan" || proto == "shadowsocks" {
+			ob = om
+			break
+		}
+	}
+	if ob == nil {
+		return config.Node{}, false
+	}
+
+	n := config.Node{
+		ID:       config.NewUUID(),
+		SubID:    subID,
+		LastSeen: time.Now().Format("2006-01-02 15:04:05"),
+	}
+	rawProto, _ := ob["protocol"].(string)
+	n.Protocol = rawProto
+	if n.Protocol == "shadowsocks" {
+		n.Protocol = "ss" // 对齐 manager.go 的 generateOutbound 分支
+	}
+	n.Name = jStr(cfg, "remarks")
+	if n.Name == "" {
+		if tag, ok := ob["tag"].(string); ok && tag != "" {
+			n.Name = tag
+		}
+	}
+
+	settings := jMap(ob, "settings")
+	ss := jMap(ob, "streamSettings")
+
+	switch rawProto {
+	case "vless", "vmess":
+		if vnext := jSlice(settings, "vnext"); len(vnext) > 0 {
+			v := jMapI(vnext[0])
+			n.Server = jStr(v, "address")
+			n.Port = strconv.Itoa(int(jNum(v, "port")))
+			if users := jSlice(v, "users"); len(users) > 0 {
+				u := jMapI(users[0])
+				n.UUID = jStr(u, "id")
+				n.Security = jStr(u, "security") // vmess 加密方式 / vless 通常 none
+			}
+		}
+	case "trojan", "shadowsocks":
+		if servers := jSlice(settings, "servers"); len(servers) > 0 {
+			s := jMapI(servers[0])
+			n.Server = jStr(s, "address")
+			n.Port = strconv.Itoa(int(jNum(s, "port")))
+			n.Password = jStr(s, "password")
+			if rawProto == "shadowsocks" {
+				n.Method = jStr(s, "method")
+			}
+		}
+	}
+
+	n.Network = jStr(ss, "network")
+	if n.Network == "" {
+		n.Network = "tcp"
+	}
+	n.TLS = jStr(ss, "security") // "none" / "tls" / "reality"
+	if n.TLS == "none" {
+		n.TLS = ""
+	}
+
+	switch n.Network {
+	case "ws":
+		ws := jMap(ss, "wsSettings")
+		n.RequestHost = jStr(ws, "host")
+		n.Path = jStr(ws, "path")
+	case "grpc":
+		g := jMap(ss, "grpcSettings")
+		n.RequestHost = jStr(g, "authority")
+		n.Path = jStr(g, "serviceName")
+	case "tcp":
+		if hdr := jMap(jMap(ss, "tcpSettings"), "header"); jStr(hdr, "type") != "" {
+			n.HeaderType = jStr(hdr, "type")
+		}
+	case "h2":
+		h2 := jMap(ss, "httpSettings")
+		n.RequestHost = jStr(h2, "host")
+		n.Path = jStr(h2, "path")
+	}
+
+	// TLS / reality 的 serverName -> SNI
+	if n.TLS == "tls" {
+		n.SNI = jStr(jMap(ss, "tlsSettings"), "serverName")
+	} else if n.TLS == "reality" {
+		n.SNI = jStr(jMap(ss, "realitySettings"), "serverName")
+	}
+
+	if n.Name == "" {
+		n.Name = n.Server + ":" + n.Port
+	}
+	return n, true
+}
+
+// ---- JSON 取值辅助 ----
+
+func jStr(m map[string]interface{}, keys ...string) string {
+	cur := interface{}(m)
+	for _, k := range keys {
+		mm, ok := cur.(map[string]interface{})
+		if !ok {
+			return ""
+		}
+		cur = mm[k]
+	}
+	s, _ := cur.(string)
+	return s
+}
+
+func jNum(m map[string]interface{}, keys ...string) float64 {
+	cur := interface{}(m)
+	for _, k := range keys {
+		mm, ok := cur.(map[string]interface{})
+		if !ok {
+			return 0
+		}
+		cur = mm[k]
+	}
+	f, _ := cur.(float64)
+	return f
+}
+
+func jMap(m map[string]interface{}, keys ...string) map[string]interface{} {
+	cur := interface{}(m)
+	for _, k := range keys {
+		mm, ok := cur.(map[string]interface{})
+		if !ok {
+			return nil
+		}
+		cur = mm[k]
+	}
+	mm, _ := cur.(map[string]interface{})
+	return mm
+}
+
+func jSlice(m map[string]interface{}, keys ...string) []interface{} {
+	cur := interface{}(m)
+	for _, k := range keys {
+		mm, ok := cur.(map[string]interface{})
+		if !ok {
+			return nil
+		}
+		cur = mm[k]
+	}
+	s, _ := cur.([]interface{})
+	return s
+}
+
+func jMapI(v interface{}) map[string]interface{} {
+	m, _ := v.(map[string]interface{})
+	return m
 }
