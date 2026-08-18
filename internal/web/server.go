@@ -201,7 +201,9 @@ func (w *WebServer) apiPing(rw http.ResponseWriter, r *http.Request) {
 	}
 	w.cfg.Unlock()
 	if node == nil {
-		w.writeJSON(rw, map[string]string{"error": "not found"})
+		// 节点在测速期间被订阅刷新替换为新ID: 返回超时而非 error,
+		// 避免前端拿到 undefined 结果显示空白("丢失测速信息")
+		w.writeJSON(rw, map[string]interface{}{"id": id, "ms": -1})
 		return
 	}
 	nodeCopy := *node
