@@ -148,6 +148,13 @@ func (m *Manager) Status() map[string]interface{} {
 func generateConfig(n *config.Node, socksPort, httpPort int, proxyMode string) map[string]interface{} {
 	cfg := map[string]interface{}{
 		"log": map[string]interface{}{"loglevel": "warning"},
+		"dns": map[string]interface{}{
+			"servers": []interface{}{
+				"1.1.1.1",
+				"8.8.8.8",
+				"localhost",
+			},
+		},
 		"inbounds": []interface{}{
 			map[string]interface{}{
 				"port": socksPort, "listen": "0.0.0.0", "protocol": "socks",
