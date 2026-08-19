@@ -30,26 +30,27 @@ type Sub struct {
 }
 
 type Node struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	SubID       string `json:"subID"`
-	Protocol    string `json:"protocol"`
-	Server      string `json:"server"`
-	Port        string `json:"port"`
-	UUID        string `json:"uuid"`
-	Password    string `json:"password"`
-	Method      string `json:"method"`
-	Network     string `json:"network"`
-	TLS         string `json:"tls"`
-	SNI         string `json:"sni"`
-	Path        string `json:"path"`
+	ID       string  `json:"id"`
+	Name     string  `json:"name"`
+	SubID    string  `json:"subID"`
+	Protocol string  `json:"protocol"`
+	Server   string  `json:"server"`
+	Port     string  `json:"port"`
+	UUID     string  `json:"uuid"`
+	Password string  `json:"password"`
+	Method   string  `json:"method"`
+	Network  string  `json:"network"`
+	TLS      string  `json:"tls"`
+	SNI      string  `json:"sni"`
+	Path     string  `json:"path"`
 	RequestHost string `json:"reqHost"`
-	HeaderType  string `json:"headerType"`
-	Security    string `json:"security"`
-	AlterID     string `json:"alterId"`
-	RawLink     string `json:"rawLink"`
-	LastSeen    string `json:"lastSeen"`
-	Ping        int    `json:"ping"`
+	HeaderType  string  `json:"headerType"`
+	Security  string  `json:"security"`
+	AlterID  string  `json:"alterId"`
+	RawLink  string  `json:"rawLink"`
+	LastSeen string  `json:"lastSeen"`
+	Ping     int     `json:"ping"`     // TCP/TLS握手延迟(ms)，-1=超时，0=未测
+	Speed    float64 `json:"speed"`    // 真实下载速度 Mbps，0=未测，-1=超时/不可测
 }
 
 func Load(path string) (*Config, error) {

@@ -6,9 +6,11 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
+	"net/url"
 	"sort"
 	"time"
 
@@ -22,6 +24,9 @@ var indexHTML string
 
 //go:embed static/*
 var staticFS embed.FS
+
+// speedTestURL 真实下载测速用的目标（Cloudflare 2MB 文件，全球 CDN 稳定可达）
+const speedTestURL = "https://speed.cloudflare.com/__down?bytes=2000000"
 
 type WebServer struct {
 	cfg *config.Config
@@ -44,6 +49,7 @@ func (w *WebServer) Run(addr string) error {
 	mux.HandleFunc("POST /api/node/{id}", w.apiSwitch)
 	mux.HandleFunc("POST /api/ping/{id}", w.apiPing)
 	mux.HandleFunc("POST /api/pingall", w.apiPingAll)
+	mux.HandleFunc("POST /api/speed", w.apiSpeed)
 	mux.HandleFunc("POST /api/sort", w.apiSort)
 	mux.HandleFunc("POST /api/proxy/start", w.apiStart)
 	mux.HandleFunc("POST /api/proxy/stop", w.apiStop)
@@ -278,6 +284,65 @@ func (w *WebServer) apiPingAll(rw http.ResponseWriter, r *http.Request) {
 	w.writeJSON(rw, results)
 }
 
+// apiSpeed 对【当前激活节点】做真实下载测速。
+// 真实吞吐必须穿过节点隧道，而 xray 只以激活节点运行，故只能测正在用的节点。
+// 通过本地 HTTP 代理端口把流量导入隧道，下载 Cloudflare 2MB 文件计算 Mbps。
+func (w *WebServer) apiSpeed(rw http.ResponseWriter, r *http.Request) {
+	if !w.v2m.IsRunning() {
+		w.writeJSON(rw, map[string]interface{}{"ok": false, "error": "代理未运行，请先启动", "mbps": 0})
+		return
+	}
+	proxyURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", w.cfg.HttpPort))
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+		},
+	}
+
+	start := time.Now()
+	resp, err := client.Get(speedTestURL)
+	if err != nil {
+		w.writeJSON(rw, map[string]interface{}{"ok": false, "error": "下载失败: " + err.Error(), "mbps": 0})
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		w.writeJSON(rw, map[string]interface{}{"ok": false, "error": fmt.Sprintf("HTTP %d", resp.StatusCode), "mbps": 0})
+		return
+	}
+
+	n, err := io.Copy(io.Discard, resp.Body)
+	elapsed := time.Since(start)
+	if err != nil {
+		w.writeJSON(rw, map[string]interface{}{"ok": false, "error": "下载中断: " + err.Error(), "mbps": 0})
+		return
+	}
+	if elapsed <= 0 {
+		w.writeJSON(rw, map[string]interface{}{"ok": false, "error": "耗时异常", "mbps": 0})
+		return
+	}
+	mbps := float64(n) * 8.0 / 1e6 / elapsed.Seconds()
+
+	// 把测得的真实速度写回激活节点，列表里也能看到
+	w.cfg.Lock()
+	for i := range w.cfg.Nodes {
+		if w.cfg.Nodes[i].ID == w.cfg.ActiveNode {
+			w.cfg.Nodes[i].Speed = mbps
+			break
+		}
+	}
+	_ = w.cfg.Save()
+	w.cfg.Unlock()
+
+	w.writeJSON(rw, map[string]interface{}{
+		"ok":    true,
+		"mbps":  mbps,
+		"bytes": n,
+		"ms":    elapsed.Milliseconds(),
+	})
+}
+
 func (w *WebServer) apiStart(rw http.ResponseWriter, r *http.Request) {
 	if err := w.v2m.Start(); err != nil {
 		w.writeJSON(rw, map[string]string{"error": err.Error()})
@@ -356,7 +421,7 @@ func corsHandler(h http.Handler) http.Handler {
 }
 
 // probeNode 测速：返回 (延迟ms, 是否可达)。
-// 方案：TCP 连接 + (若启用TLS)真实握手。
+// 方案：TCP 连接 + (若启用TLS)真实握手。这是【连通性】信号，用于筛掉死节点。
 // 采样策略：首次成功立即返回（快的节点一次搞定）；仅失败时重试一次，
 // 显著加快全量测速，避免每个节点的 3 次等待叠加。
 func probeNode(n config.Node, timeout time.Duration) (int64, bool) {
