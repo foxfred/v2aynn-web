@@ -21,6 +21,10 @@ type Manager struct {
 	running      bool
 	activeName   string // 缓存实际启动节点的名称，避免依赖 cfg.Nodes 反查
 	activeNodeID string
+
+	restartCount    int       // 连续重启次数
+	lastRestart     time.Time // 上次重启时间
+	restartMu       sync.Mutex
 }
 
 func NewManager(dataDir string) *Manager {
@@ -81,11 +85,16 @@ func (m *Manager) Start() error {
 		return err
 	}
 	m.running = true
+	// 启动成功，重置重启计数
+	m.restartMu.Lock()
+	m.restartCount = 0
+	m.lastRestart = time.Time{}
+	m.restartMu.Unlock()
 	go m.watch(m.cmd)
 	return nil
 }
 
-// watch 监控 xray 进程，异常退出时自动重启
+// watch 监控 xray 进程，异常退出时自动重启（最多3次，超过则放弃）
 func (m *Manager) watch(cmd *exec.Cmd) {
 	_ = cmd.Wait()
 	m.mu.Lock()
@@ -96,7 +105,23 @@ func (m *Manager) watch(cmd *exec.Cmd) {
 	}
 	m.mu.Unlock()
 	if !m.running && isCurrent {
-		log.Println("xray 异常退出，5秒后自动重启")
+		// 防无限重启：3次内如果始终撑不过30秒，判定为配置问题，放弃
+		m.restartMu.Lock()
+		now := time.Now()
+		if now.Sub(m.lastRestart) > 30*time.Second {
+			m.restartCount = 0 // 上次重启已过30s，重置计数
+		}
+		m.restartCount++
+		m.lastRestart = now
+		if m.restartCount > 3 {
+			log.Printf("xray 连续重启 %d 次失败，放弃自动重启，请检查节点配置", m.restartCount)
+			m.restartMu.Unlock()
+			return
+		}
+		restartCount := m.restartCount
+		m.restartMu.Unlock()
+
+		log.Printf("xray 异常退出 (%d/3)，5秒后自动重启", restartCount)
 		time.Sleep(5 * time.Second)
 		_ = m.Start()
 	}
@@ -114,10 +139,27 @@ func (m *Manager) Stop() {
 }
 
 func (m *Manager) SwitchNode(id string) error {
+	// 先确认节点存在，避免把 ActiveNode 设置为已不存在的 ID（订阅刷新竞态下会报"不在节点列表中"）
 	m.cfg.Lock()
+	found := false
+	for _, n := range m.cfg.Nodes {
+		if n.ID == id {
+			found = true
+			break
+		}
+	}
+	if !found {
+		m.cfg.Unlock()
+		return fmt.Errorf("节点(%s)不在节点列表中", id)
+	}
 	m.cfg.ActiveNode = id
 	_ = m.cfg.Save()
 	m.cfg.Unlock()
+	// 重置重启计数
+	m.restartMu.Lock()
+	m.restartCount = 0
+	m.lastRestart = time.Time{}
+	m.restartMu.Unlock()
 	m.Stop()
 	time.Sleep(300 * time.Millisecond)
 	return m.Start()
@@ -237,9 +279,7 @@ func generateOutbound(n *config.Node) map[string]interface{} {
 		s["servers"] = []interface{}{
 			map[string]interface{}{
 				"address": n.Server, "port": toInt(n.Port, 443),
-				"accounts": []interface{}{
-					map[string]interface{}{"password": n.Password},
-				},
+				"password": n.Password,
 			},
 		}
 	case "ss":

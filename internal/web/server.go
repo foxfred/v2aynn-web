@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strings"
 	"time"
 
 	"v2aynn-web/internal/config"
@@ -46,6 +47,9 @@ func (w *WebServer) Run(addr string) error {
 	mux.HandleFunc("POST /api/subs", w.apiAddSub)
 	mux.HandleFunc("POST /api/subs/{id}", w.apiDelSub)
 	mux.HandleFunc("POST /api/fetch", w.apiFetch)
+	mux.HandleFunc("POST /api/node/add", w.apiAddNode)
+	mux.HandleFunc("POST /api/node/import", w.apiImportNode)
+	mux.HandleFunc("POST /api/node/{id}/del", w.apiDelNode)
 	mux.HandleFunc("POST /api/node/{id}", w.apiSwitch)
 	mux.HandleFunc("POST /api/ping/{id}", w.apiPing)
 	mux.HandleFunc("POST /api/pingall", w.apiPingAll)
@@ -186,6 +190,123 @@ func (w *WebServer) apiFetch(rw http.ResponseWriter, r *http.Request) {
 	w.writeJSON(rw, map[string]string{"ok": "true"})
 }
 
+// apiAddNode 创建手动节点
+func (w *WebServer) apiAddNode(rw http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name        string `json:"name"`
+		Protocol    string `json:"protocol"`
+		Server      string `json:"server"`
+		Port        string `json:"port"`
+		UUID        string `json:"uuid"`
+		Password    string `json:"password"`
+		Method      string `json:"method"`
+		Network     string `json:"network"`
+		TLS         string `json:"tls"`
+		SNI         string `json:"sni"`
+		Path        string `json:"path"`
+		RequestHost string `json:"reqHost"`
+		HeaderType  string `json:"headerType"`
+		Security    string `json:"security"`
+		AlterID     string `json:"alterId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.writeJSON(rw, map[string]string{"error": "bad json"})
+		return
+	}
+	if req.Protocol == "" || req.Server == "" || req.Port == "" {
+		w.writeJSON(rw, map[string]string{"error": "protocol/server/port required"})
+		return
+	}
+	id := fmt.Sprintf("%d", time.Now().UnixNano())
+	node := config.Node{
+		ID: id, Name: req.Name, Protocol: req.Protocol,
+		Server: req.Server, Port: req.Port,
+		UUID: req.UUID, Password: req.Password, Method: req.Method,
+		Network: req.Network, TLS: req.TLS, SNI: req.SNI,
+		Path: req.Path, RequestHost: req.RequestHost,
+		HeaderType: req.HeaderType, Security: req.Security, AlterID: req.AlterID,
+		Ping: 0, Speed: 0,
+	}
+	w.cfg.Lock()
+	w.cfg.Nodes = append([]config.Node{node}, w.cfg.Nodes...)
+	_ = w.cfg.Save()
+	w.cfg.Unlock()
+	w.writeJSON(rw, map[string]string{"id": id, "ok": "true"})
+}
+
+// apiImportNode 粘贴导入节点（支持 vless://, vmess://, trojan://, ss:// 链接，每行一个）
+func (w *WebServer) apiImportNode(rw http.ResponseWriter, r *http.Request) {
+	var req struct {
+		URLs []string `json:"urls"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.writeJSON(rw, map[string]string{"error": "bad json"})
+		return
+	}
+	if len(req.URLs) == 0 {
+		w.writeJSON(rw, map[string]string{"error": "urls required"})
+		return
+	}
+
+	var added []string
+	for _, raw := range req.URLs {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		// 尝试整段作为单个URL解析
+		if n, err := subscription.Parse(raw); err == nil {
+			w.cfg.Lock()
+			w.cfg.Nodes = append([]config.Node{n}, w.cfg.Nodes...)
+			w.cfg.Unlock()
+			added = append(added, n.Name)
+			continue
+		}
+		// 多行：按行拆分
+		for _, line := range strings.Split(raw, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			if n, err := subscription.Parse(line); err == nil {
+				w.cfg.Lock()
+				w.cfg.Nodes = append([]config.Node{n}, w.cfg.Nodes...)
+				w.cfg.Unlock()
+				added = append(added, n.Name)
+			}
+		}
+	}
+
+	w.cfg.Lock()
+	_ = w.cfg.Save()
+	w.cfg.Unlock()
+
+	w.writeJSON(rw, map[string]interface{}{
+		"ok":    "true",
+		"count": len(added),
+		"names": added,
+	})
+}
+
+// apiDelNode 删除节点
+func (w *WebServer) apiDelNode(rw http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	w.cfg.Lock()
+	nodes := make([]config.Node, 0)
+	for _, n := range w.cfg.Nodes {
+		if n.ID != id {
+			nodes = append(nodes, n)
+		}
+	}
+	w.cfg.Nodes = nodes
+	if w.cfg.ActiveNode == id {
+		w.cfg.ActiveNode = ""
+	}
+	_ = w.cfg.Save()
+	w.cfg.Unlock()
+	w.writeJSON(rw, map[string]string{"ok": "true"})
+}
+
 func (w *WebServer) apiSwitch(rw http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if err := w.v2m.SwitchNode(id); err != nil {
@@ -292,16 +413,20 @@ func (w *WebServer) apiSpeed(rw http.ResponseWriter, r *http.Request) {
 		w.writeJSON(rw, map[string]interface{}{"ok": false, "error": "代理未运行，请先启动", "mbps": 0})
 		return
 	}
+	target := w.cfg.SpeedURL
+	if target == "" {
+		target = speedTestURL
+	}
 	proxyURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", w.cfg.HttpPort))
 	client := &http.Client{
-		Timeout: 15 * time.Second,
+		Timeout: 45 * time.Second,
 		Transport: &http.Transport{
 			Proxy: http.ProxyURL(proxyURL),
 		},
 	}
 
 	start := time.Now()
-	resp, err := client.Get(speedTestURL)
+	resp, err := client.Get(target)
 	if err != nil {
 		w.writeJSON(rw, map[string]interface{}{"ok": false, "error": "下载失败: " + err.Error(), "mbps": 0})
 		return
@@ -362,6 +487,7 @@ func (w *WebServer) apiGetSettings(rw http.ResponseWriter, r *http.Request) {
 		"socksPort": w.cfg.SocksPort, "httpPort": w.cfg.HttpPort,
 		"listenAddr": w.cfg.ListenAddr, "subRefresh": w.cfg.SubRefresh,
 		"subProxy": w.cfg.SubProxy, "proxyMode": w.cfg.ProxyMode,
+		"speedURL": w.cfg.SpeedURL,
 	}
 	w.cfg.Unlock()
 	w.writeJSON(rw, st)
@@ -391,6 +517,9 @@ func (w *WebServer) apiSettings(rw http.ResponseWriter, r *http.Request) {
 	}
 	if v, ok := req["proxyMode"]; ok {
 		w.cfg.ProxyMode = v.(string)
+	}
+	if v, ok := req["speedURL"]; ok {
+		w.cfg.SpeedURL = v.(string)
 	}
 	_ = w.cfg.Save()
 	w.cfg.Unlock()

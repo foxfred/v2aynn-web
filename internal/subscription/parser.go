@@ -33,12 +33,29 @@ func Fetch(cfg *config.Config) {
 	cfg.Lock()
 	subs := make([]config.Sub, len(cfg.Subs))
 	copy(subs, cfg.Subs)
+	oldNodes := make([]config.Node, len(cfg.Nodes))
+	copy(oldNodes, cfg.Nodes)
 	cfg.Unlock()
+
+	// 快照当前节点，按订阅分组：某订阅拉取失败时保留其旧节点，避免整表清空
+	// 注意：手动节点（SubID=""）不在此处理，改在写回时从【实时】cfg.Nodes 合并，
+	// 防止 Fetch 快照早于导入导致新导入节点被覆盖丢失（见下方锁内合并逻辑）
+	oldBySub := make(map[string][]config.Node)
+	for _, n := range oldNodes {
+		if n.SubID != "" {
+			oldBySub[n.SubID] = append(oldBySub[n.SubID], n)
+		}
+	}
 
 	for _, sub := range subs {
 		nodes, err := fetchOne(sub, cfg.SubProxy)
 		if err != nil {
-			log.Printf("Fetch: 订阅[%s]拉取失败: %v", sub.Name, err)
+			// 拉取失败：保留该订阅原有节点，防止其节点被清空
+			log.Printf("Fetch: 订阅[%s]拉取失败，保留旧节点: %v", sub.Name, err)
+			if old, ok := oldBySub[sub.ID]; ok {
+				all = append(all, old...)
+			}
+			continue
 		} else {
 			log.Printf("Fetch: 订阅[%s]拉取到%d个节点", sub.Name, len(nodes))
 		}
@@ -57,6 +74,27 @@ func Fetch(cfg *config.Config) {
 	}
 
 	cfg.Lock()
+	// 手动节点(SubID="")永不随订阅刷新丢弃：
+	// 在【锁内】读取实时 cfg.Nodes 合并（而非 Fetch 开始时的快照），
+	// 确保 Fetch 进行期间新导入/添加的节点也不会被覆盖丢失。
+	// 手动节点排在最前，去重时优先于同 server:port:protocol 的订阅节点。
+	var manual []config.Node
+	seenM := make(map[string]bool)
+	for _, n := range cfg.Nodes {
+		if n.SubID == "" {
+			key := n.Server + ":" + n.Port + ":" + n.Protocol
+			if !seenM[key] {
+				seenM[key] = true
+				manual = append(manual, n)
+			}
+		}
+	}
+	all = append(manual, all...)
+	all = dedupNodes(all)
+	if len(manual) > 0 {
+		log.Printf("Fetch: 合并%d个手动节点, 去重后共%d个节点", len(manual), len(all))
+	}
+
 	// Preserve ping data and find old ActiveNode key
 	// 注意：保留所有非零 ping（含 -1 超时标记），否则 fetch 刷新后超时节点会退化为"未测"，导致排序变动
 	oldPings := make(map[string]int)
@@ -220,6 +258,12 @@ func parse(raw, subID string) (config.Node, error) {
 	default:
 		return n, fmt.Errorf("unsupported")
 	}
+}
+
+// Parse 从单个节点URL解析出一个Node。空subID=手动添加。
+// 支持 vless://, vmess://, trojan://, ss:// 四种协议。
+func Parse(raw string) (config.Node, error) {
+	return parse(raw, "")
 }
 
 func parseVmess(link string, n config.Node) (config.Node, error) {
@@ -447,16 +491,31 @@ func parseXrayConfig(cfg map[string]interface{}, subID string) (config.Node, boo
 	if !ok || len(outs) == 0 {
 		return config.Node{}, false
 	}
-	// 选第一条受支持的代理出站 (vless/vmess/trojan/shadowsocks)，跳过 dns/freedom/block 等
+	// 优先选 tag="proxy" 的出站（BPB 配置通常有 proxy/dns/freedom 三个）
+	// 没有 proxy tag 再选第一个受支持的协议
 	var ob map[string]interface{}
 	for _, o := range outs {
 		om, ok := o.(map[string]interface{})
 		if !ok {
 			continue
 		}
-		if proto, _ := om["protocol"].(string); proto == "vless" || proto == "vmess" || proto == "trojan" || proto == "shadowsocks" {
+		// 先找 proxy tag
+		if tag, ok := om["tag"].(string); ok && tag == "proxy" {
 			ob = om
 			break
+		}
+	}
+	// fallback: 取第一个受支持的协议出站
+	if ob == nil {
+		for _, o := range outs {
+			om, ok := o.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if proto, _ := om["protocol"].(string); proto == "vless" || proto == "vmess" || proto == "trojan" || proto == "shadowsocks" {
+				ob = om
+				break
+			}
 		}
 	}
 	if ob == nil {

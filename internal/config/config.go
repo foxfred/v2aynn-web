@@ -18,6 +18,7 @@ type Config struct {
 	ProxyMode  string   `json:"proxyMode"`
 	ActiveNode string   `json:"activeNode"`
 	SortOrder  string   `json:"sortOrder"`
+	SpeedURL   string   `json:"speedURL"`
 	Subs       []Sub    `json:"subs"`
 	Nodes      []Node   `json:"nodes"`
 	path       string
@@ -58,6 +59,7 @@ func Load(path string) (*Config, error) {
 		WebPort: 8000, SocksPort: 10808, HttpPort: 10810,
 		ListenAddr: "0.0.0.0", SubRefresh: 300,
 		SubProxy: "", ProxyMode: "smart",
+		SpeedURL: "https://speed.cloudflare.com/__down?bytes=2000000",
 		Subs: []Sub{}, Nodes: []Node{},
 	}
 	c.path = path
@@ -75,6 +77,7 @@ func Load(path string) (*Config, error) {
 			WebPort: 8000, SocksPort: 10808, HttpPort: 10810,
 			ListenAddr: "0.0.0.0", SubRefresh: 300,
 			SubProxy: "", ProxyMode: "smart",
+			SpeedURL: "https://speed.cloudflare.com/__down?bytes=2000000",
 			Subs: []Sub{}, Nodes: []Node{}, path: path,
 		}
 		return c, nil
