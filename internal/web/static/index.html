@@ -4,118 +4,392 @@
 <title>v2aynn-web</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;line-height:1.6}
-.box{max-width:900px;margin:0 auto;padding:20px}
-h1{font-size:1.4rem;color:#58a6ff;margin-bottom:12px}
-h2{font-size:1.1rem;color:#8b949e;border-bottom:1px solid #21262d;padding-bottom:6px;margin:18px 0 10px}
-.bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:12px;background:#161b22;border:1px solid #30363d;border-radius:8px;margin-bottom:14px}
-.dot{width:12px;height:12px;border-radius:50%;background:#f85149;display:inline-block}
-.dot.on{background:#3fb950}
-.btn{padding:6px 16px;border:1px solid #30363d;border-radius:6px;background:#21262d;color:#e6edf3;cursor:pointer;font-size:13px}
-.btn:hover{background:#30363d}
-.btn.st{background:#238636;border-color:#2ea043}
-.btn.sp{background:#b62324;border-color:#da3633}
-.btn.ac{background:#1f6feb;border-color:#388bfd}
-.nwrap{border:1px solid #30363d;border-radius:6px;overflow:hidden;margin-bottom:10px}
-.nlh{display:flex;align-items:center;padding:5px 10px;background:#161b22;border-bottom:1px solid #30363d;font-size:10px;color:#8b949e;font-weight:600}
-.nlh .c1{flex:1}.nlh .c2{width:70px;text-align:right}.nlh .c3{width:110px;text-align:right}
-.nl{display:grid;gap:1px;max-height:560px;overflow-y:auto;overflow-x:auto;background:#0d1117}
-.ni{display:flex;justify-content:space-between;align-items:center;padding:5px 10px;background:#161b22;border-bottom:1px solid #21262d;cursor:pointer;min-width:420px}
-.ni:last-child{border-bottom:none}
+body{font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;line-height:1.6;height:100vh;overflow:hidden;font-size:14px}
+.app{display:flex;flex-direction:column;height:100vh;max-width:1100px;margin:0 auto;border-left:1px solid #30363d;border-right:1px solid #30363d;box-shadow:0 0 20px rgba(0,0,0,.3)}
+
+/* 顶栏 */
+.topbar{display:flex;align-items:center;gap:10px;padding:8px 16px;background:#161b22;border-bottom:1px solid #30363d;flex-shrink:0}
+.topbar .dot{width:11px;height:11px;border-radius:50%;background:#f85149;display:inline-block;flex-shrink:0}
+.topbar .dot.on{background:#3fb950}
+.topbar .st{flex:1;min-width:0;font-size:13px;color:#8b949e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.topbar .btn{padding:5px 14px;border:1px solid #30363d;border-radius:5px;background:#21262d;color:#e6edf3;cursor:pointer;font-size:13px;flex-shrink:0}
+.topbar .btn:hover{background:#30363d}
+.topbar .btn.st{background:#238636;border-color:#2ea043}
+.topbar .btn.sp{background:#b62324;border-color:#da3633}
+.topbar .btn.ac{background:#1f6feb;border-color:#388bfd}
+.topbar .spd{font-size:13px;color:#8b949e;flex-shrink:0}
+
+/* 主体：左右双栏 */
+.main{display:flex;flex:1;overflow:hidden}
+
+/* 左侧分组列表 */
+.sidebar{width:220px;min-width:180px;border-right:1px solid #30363d;display:flex;flex-direction:column;background:#0d1117;flex-shrink:0}
+.sidebar .sh{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;border-bottom:1px solid #21262d;font-size:13px;color:#8b949e;font-weight:600}
+.sidebar .sh .btn{padding:3px 8px;font-size:12px;border:1px solid #30363d;border-radius:4px;background:#21262d;color:#e6edf3;cursor:pointer}
+.sidebar .sh .btn:hover{background:#30363d}
+.sidebar .gl{flex:1;overflow-y:auto}
+.sidebar .gi{display:flex;align-items:center;padding:9px 10px;cursor:pointer;border-bottom:1px solid #21262d;transition:background .1s}
+.sidebar .gi:hover{background:#161b22}
+.sidebar .gi.ac{border-left:3px solid #58a6ff;background:#0d419d22}
+.sidebar .gi .gn{flex:1;min-width:0}
+.sidebar .gi .gnm{font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sidebar .gi .gns{font-size:11px;color:#8b949e}
+.sidebar .gi .gcnt{font-size:11px;color:#8b949e;padding:1px 6px;background:#21262d;border-radius:8px}
+.sidebar .gi .gact{font-size:11px;padding:2px 6px;background:#1f6feb;color:#fff;border-radius:3px;margin-left:4px}
+
+/* 右侧节点区域 */
+.content{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.content .ch{display:flex;align-items:center;gap:6px;padding:6px 12px;border-bottom:1px solid #21262d;flex-shrink:0;flex-wrap:wrap}
+.content .ch .cht{font-size:15px;font-weight:600;color:#e6edf3}
+.content .ch .btn{padding:3px 10px;border:1px solid #30363d;border-radius:4px;background:#21262d;color:#e6edf3;cursor:pointer;font-size:12px}
+.content .ch .btn:hover{background:#30363d}
+.content .ch .btn.st{background:#238636;border-color:#2ea043}
+.content .ch .btn.ac{background:#1f6feb;border-color:#388bfd}
+.content .ch .btn.sp{background:#b62324;border-color:#da3633}
+.content .ch select{font-size:12px;padding:3px 5px;background:#0d1117;border:1px solid #30363d;border-radius:3px;color:#e6edf3}
+
+/* 节点列表 */
+.nwrap{flex:1;overflow-y:auto;overflow-x:auto}
+.nlh{display:flex;align-items:center;padding:6px 10px;background:#161b22;border-bottom:1px solid #30363d;font-size:12px;color:#8b949e;font-weight:600;position:sticky;top:0;z-index:1}
+.nlh .c1{flex:1;min-width:100px;max-width:480px}
+.nlh .c2{width:52px;text-align:right;flex-shrink:0}.nlh .c3{width:118px;text-align:right;flex-shrink:0}
+.ni{display:flex;align-items:center;padding:7px 10px;border-bottom:1px solid #21262d;cursor:pointer;min-width:360px;transition:background .1s}
+.ni:hover{background:#161b22}
 .ni.ac{border-left:3px solid #58a6ff;background:#0d419d22}
-.ni .c2{width:70px;text-align:right;font-size:10px}
-.ni .c3{width:110px;text-align:right;white-space:nowrap}
-.nn{font-weight:600;font-size:11px}
-.nm{font-size:10px;color:#8b949e}
-.tag{display:inline-block;padding:0 4px;border-radius:3px;font-size:9px;margin-left:4px;line-height:16px}
+.ni .nn{font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ni .nm{font-size:11px;color:#8b949e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ni .c1{flex:1;min-width:100px;max-width:480px;overflow:hidden}
+.ni .c2{width:52px;text-align:right;font-size:12px;flex-shrink:0}
+.ni .c3{width:118px;text-align:right;white-space:nowrap;flex-shrink:0}
+.ni .c3 .btn{padding:3px 7px;font-size:11px;border:1px solid #30363d;border-radius:3px;background:#21262d;color:#e6edf3;cursor:pointer}
+.ni .c3 .btn:hover{background:#30363d}
+.ni .c3 .btn.ac{background:#1f6feb;border-color:#388bfd}
+.tag{display:inline-block;padding:0 4px;border-radius:2px;font-size:10px;margin-left:3px;line-height:16px}
 .tag.vmess{background:#1f6feb33;color:#58a6ff}
 .tag.vless{background:#8957e533;color:#bc8cff}
 .tag.trojan{background:#f8514933;color:#ff7b72}
 .tag.ss{background:#d2992233;color:#e3b341}
-.fr{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap}
-.fr input{flex:1;min-width:120px;padding:6px 10px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;font-size:13px}
-.fr input:focus{outline:none;border-color:#58a6ff}
-.si{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:#161b22;border:1px solid #30363d;border-radius:6px;margin-bottom:5px}
-.sg{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px}
-.sg label{font-size:12px;color:#8b949e;display:block;margin-bottom:3px}
-.sg input{width:100%;padding:6px 10px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3}
+
+/* 弹窗/表单 */
+.modal{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.5);z-index:100;align-items:center;justify-content:center}
+.modal.show{display:flex}
+.modal .mp{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:18px;width:460px;max-width:92vw;max-height:82vh;overflow-y:auto}
+.modal .mp h3{font-size:15px;color:#58a6ff;margin-bottom:12px}
+.modal .mp label{font-size:12px;color:#8b949e;display:block;margin-bottom:3px}
+.modal .mp input,.modal .mp select,.modal .mp textarea{width:100%;padding:6px 9px;margin-bottom:9px;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#e6edf3;font-size:13px}
+.modal .mp textarea{min-height:80px;resize:vertical}
+.modal .mp .sg{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.modal .mp .btn{padding:6px 16px;border:1px solid #30363d;border-radius:4px;background:#21262d;color:#e6edf3;cursor:pointer;font-size:13px;margin-right:8px}
+.modal .mp .btn.st{background:#238636;border-color:#2ea043}
+.modal .mp .btn.sp{background:#b62324;border-color:#da3633}
+.empty{color:#8b949e;font-size:13px;padding:20px;text-align:center}
+/* 设置面板 */
+.st-ft{font-size:12px;color:#8b949e;margin-bottom:8px;padding-top:6px;border-top:1px solid #21262d}
+.st-full{grid-column:1/-1}
 </style></head>
-<body><div class="box">
-<h1>v2aynn-web</h1>
-<div class="bar"><span class="dot" id="dot"></span><span id="st" title="当前节点" style="flex:1;min-width:0;font-size:13px;color:#8b949e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">连接中...</span>
+<body><div class="app">
+<div class="topbar">
+<span class="dot" id="dot"></span>
+<span class="st" id="st">连接中...</span>
 <button class="btn st" onclick="doStart()">启动</button>
 <button class="btn sp" onclick="doStop()">停止</button>
-<button class="btn" onclick="refresh()">刷新</button>
+<button class="btn" onclick="refreshAll()">更新全部</button>
 <button class="btn ac" onclick="speedTest()">真实测速</button>
-<span id="spd" style="font-size:12px;color:#8b949e;margin-left:auto">速度 --</span></div>
+<span class="spd" id="spd">速度 --</span>
+<button class="btn" onclick="showSettings()">设置 ⚙</button>
+</div>
 
-<h2>节点 <button class="btn" onclick="pingAll()" style="font-size:10px;padding:2px 8px;margin-left:6px">全部测速</button>
-<button class="btn ac" onclick="toggleAddNode()" style="font-size:10px;padding:2px 8px;margin-left:4px">+ 手动添加</button>
-<button class="btn st" onclick="toggleImportForm()" style="font-size:10px;padding:2px 8px;margin-left:2px">+ 粘贴导入</button>
-<select id="sortSel" onchange="setSort(this.value)" style="font-size:10px;padding:2px 4px;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#e6edf3"><option value="">默认顺序</option><option value="ping_asc">延迟低到高</option><option value="ping_desc">延迟高到低</option></select></h2>
-<div id="addNodeForm" style="display:none;padding:10px;background:#161b22;border:1px solid #30363d;border-radius:6px;margin-bottom:10px">
-<div style="font-size:12px;color:#58a6ff;margin-bottom:8px">手动添加节点</div>
+<div class="main">
+<!-- 左侧分组列表 -->
+<div class="sidebar">
+<div class="sh">
+<span>订阅分组</span>
+<button onclick="showAddGroup()">+</button>
+</div>
+<div class="gl" id="gl"></div>
+</div>
+
+<!-- 右侧节点列表 -->
+<div class="content">
+<div class="ch" id="ch">
+<span class="cht" id="grpName">全部节点</span>
+<button class="btn ac" onclick="toggleAddNode()">+ 手动</button>
+<button class="btn st" onclick="toggleImport()">+ 粘贴</button>
+<button class="btn" onclick="pingGroup()">测速</button>
+<button class="btn sp" onclick="delGroup()" id="delGrpBtn" style="display:none">删除分组</button>
+<select id="sortSel" onchange="setSort(this.value)">
+<option value="">默认</option><option value="ping_asc">延迟↑</option><option value="ping_desc">延迟↓</option>
+</select>
+</div>
+<div class="nwrap">
+<div class="nlh"><div class="c1">节点名称 / 地址</div><div class="c2">延迟</div><div class="c3">操作</div></div>
+<div class="nl" id="nl"><div class="empty">选择左侧分组查看节点</div></div>
+</div>
+</div>
+</div>
+</div>
+
+<!-- 添加分组弹窗 -->
+<div class="modal" id="addGroupModal">
+<div class="mp">
+<h3>添加订阅分组</h3>
+<label>名称</label><input id="gn" placeholder="例: 我的节点">
+<label>订阅URL</label><input id="gu" placeholder="https://...">
+<label>订阅代理（可选）</label><input id="gp" placeholder="http://127.0.0.1:7890">
+<div><button class="btn st" onclick="addGroup()">添加</button><button class="btn" onclick="closeModal('addGroupModal')">取消</button></div>
+</div>
+</div>
+
+<!-- 手动添加节点弹窗 -->
+<div class="modal" id="addNodeModal">
+<div class="mp">
+<h3>手动添加节点</h3>
 <div class="sg">
-<div><label>名称</label><input id="an" placeholder="例: 手动Trojan"></div>
-<div><label>协议</label><select id="ap" style="width:100%;padding:6px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3"><option value="vless">vless</option><option value="vmess">vmess</option><option value="trojan">trojan</option><option value="ss">shadowsocks</option></select></div>
-<div><label>服务器</label><input id="as" placeholder="IP或域名"></div>
+<div><label>名称</label><input id="an"></div>
+<div><label>协议</label><select id="ap"><option value="vless">vless</option><option value="vmess">vmess</option><option value="trojan">trojan</option><option value="ss">shadowsocks</option></select></div>
+<div><label>服务器</label><input id="as"></div>
 <div><label>端口</label><input id="aop" type="number" placeholder="443"></div>
-<div><label>UUID/密码</label><input id="aid" placeholder="UUID或密码"></div>
-<div><label>传输方式</label><select id="anet" style="width:100%;padding:6px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3"><option value="tcp">tcp</option><option value="ws">ws</option><option value="h2">h2</option><option value="quic">quic</option></select></div>
-<div><label>TLS</label><select id="atls" style="width:100%;padding:6px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3"><option value="none">无</option><option value="tls">tls</option><option value="reality">reality</option></select></div>
-<div><label>SNI/主机名</label><input id="asni" placeholder="可选"></div>
-<div><label>路径</label><input id="apath" placeholder="/path"></div>
-<div><label>请求Host</label><input id="ahost" placeholder="可选"></div>
+<div><label>UUID/密码</label><input id="aid"></div>
+<div><label>传输方式</label><select id="anet"><option value="tcp">tcp</option><option value="ws">ws</option></select></div>
+<div><label>TLS</label><select id="atls"><option value="none">无</option><option value="tls">tls</option></select></div>
+<div><label>SNI</label><input id="asni"></div>
+<div><label>路径</label><input id="apath"></div>
+<div><label>请求Host</label><input id="ahost"></div>
 </div>
-<div style="margin-top:8px"><button class="btn st" onclick="addManualNode()">添加</button> <button class="btn" onclick="toggleAddNode()">取消</button></div>
+<div><button class="btn st" onclick="addManualNode()">添加</button><button class="btn" onclick="closeModal('addNodeModal')">取消</button></div>
 </div>
-<div id="importForm" style="display:none;padding:10px;background:#161b22;border:1px solid #30363d;border-radius:6px;margin-bottom:10px">
-<div style="font-size:12px;color:#3fb950;margin-bottom:8px">粘贴导入节点（每行一个链接，支持 vless/vmess/trojan/ss）</div>
-<textarea id="imp" placeholder="粘贴节点链接，每行一个..." style="width:100%;min-height:80px;padding:8px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;font-size:12px;resize:vertical"></textarea>
-<div style="margin-top:8px"><button class="btn st" onclick="importNodes()">导入</button> <button class="btn" onclick="toggleImportForm()">取消</button></div>
 </div>
-<div class="nwrap"><div class="nlh"><div class="c1">节点名称 / 地址</div><div class="c2">延迟</div><div class="c3">操作</div></div><div class="nl" id="nl">加载中...</div></div>
 
-<h2>订阅 <button class="btn" onclick="updateSub()" style="font-size:10px;padding:2px 8px;margin-left:6px">更新订阅</button></h2>
-<div class="fr"><input id="n" placeholder="名称"><input id="u" placeholder="订阅URL"><button class="btn" onclick="addSub()">添加</button></div>
-<div id="sl"></div>
+<!-- 粘贴导入弹窗 -->
+<div class="modal" id="importModal">
+<div class="mp">
+<h3>粘贴导入节点</h3>
+<textarea id="imp" placeholder="每行一个链接，支持 vless/vmess/trojan/ss"></textarea>
+<div><button class="btn st" onclick="importNodes()">导入</button><button class="btn" onclick="closeModal('importModal')">取消</button></div>
+</div>
+</div>
 
-<h2>设置</h2>
+<!-- 设置弹窗 -->
+<div class="modal" id="settingsModal">
+<div class="mp">
+<h3>设置</h3>
 <div class="sg">
-<div><label>SOCKS端口</label><input id="s1" type="number"></div>
-<div><label>HTTP端口</label><input id="s2" type="number"></div>
-<div><label>监听地址</label><input id="s3"></div>
-<div><label>刷新间隔(秒)</label><input id="s4" type="number"></div>
-<div><label>订阅代理</label><input id="s5" placeholder="留空=直连"></div>
-<div><label>代理模式</label><select id="s6" style="width:100%;padding:6px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3"><option value="smart">智能分流(国内直连)</option><option value="global">全局代理</option></select></div>
-<div><label>测速目标URL</label><input id="s7" placeholder="https://speed.cloudflare.com/__down?bytes=2000000"></div>
-</div><button class="btn" onclick="saveSet()">保存</button>
+<div><label>SOCKS5 端口</label><input id="setSocks" type="number" placeholder="10808"></div>
+<div><label>HTTP 代理端口</label><input id="setHttp" type="number" placeholder="10810"></div>
+<div class="st-full"><label>Web 监听地址</label><input id="setListen" placeholder="0.0.0.0"></div>
+<div><label>订阅刷新间隔(秒)</label><input id="setRefresh" type="number" placeholder="300"></div>
+<div><label>代理模式</label><select id="setMode"><option value="smart">智能（仅直连受阻走代理）</option><option value="global">全局</option><option value="direct">直连</option></select></div>
+<div class="st-full"><label>全局订阅代理（HTTP代理，可选）</label><input id="setSubProxy" placeholder="http://127.0.0.1:7890"></div>
+<div class="st-full"><label>测速URL（用于真实测速）</label><input id="setSpeedURL" placeholder="https://speed.cloudflare.com/__down?bytes=2000000"></div>
+<div class="st-full st-ft">提示：修改端口 / 监听地址 / 代理模式后，代理会自动重启以应用新配置；若修改了 Web 端口，需重启系统服务后生效。</div>
 </div>
+<div><button class="btn st" onclick="saveSettings()">保存</button><button class="btn" onclick="closeModal('settingsModal')">取消</button></div>
+</div>
+</div>
+
+<!-- 编辑分组弹窗 -->
+<div class="modal" id="editGroupModal">
+<div class="mp">
+<h3>编辑订阅分组</h3>
+<label>名称</label><input id="egn">
+<label>订阅URL</label><input id="egu">
+<label>订阅代理（可选）</label><input id="egp" placeholder="http://127.0.0.1:7890">
+<div class="st-ft">保存后将清空该分组现有节点，并立即用新订阅链接重新拉取。</div>
+<div><button class="btn st" onclick="updateGroup()">保存</button><button class="btn" onclick="closeModal('editGroupModal')">取消</button></div>
+</div>
+</div>
+
 <script>
-let active='';
+let active='', curGrp='', groups=[];
+
 async function api(m,p,b){const o={method:m,headers:{'Content-Type':'application/json'}};if(b)o.body=JSON.stringify(b);return(await fetch(p,o)).json()}
-async function refresh(){fetch('/api/fetch',{method:'POST'});await Promise.all([loadNodes(),loadSubs()]);loadStatus()}
-async function loadStatus(){try{const s=await api('GET','/api/status');document.getElementById('dot').className='dot'+(s.running?' on':'');document.getElementById('st').textContent=(s.running?'运行中':'已停止')+(s.activeName?' - '+s.activeName:'');active=s.activeNode}catch(e){document.getElementById('st').textContent='连接失败'}}
-async function loadNodes(){const d=await api('GET','/api/nodes');const el=document.getElementById('nl');const ss=document.getElementById('sortSel');if(ss&&d.sort)ss.value=d.sort;if(!d.nodes||!d.nodes.length){el.innerHTML='<div style="padding:12px;font-size:12px;color:#8b949e">暂无节点</div>';return}el.innerHTML=d.nodes.map(n=>{const pc=n.ping>0?'#8b949e':(n.ping<0?'#f85149':'#8b949e');const p=n.ping>0?n.ping+'ms':(n.ping<0?'超时':'');return'<div class="ni '+(n.id===d.active?'ac':'')+'" onclick="switchN(\''+n.id+'\')"><div style="flex:1;min-width:0"><div class="nn">'+esc(n.name)+'</div><div class="nm">'+n.server+':'+n.port+' <span class="tag '+n.protocol+'">'+n.protocol+'</span></div></div><div class="c2"><span class="ping" id="p'+n.id+'" style="font-size:10px;color:'+pc+'">'+p+'</span>'+(n.speed>0?'<div style="font-size:9px;color:#3fb950">'+n.speed.toFixed(1)+'M</div>':'')+'</div><div class="c3"><button class="btn" style="font-size:10px;padding:2px 6px" onclick="event.stopPropagation();pingNode(\''+n.id+'\')">测速</button><button class="btn sp" style="font-size:10px;padding:2px 6px;margin-left:3px" onclick="event.stopPropagation();delNode(\''+n.id+'\')">删除</button><button class="btn '+(n.id===d.active?'ac':'')+'" style="font-size:10px;padding:2px 6px;margin-left:3px">'+(n.id===d.active?'当前':'切换')+'</button></div></div>'}).join('')}
-async function setSort(v){await api('POST','/api/sort',{order:v});loadNodes()}
-async function loadSubs(){const subs=await api('GET','/api/subs');document.getElementById('sl').innerHTML=(subs||[]).map(s=>'<div class="si"><span>'+esc(s.name)+' <span style="font-size:10px;color:#8b949e">'+esc(s.url)+'</span></span><button class="btn sp" onclick="delSub(\''+s.id+'\')">删除</button></div>').join('')}
-async function addSub(){const nm=document.getElementById('n').value.trim(),url=document.getElementById('u').value.trim();if(!url)return;await api('POST','/api/subs',{name:nm,url:url});document.getElementById('n').value='';document.getElementById('u').value='';await loadSubs();await updateSub()}
-async function updateSub(){const btn=[...document.querySelectorAll('button')].find(b=>b.textContent==='更新订阅');const el=document.getElementById('nl');if(btn){btn.disabled=true;btn.textContent='更新中...'}if(el)el.innerHTML='<div style="padding:12px;font-size:12px;color:#8b949e">正在更新订阅...</div>';await fetch('/api/fetch',{method:'POST'});await loadSubs();await loadNodes();if(btn){btn.disabled=false;btn.textContent='更新订阅'}}
-async function delSub(id){await api('POST','/api/subs/'+id);await loadSubs();await loadNodes()}
-async function switchN(id){await api('POST','/api/node/'+id);loadNodes();loadStatus()}
+
+function closeModal(id){document.getElementById(id).classList.remove('show')}
+
+// 加载分组列表
+async function loadGroups(){
+  const d=await api('GET','/api/groups');
+  groups=d.groups||[];
+  activeGrp=d.activeGrp||'';
+  const el=document.getElementById('gl');
+  el.innerHTML=groups.map(g=>{
+    const isActive=g.id===curGrp;
+    const isDefault=g.id==='__default__';
+    const editBtn=(!isDefault&&g.url)?'<span class="gact" onclick="event.stopPropagation();editGroup(\''+g.id+'\')">编辑</span>':'';
+    return '<div class="gi'+(isActive?' ac':'')+'" onclick="selectGroup(\''+g.id+'\')"><div class="gn"><div class="gnm">'+esc(g.name)+'</div><div class="gns">'+(g.url?esc(g.url).substring(0,30)+'...':'无订阅')+'</div></div><span class="gcnt">'+g.nodeCount+'</span>'+editBtn+'</div>'
+  }).join('');
+  if(!curGrp&&groups.length>0)selectGroup(groups[0].id);
+}
+
+// 选择分组
+async function selectGroup(id){
+  curGrp=id;
+  loadGroups();
+  const d=await api('GET','/api/group/'+id+'/nodes');
+  const nodes=d.nodes||[];
+  active=d.active||'';
+  const el=document.getElementById('nl');
+  const grp=groups.find(g=>g.id===id);
+  document.getElementById('grpName').textContent=grp?grp.name:'节点';
+  document.getElementById('delGrpBtn').style.display=(grp&&grp.url)?'inline-block':'none';
+  if(!nodes.length){el.innerHTML='<div class="empty">暂无节点</div>';return}
+  el.innerHTML=nodes.map(n=>{
+    const pc=n.ping>0?'#8b949e':(n.ping<0?'#f85149':'#8b949e');
+    const p=n.ping>0?n.ping+'ms':(n.ping<0?'超时':'');
+    return '<div class="ni '+(n.id===active?'ac':'')+'" onclick="switchN(\''+n.id+'\')"><div class="c1"><div class="nn">'+esc(n.name)+'</div><div class="nm">'+n.server+':'+n.port+' <span class="tag '+n.protocol+'">'+n.protocol+'</span></div></div><div class="c2"><span class="ping" id="p'+n.id+'" style="font-size:10px;color:'+pc+'">'+p+'</span>'+(n.speed>0?'<div style="font-size:9px;color:#3fb950">'+n.speed.toFixed(1)+'M</div>':'')+'</div><div class="c3"><button class="btn" onclick="event.stopPropagation();pingNode(\''+n.id+'\')">测速</button><button class="btn" style="margin-left:3px;color:#f85149" onclick="event.stopPropagation();delNode(\''+n.id+'\')">删除</button></div></div>'
+  }).join('');
+}
+
+async function loadStatus(){
+  try{const s=await api('GET','/api/status');document.getElementById('dot').className='dot'+(s.running?' on':'');document.getElementById('st').textContent=(s.running?'运行中':'已停止')+(s.activeName?' - '+s.activeName:'');active=s.activeNode}catch(e){document.getElementById('st').textContent='连接失败'}
+}
+
+// 添加分组
+function showAddGroup(){document.getElementById('addGroupModal').classList.add('show')}
+async function addGroup(){
+  const name=document.getElementById('gn').value.trim(),url=document.getElementById('gu').value.trim(),proxy=document.getElementById('gp').value.trim();
+  if(!name||!url)return;
+  await api('POST','/api/group/add',{name,url,subProxy:proxy});
+  document.getElementById('gn').value='';document.getElementById('gu').value='';document.getElementById('gp').value='';
+  closeModal('addGroupModal');
+  await loadGroups();
+  setTimeout(()=>fetchGroup(curGrp),200);
+}
+
+// 删除分组
+async function delGroup(){
+  if(!curGrp||!confirm('删除此分组及所有节点？'))return;
+  await api('POST','/api/group/'+curGrp+'/del');
+  curGrp='';
+  await loadGroups();
+}
+
+// 更新全部
+async function refreshAll(){
+  for(const g of groups){
+    if(g.url)await api('POST','/api/group/'+g.id+'/fetch');
+  }
+  loadGroups();
+  setTimeout(()=>selectGroup(curGrp),2000);
+}
+
+// 测速当前分组
+async function pingGroup(){
+  if(!curGrp)return;
+  const btn=document.querySelector('[onclick="pingGroup()"]');
+  if(btn){btn.disabled=true;btn.textContent='测速中...'}
+  const r=await api('POST','/api/ping/group/'+curGrp);
+  if(btn){btn.disabled=false;btn.textContent='测速'}
+  selectGroup(curGrp);
+}
+
+// 切换节点
+async function switchN(id){await api('POST','/api/node/'+id);selectGroup(curGrp);loadStatus()}
+
+// 手动添加节点
+function toggleAddNode(){document.getElementById('addNodeModal').classList.add('show')}
+async function addManualNode(){
+  const d={name:document.getElementById('an').value.trim(),protocol:document.getElementById('ap').value,server:document.getElementById('as').value.trim(),port:document.getElementById('aop').value,uuid:document.getElementById('aid').value,reqHost:document.getElementById('ahost').value,path:document.getElementById('apath').value,network:document.getElementById('anet').value,tls:document.getElementById('atls').value,sni:document.getElementById('asni').value};
+  if(!d.name||!d.server||!d.port){alert('名称、服务器、端口必填');return}
+  const r=await api('POST','/api/node/add',d);
+  if(r.id){closeModal('addNodeModal');document.querySelectorAll('#addNodeModal input').forEach(e=>e.value='');loadGroups();setTimeout(()=>selectGroup('__default__'),100)}
+}
+
+// 导入
+function toggleImport(){document.getElementById('importModal').classList.add('show')}
+async function importNodes(){
+  const t=document.getElementById('imp').value.trim();
+  if(!t){alert('请粘贴节点链接');return}
+  const urls=t.split('\n').filter(l=>l.trim()!=='');
+  const r=await api('POST','/api/node/import',{urls});
+  if(r.ok){closeModal('importModal');document.getElementById('imp').value='';loadGroups();setTimeout(()=>selectGroup('__default__'),100)}
+}
+
+// 删除节点
+async function delNode(id){
+  if(!confirm('删除此节点?'))return;
+  await api('POST','/api/node/'+id+'/del');
+  selectGroup(curGrp);
+}
+
+// 测速
+async function pingNode(id){
+  const el=document.getElementById('p'+id);
+  if(el)el.textContent='测速中...';
+  try{const r=await api('POST','/api/ping/'+id);if(el)el.textContent=r.ms>0?r.ms+'ms':(r.ms<0?'超时':'')}catch(e){if(el)el.textContent='超时'}
+}
+
+async function setSort(v){await api('POST','/api/sort',{order:v});selectGroup(curGrp)}
+
 async function doStart(){await api('POST','/api/proxy/start');loadStatus()}
 async function doStop(){await api('POST','/api/proxy/stop');loadStatus()}
-async function speedTest(){const el=document.getElementById('spd');el.style.color='#8b949e';el.textContent='测速中...';try{const r=await api('POST','/api/speed');if(!r.ok){el.style.color='#f85149';el.textContent=r.error||'失败'}else{el.style.color=r.mbps>=1?'#3fb950':(r.mbps>=0.1?'#e3b341':'#f85149');el.textContent=r.mbps.toFixed(2)+' Mbps';loadNodes()}}catch(e){el.style.color='#f85149';el.textContent='失败'}}
-async function loadSet(){const s=await api('GET','/api/settings');document.getElementById('s1').value=s.socksPort;document.getElementById('s2').value=s.httpPort;document.getElementById('s3').value=s.listenAddr;document.getElementById('s4').value=s.subRefresh;if(document.getElementById('s5'))document.getElementById('s5').value=s.subProxy||'';if(document.getElementById('s6'))document.getElementById('s6').value=s.proxyMode||'smart';if(document.getElementById('s7'))document.getElementById('s7').value=s.speedURL||''}
-async function saveSet(){await api('POST','/api/settings',{socksPort:parseInt(document.getElementById('s1').value),httpPort:parseInt(document.getElementById('s2').value),listenAddr:document.getElementById('s3').value,subRefresh:parseInt(document.getElementById('s4').value),subProxy:document.getElementById('s5')?document.getElementById('s5').value:'',proxyMode:document.getElementById('s6')?document.getElementById('s6').value:'smart',speedURL:document.getElementById('s7')?document.getElementById('s7').value:''})}
-async function setPing(el,r){if(!el)return;if(!r||r.ms===undefined){el.style.color='#8b949e';el.textContent='';return}if(r.ms>0){el.style.color='#8b949e';el.textContent=r.ms+'ms'}else if(r.ms<0){el.style.color='#f85149';el.textContent='超时'}else{el.style.color='#8b949e';el.textContent=''}}
-async function pingNode(id){const el=document.getElementById('p'+id);if(el)el.textContent='测速中...';try{const r=await api('POST','/api/ping/'+id);setPing(el,r)}catch(e){setPing(el,{ms:-1})}}
-async function pingAll(){const d=await api('GET','/api/nodes');if(!d.nodes||!d.nodes.length)return;const ids=d.nodes.map(n=>n.id).sort(()=>Math.random()-0.5);const btn=document.querySelector('[onclick="pingAll()"]');if(btn){btn.disabled=true;btn.textContent='测速中 0/'+ids.length}document.querySelectorAll('.ping').forEach(el=>el.textContent='测速中...');let done=0;for(let i=0;i<ids.length;i+=5){const batch=ids.slice(i,i+5);await Promise.all(batch.map(async id=>{try{const r=await api('POST','/api/ping/'+id);setPing(document.getElementById('p'+id),r)}catch(e){setPing(document.getElementById('p'+id),{ms:-1})}}));done+=batch.length;if(btn)btn.textContent='测速中 '+done+'/'+ids.length;await new Promise(r=>setTimeout(r,0))}if(btn){btn.disabled=false;btn.textContent='全部测速'}loadNodes()}
-async function toggleAddNode(){const f=document.getElementById('addNodeForm');f.style.display=f.style.display==='none'?'block':'none'}
-async function addManualNode(){const d={name:document.getElementById('an').value.trim(),protocol:document.getElementById('ap').value,server:document.getElementById('as').value.trim(),port:document.getElementById('aop').value,uuid:document.getElementById('aid').value,reqHost:document.getElementById('ahost').value,path:document.getElementById('apath').value,network:document.getElementById('anet').value,tls:document.getElementById('atls').value,sni:document.getElementById('asni').value};if(!d.name||!d.server||!d.port){alert('名称、服务器、端口必填');return}const r=await api('POST','/api/node/add',d);if(r.id){loadNodes();toggleAddNode();alert('添加成功')}}
-async function delNode(id){if(!confirm('删除此节点?'))return;await api('POST','/api/node/'+id+'/del');loadNodes()}
-async function toggleImportForm(){const f=document.getElementById('importForm');f.style.display=f.style.display==='none'?'block':'none'}
-async function importNodes(){const t=document.getElementById('imp').value.trim();if(!t){alert('请先粘贴节点链接');return}const urls=t.split('\n').filter(l=>l.trim()!=='');if(urls.length===0){alert('没有可解析的链接');return}const r=await api('POST','/api/node/import',{urls:urls});if(r.ok){loadNodes();toggleImportForm();document.getElementById('imp').value='';alert('导入成功 '+r.count+' 个节点')}else{alert('导入失败: '+(r.error||'未知错误'))}}
+
+async function speedTest(){
+  const el=document.getElementById('spd');el.textContent='测速中...';el.style.color='#8b949e';
+  try{const r=await api('POST','/api/speed');if(!r.ok){el.style.color='#f85149';el.textContent=r.error||'失败'}else{el.style.color=r.mbps>=1?'#3fb950':(r.mbps>=0.1?'#e3b341':'#f85149');el.textContent=r.mbps.toFixed(2)+' Mbps';selectGroup(curGrp)}}catch(e){el.style.color='#f85149';el.textContent='失败'}
+}
+
 function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML}
-refresh();loadSet();setInterval(loadStatus,5000);
+
+// 编辑订阅分组
+let editGID='';
+function editGroup(id){
+  editGID=id;
+  const g=groups.find(x=>x.id===id);
+  document.getElementById('egn').value=g?g.name||'':'';
+  document.getElementById('egu').value=g?g.url||'':'';
+  document.getElementById('egp').value=g?(g.subProxy||''):'';
+  document.getElementById('editGroupModal').classList.add('show');
+}
+async function updateGroup(){
+  const name=document.getElementById('egn').value.trim();
+  const url=document.getElementById('egu').value.trim();
+  const proxy=document.getElementById('egp').value.trim();
+  if(!name||!url){alert('名称和订阅URL不能为空');return}
+  const r=await api('POST','/api/group/'+editGID+'/update',{name,url,subProxy:proxy});
+  if(r.error){alert('保存失败: '+r.error);return}
+  document.getElementById('egn').value='';document.getElementById('egu').value='';document.getElementById('egp').value='';
+  closeModal('editGroupModal');
+  await loadGroups();
+  setTimeout(()=>selectGroup(editGID),300);
+}
+
+// 设置面板
+async function showSettings(){
+  try{
+    const s=await api('GET','/api/settings');
+    document.getElementById('setSocks').value=s.socksPort||'';
+    document.getElementById('setHttp').value=s.httpPort||'';
+    document.getElementById('setListen').value=s.listenAddr||'';
+    document.getElementById('setRefresh').value=s.subRefresh||'';
+    document.getElementById('setMode').value=s.proxyMode||'smart';
+    document.getElementById('setSubProxy').value=s.subProxy||'';
+    document.getElementById('setSpeedURL').value=s.speedURL||'';
+  }catch(e){}
+  document.getElementById('settingsModal').classList.add('show');
+}
+
+async function saveSettings(){
+  const socks=parseInt(document.getElementById('setSocks').value);
+  const http=parseInt(document.getElementById('setHttp').value);
+  const refresh=parseInt(document.getElementById('setRefresh').value);
+  if(!socks||socks<=0||socks>65535){alert('SOCKS5端口无效');return}
+  if(!http||http<=0||http>65535){alert('HTTP端口无效');return}
+  if(!refresh||refresh<10){alert('订阅刷新间隔需≥10秒');return}
+  const b={
+    socksPort:socks,
+    httpPort:http,
+    listenAddr:document.getElementById('setListen').value.trim()||'0.0.0.0',
+    subRefresh:refresh,
+    proxyMode:document.getElementById('setMode').value,
+    subProxy:document.getElementById('setSubProxy').value.trim(),
+    speedURL:document.getElementById('setSpeedURL').value.trim()||'https://speed.cloudflare.com/__down?bytes=2000000'
+  };
+  const r=await api('POST','/api/settings',b);
+  closeModal('settingsModal');
+  if(r.error){alert('保存失败: '+r.error);return}
+  alert('设置已保存，代理配置已应用');
+}
+
+loadGroups();loadStatus();setInterval(loadStatus,5000);
 </script></body></html>

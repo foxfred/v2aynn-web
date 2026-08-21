@@ -38,7 +38,7 @@ func main() {
 			return
 		}
 		// 首次拉取订阅（同步），确保节点ID有效后再启动
-		subscription.Fetch(cfg)
+		subscription.FetchAll(cfg)
 		for attempt := 1; attempt <= 5; attempt++ {
 			err := v2m.Start()
 			if err == nil {

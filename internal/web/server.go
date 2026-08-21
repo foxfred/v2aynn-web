@@ -26,7 +26,6 @@ var indexHTML string
 //go:embed static/*
 var staticFS embed.FS
 
-// speedTestURL 真实下载测速用的目标（Cloudflare 2MB 文件，全球 CDN 稳定可达）
 const speedTestURL = "https://speed.cloudflare.com/__down?bytes=2000000"
 
 type WebServer struct {
@@ -42,17 +41,18 @@ func NewServer(cfg *config.Config, v2m *v2ray.Manager) *WebServer {
 func (w *WebServer) Run(addr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/status", w.apiStatus)
-	mux.HandleFunc("GET /api/nodes", w.apiNodes)
-	mux.HandleFunc("GET /api/subs", w.apiSubs)
-	mux.HandleFunc("POST /api/subs", w.apiAddSub)
-	mux.HandleFunc("POST /api/subs/{id}", w.apiDelSub)
-	mux.HandleFunc("POST /api/fetch", w.apiFetch)
+	mux.HandleFunc("GET /api/groups", w.apiGroups)
+	mux.HandleFunc("POST /api/group/add", w.apiAddGroup)
+	mux.HandleFunc("POST /api/group/{id}/del", w.apiDelGroup)
+	mux.HandleFunc("POST /api/group/{id}/update", w.apiUpdateGroup)
+	mux.HandleFunc("POST /api/group/{id}/fetch", w.apiFetchGroup)
+	mux.HandleFunc("GET /api/group/{id}/nodes", w.apiGroupNodes)
 	mux.HandleFunc("POST /api/node/add", w.apiAddNode)
 	mux.HandleFunc("POST /api/node/import", w.apiImportNode)
 	mux.HandleFunc("POST /api/node/{id}/del", w.apiDelNode)
 	mux.HandleFunc("POST /api/node/{id}", w.apiSwitch)
 	mux.HandleFunc("POST /api/ping/{id}", w.apiPing)
-	mux.HandleFunc("POST /api/pingall", w.apiPingAll)
+	mux.HandleFunc("POST /api/ping/group/{id}", w.apiPingGroup)
 	mux.HandleFunc("POST /api/speed", w.apiSpeed)
 	mux.HandleFunc("POST /api/sort", w.apiSort)
 	mux.HandleFunc("POST /api/proxy/start", w.apiStart)
@@ -79,15 +79,53 @@ func (w *WebServer) apiStatus(rw http.ResponseWriter, r *http.Request) {
 	w.writeJSON(rw, w.v2m.Status())
 }
 
-func (w *WebServer) apiNodes(rw http.ResponseWriter, r *http.Request) {
+// apiGroups 返回所有分组概览（不含节点列表，仅含节点数）
+func (w *WebServer) apiGroups(rw http.ResponseWriter, r *http.Request) {
 	w.cfg.Lock()
-	nodes := make([]config.Node, len(w.cfg.Nodes))
-	copy(nodes, w.cfg.Nodes)
+	type groupSummary struct {
+		ID        string `json:"id"`
+		Name      string `json:"name"`
+		URL       string `json:"url"`
+		NodeCount int    `json:"nodeCount"`
+		LastFetch string `json:"lastFetch"`
+		SubProxy  string `json:"subProxy"`
+	}
+	groups := make([]groupSummary, len(w.cfg.Groups))
+	for i, g := range w.cfg.Groups {
+		groups[i] = groupSummary{
+			ID: g.ID, Name: g.Name, URL: g.URL,
+			NodeCount: len(g.Nodes), LastFetch: g.LastFetch,
+			SubProxy: g.SubProxy,
+		}
+	}
+	activeGrp := w.cfg.ActiveGrp
+	w.cfg.Unlock()
+	w.writeJSON(rw, map[string]interface{}{
+		"groups":    groups,
+		"activeGrp": activeGrp,
+	})
+}
+
+// apiGroupNodes 返回指定分组的节点列表
+func (w *WebServer) apiGroupNodes(rw http.ResponseWriter, r *http.Request) {
+	gid := r.PathValue("id")
+	w.cfg.Lock()
+	var nodes []config.Node
 	active := w.cfg.ActiveNode
 	sortOrder := w.cfg.SortOrder
+	for _, g := range w.cfg.Groups {
+		if g.ID == gid {
+			nodes = make([]config.Node, len(g.Nodes))
+			copy(nodes, g.Nodes)
+			break
+		}
+	}
 	w.cfg.Unlock()
+	if nodes == nil {
+		w.writeJSON(rw, map[string]interface{}{"nodes": []config.Node{}, "active": active, "sort": sortOrder})
+		return
+	}
 
-	// 按延迟排序: ping>0 的节点按数字排序放前面，超时(-1)/未测(0)放最后
 	switch sortOrder {
 	case "ping_asc":
 		sortNodes(nodes, true)
@@ -95,102 +133,113 @@ func (w *WebServer) apiNodes(rw http.ResponseWriter, r *http.Request) {
 		sortNodes(nodes, false)
 	}
 
-	w.writeJSON(rw, map[string]interface{}{"nodes": nodes, "active": active, "sort": sortOrder})
+	w.writeJSON(rw, map[string]interface{}{"nodes": nodes, "active": active, "sort": sortOrder, "groupId": gid})
 }
 
-// apiSort 保存排序方式
-func (w *WebServer) apiSort(rw http.ResponseWriter, r *http.Request) {
+// apiAddGroup 添加订阅分组
+func (w *WebServer) apiAddGroup(rw http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Order string `json:"order"`
+		Name     string `json:"name"`
+		URL      string `json:"url"`
+		SubProxy string `json:"subProxy"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.writeJSON(rw, map[string]string{"error": "bad json"})
 		return
 	}
-	if req.Order != "" && req.Order != "ping_asc" && req.Order != "ping_desc" {
-		w.writeJSON(rw, map[string]string{"error": "bad order"})
+	if req.Name == "" || req.URL == "" {
+		w.writeJSON(rw, map[string]string{"error": "name and url required"})
 		return
 	}
+	id := fmt.Sprintf("%d", time.Now().UnixNano())
 	w.cfg.Lock()
-	w.cfg.SortOrder = req.Order
-	_ = w.cfg.Save()
-	w.cfg.Unlock()
-	w.writeJSON(rw, map[string]string{"ok": "true"})
-}
-
-// sortNodes 对节点按ping排序，valid ping优先，asc=true升序否则降序
-func sortNodes(nodes []config.Node, asc bool) {
-	sort.SliceStable(nodes, func(i, j int) bool {
-		pi, pj := nodes[i].Ping, nodes[j].Ping
-		vi, vj := pi > 0, pj > 0
-		if vi != vj {
-			return vi
-		}
-		if !vi {
-			return false
-		}
-		if asc {
-			return pi < pj
-		}
-		return pi > pj
-	})
-}
-
-func (w *WebServer) apiSubs(rw http.ResponseWriter, r *http.Request) {
-	w.cfg.Lock()
-	subs := make([]config.Sub, len(w.cfg.Subs))
-	copy(subs, w.cfg.Subs)
-	w.cfg.Unlock()
-	w.writeJSON(rw, subs)
-}
-
-func (w *WebServer) apiAddSub(rw http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Name string `json:"name"`
-		URL  string `json:"url"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.writeJSON(rw, map[string]string{"error": "bad json"})
-		return
-	}
-	w.cfg.Lock()
-	w.cfg.Subs = append(w.cfg.Subs, config.Sub{
-		ID:   fmt.Sprintf("%d", time.Now().UnixNano()),
-		Name: req.Name, URL: req.URL,
+	w.cfg.Groups = append(w.cfg.Groups, config.Group{
+		ID:   id,
+		Name: req.Name, URL: req.URL, SubProxy: req.SubProxy,
+		Nodes: []config.Node{},
 	})
 	_ = w.cfg.Save()
 	w.cfg.Unlock()
-	w.writeJSON(rw, map[string]string{"ok": "true"})
+	// 异步拉取
+	go subscription.FetchGroup(w.cfg, id)
+	w.writeJSON(rw, map[string]string{"id": id, "ok": "true"})
 }
 
-func (w *WebServer) apiDelSub(rw http.ResponseWriter, r *http.Request) {
+// apiDelGroup 删除订阅分组
+func (w *WebServer) apiDelGroup(rw http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if id == config.DefaultGroupID {
+		w.writeJSON(rw, map[string]string{"error": "不能删除默认分组"})
+		return
+	}
 	w.cfg.Lock()
-	subs := make([]config.Sub, 0)
-	for _, s := range w.cfg.Subs {
-		if s.ID != id {
-			subs = append(subs, s)
+	groups := make([]config.Group, 0)
+	for _, g := range w.cfg.Groups {
+		if g.ID != id {
+			groups = append(groups, g)
 		}
 	}
-	w.cfg.Subs = subs
-	nodes := make([]config.Node, 0)
-	for _, n := range w.cfg.Nodes {
-		if n.SubID != id {
-			nodes = append(nodes, n)
-		}
+	w.cfg.Groups = groups
+	if w.cfg.ActiveGrp == id {
+		w.cfg.ActiveGrp = ""
 	}
-	w.cfg.Nodes = nodes
 	_ = w.cfg.Save()
 	w.cfg.Unlock()
 	w.writeJSON(rw, map[string]string{"ok": "true"})
 }
 
-func (w *WebServer) apiFetch(rw http.ResponseWriter, r *http.Request) {
-	go subscription.Fetch(w.cfg)
+// apiUpdateGroup 更新订阅分组（名称/订阅URL/订阅代理），仅限有URL的订阅分组
+func (w *WebServer) apiUpdateGroup(rw http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == config.DefaultGroupID {
+		w.writeJSON(rw, map[string]string{"error": "默认分组不支持编辑"})
+		return
+	}
+	var req struct {
+		Name     string `json:"name"`
+		URL      string `json:"url"`
+		SubProxy string `json:"subProxy"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.writeJSON(rw, map[string]string{"error": "bad json"})
+		return
+	}
+	w.cfg.Lock()
+	updated := false
+	for i := range w.cfg.Groups {
+		if w.cfg.Groups[i].ID == id {
+			if req.Name != "" {
+				w.cfg.Groups[i].Name = req.Name
+			}
+			if req.URL != "" {
+				w.cfg.Groups[i].URL = req.URL
+			}
+			w.cfg.Groups[i].SubProxy = req.SubProxy
+			w.cfg.Groups[i].LastFetch = ""
+			w.cfg.Groups[i].Nodes = []config.Node{}
+			updated = true
+			break
+		}
+	}
+	_ = w.cfg.Save()
+	w.cfg.Unlock()
+	if !updated {
+		w.writeJSON(rw, map[string]string{"error": "分组不存在"})
+		return
+	}
+	// 更新后异步拉取新订阅
+	go subscription.FetchGroup(w.cfg, id)
 	w.writeJSON(rw, map[string]string{"ok": "true"})
 }
 
-// apiAddNode 创建手动节点
+// apiFetchGroup 拉取指定分组
+func (w *WebServer) apiFetchGroup(rw http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	go subscription.FetchGroup(w.cfg, id)
+	w.writeJSON(rw, map[string]string{"ok": "true"})
+}
+
+// apiAddNode 创建手动节点（默认分组）
 func (w *WebServer) apiAddNode(rw http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name        string `json:"name"`
@@ -228,13 +277,19 @@ func (w *WebServer) apiAddNode(rw http.ResponseWriter, r *http.Request) {
 		Ping: 0, Speed: 0,
 	}
 	w.cfg.Lock()
-	w.cfg.Nodes = append([]config.Node{node}, w.cfg.Nodes...)
+	w.cfg.EnsureDefaultGroup()
+	for i := range w.cfg.Groups {
+		if w.cfg.Groups[i].ID == config.DefaultGroupID {
+			w.cfg.Groups[i].Nodes = append([]config.Node{node}, w.cfg.Groups[i].Nodes...)
+			break
+		}
+	}
 	_ = w.cfg.Save()
 	w.cfg.Unlock()
 	w.writeJSON(rw, map[string]string{"id": id, "ok": "true"})
 }
 
-// apiImportNode 粘贴导入节点（支持 vless://, vmess://, trojan://, ss:// 链接，每行一个）
+// apiImportNode 导入节点到默认分组
 func (w *WebServer) apiImportNode(rw http.ResponseWriter, r *http.Request) {
 	var req struct {
 		URLs []string `json:"urls"`
@@ -249,35 +304,39 @@ func (w *WebServer) apiImportNode(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	var added []string
+	w.cfg.Lock()
+	w.cfg.EnsureDefaultGroup()
 	for _, raw := range req.URLs {
 		raw = strings.TrimSpace(raw)
 		if raw == "" {
 			continue
 		}
-		// 尝试整段作为单个URL解析
 		if n, err := subscription.Parse(raw); err == nil {
-			w.cfg.Lock()
-			w.cfg.Nodes = append([]config.Node{n}, w.cfg.Nodes...)
-			w.cfg.Unlock()
+			for i := range w.cfg.Groups {
+				if w.cfg.Groups[i].ID == config.DefaultGroupID {
+					w.cfg.Groups[i].Nodes = append([]config.Node{n}, w.cfg.Groups[i].Nodes...)
+					break
+				}
+			}
 			added = append(added, n.Name)
 			continue
 		}
-		// 多行：按行拆分
 		for _, line := range strings.Split(raw, "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" {
 				continue
 			}
 			if n, err := subscription.Parse(line); err == nil {
-				w.cfg.Lock()
-				w.cfg.Nodes = append([]config.Node{n}, w.cfg.Nodes...)
-				w.cfg.Unlock()
+				for i := range w.cfg.Groups {
+					if w.cfg.Groups[i].ID == config.DefaultGroupID {
+						w.cfg.Groups[i].Nodes = append([]config.Node{n}, w.cfg.Groups[i].Nodes...)
+						break
+					}
+				}
 				added = append(added, n.Name)
 			}
 		}
 	}
-
-	w.cfg.Lock()
 	_ = w.cfg.Save()
 	w.cfg.Unlock()
 
@@ -292,15 +351,10 @@ func (w *WebServer) apiImportNode(rw http.ResponseWriter, r *http.Request) {
 func (w *WebServer) apiDelNode(rw http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	w.cfg.Lock()
-	nodes := make([]config.Node, 0)
-	for _, n := range w.cfg.Nodes {
-		if n.ID != id {
-			nodes = append(nodes, n)
-		}
-	}
-	w.cfg.Nodes = nodes
+	w.cfg.RemoveNode(id)
 	if w.cfg.ActiveNode == id {
 		w.cfg.ActiveNode = ""
+		w.cfg.ActiveGrp = ""
 	}
 	_ = w.cfg.Save()
 	w.cfg.Unlock()
@@ -319,17 +373,9 @@ func (w *WebServer) apiSwitch(rw http.ResponseWriter, r *http.Request) {
 func (w *WebServer) apiPing(rw http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	w.cfg.Lock()
-	var node *config.Node
-	for i := range w.cfg.Nodes {
-		if w.cfg.Nodes[i].ID == id {
-			node = &w.cfg.Nodes[i]
-			break
-		}
-	}
+	node, gid := w.cfg.FindNode(id)
 	w.cfg.Unlock()
 	if node == nil {
-		// 节点在测速期间被订阅刷新替换为新ID: 返回超时而非 error,
-		// 避免前端拿到 undefined 结果显示空白("丢失测速信息")
 		w.writeJSON(rw, map[string]interface{}{"id": id, "ms": -1})
 		return
 	}
@@ -339,32 +385,30 @@ func (w *WebServer) apiPing(rw http.ResponseWriter, r *http.Request) {
 		ms = -1
 	}
 	w.cfg.Lock()
-	for i := range w.cfg.Nodes {
-		if w.cfg.Nodes[i].ID == id {
-			w.cfg.Nodes[i].Ping = int(ms)
+	if n, _ := w.cfg.FindNode(id); n != nil {
+		n.Ping = int(ms)
+		_ = w.cfg.Save()
+	}
+	w.cfg.Unlock()
+	w.writeJSON(rw, map[string]interface{}{"id": id, "ms": ms, "groupId": gid})
+}
+
+// apiPingGroup 测速指定分组的全部节点
+func (w *WebServer) apiPingGroup(rw http.ResponseWriter, r *http.Request) {
+	gid := r.PathValue("id")
+	w.cfg.Lock()
+	var nodes []config.Node
+	for _, g := range w.cfg.Groups {
+		if g.ID == gid {
+			nodes = make([]config.Node, len(g.Nodes))
+			copy(nodes, g.Nodes)
 			break
 		}
 	}
-	_ = w.cfg.Save()
-	w.cfg.Unlock()
-	w.writeJSON(rw, map[string]interface{}{"id": id, "ms": ms})
-}
-
-func (w *WebServer) apiPingAll(rw http.ResponseWriter, r *http.Request) {
-	w.cfg.Lock()
-	nodes := make([]config.Node, len(w.cfg.Nodes))
-	copy(nodes, w.cfg.Nodes)
 	w.cfg.Unlock()
 
-	type result struct {
-		id   string
-		ms   int64
-		name string
-		key  string // server:port:protocol, 用于跨Fetch周期匹配
-	}
-	ch := make(chan result, len(nodes))
-	sem := make(chan struct{}, 5) // 最多5个并发
-
+	ch := make(chan map[string]interface{}, len(nodes))
+	sem := make(chan struct{}, 5)
 	for _, node := range nodes {
 		go func(n config.Node) {
 			sem <- struct{}{}
@@ -374,29 +418,31 @@ func (w *WebServer) apiPingAll(rw http.ResponseWriter, r *http.Request) {
 				ms = -1
 			}
 			<-sem
-			ch <- result{id: n.ID, ms: ms, name: n.Name, key: key}
+			ch <- map[string]interface{}{"id": n.ID, "ms": ms, "key": key}
 		}(node)
 	}
 
+	pingMap := make(map[string]int)
 	results := make([]map[string]interface{}, 0, len(nodes))
-	pingMap := make(map[string]int) // key -> ms, 用key而非ID确保跨Fetch正确
 	for i := 0; i < len(nodes); i++ {
 		r := <-ch
-		results = append(results, map[string]interface{}{
-			"id": r.id, "ms": r.ms, "name": r.name,
-		})
-		// 保存所有非零结果（含 -1 超时），确保测速后超时节点持久化为超时而非旧值
-		if r.ms != 0 {
-			pingMap[r.key] = int(r.ms)
+		results = append(results, map[string]interface{}{"id": r["id"], "ms": r["ms"]})
+		ms := r["ms"].(int64)
+		if ms != 0 {
+			pingMap[r["key"].(string)] = int(ms)
 		}
 	}
 
-	// 保存测速结果到配置（按 server:port:protocol 匹配，跨Fetch周期安全）
 	w.cfg.Lock()
-	for i := range w.cfg.Nodes {
-		key := w.cfg.Nodes[i].Server + ":" + w.cfg.Nodes[i].Port + ":" + w.cfg.Nodes[i].Protocol
-		if p, ok := pingMap[key]; ok {
-			w.cfg.Nodes[i].Ping = p
+	for gi := range w.cfg.Groups {
+		if w.cfg.Groups[gi].ID == gid {
+			for ni := range w.cfg.Groups[gi].Nodes {
+				key := w.cfg.Groups[gi].Nodes[ni].Server + ":" + w.cfg.Groups[gi].Nodes[ni].Port + ":" + w.cfg.Groups[gi].Nodes[ni].Protocol
+				if p, ok := pingMap[key]; ok {
+					w.cfg.Groups[gi].Nodes[ni].Ping = p
+				}
+			}
+			break
 		}
 	}
 	_ = w.cfg.Save()
@@ -405,9 +451,6 @@ func (w *WebServer) apiPingAll(rw http.ResponseWriter, r *http.Request) {
 	w.writeJSON(rw, results)
 }
 
-// apiSpeed 对【当前激活节点】做真实下载测速。
-// 真实吞吐必须穿过节点隧道，而 xray 只以激活节点运行，故只能测正在用的节点。
-// 通过本地 HTTP 代理端口把流量导入隧道，下载 Cloudflare 2MB 文件计算 Mbps。
 func (w *WebServer) apiSpeed(rw http.ResponseWriter, r *http.Request) {
 	if !w.v2m.IsRunning() {
 		w.writeJSON(rw, map[string]interface{}{"ok": false, "error": "代理未运行，请先启动", "mbps": 0})
@@ -449,22 +492,15 @@ func (w *WebServer) apiSpeed(rw http.ResponseWriter, r *http.Request) {
 	}
 	mbps := float64(n) * 8.0 / 1e6 / elapsed.Seconds()
 
-	// 把测得的真实速度写回激活节点，列表里也能看到
 	w.cfg.Lock()
-	for i := range w.cfg.Nodes {
-		if w.cfg.Nodes[i].ID == w.cfg.ActiveNode {
-			w.cfg.Nodes[i].Speed = mbps
-			break
-		}
+	if n, _ := w.cfg.FindNode(w.cfg.ActiveNode); n != nil {
+		n.Speed = mbps
+		_ = w.cfg.Save()
 	}
-	_ = w.cfg.Save()
 	w.cfg.Unlock()
 
 	w.writeJSON(rw, map[string]interface{}{
-		"ok":    true,
-		"mbps":  mbps,
-		"bytes": n,
-		"ms":    elapsed.Milliseconds(),
+		"ok": true, "mbps": mbps, "bytes": n, "ms": elapsed.Milliseconds(),
 	})
 }
 
@@ -478,6 +514,25 @@ func (w *WebServer) apiStart(rw http.ResponseWriter, r *http.Request) {
 
 func (w *WebServer) apiStop(rw http.ResponseWriter, r *http.Request) {
 	w.v2m.Stop()
+	w.writeJSON(rw, map[string]string{"ok": "true"})
+}
+
+func (w *WebServer) apiSort(rw http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Order string `json:"order"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.writeJSON(rw, map[string]string{"error": "bad json"})
+		return
+	}
+	if req.Order != "" && req.Order != "ping_asc" && req.Order != "ping_desc" {
+		w.writeJSON(rw, map[string]string{"error": "bad order"})
+		return
+	}
+	w.cfg.Lock()
+	w.cfg.SortOrder = req.Order
+	_ = w.cfg.Save()
+	w.cfg.Unlock()
 	w.writeJSON(rw, map[string]string{"ok": "true"})
 }
 
@@ -549,20 +604,31 @@ func corsHandler(h http.Handler) http.Handler {
 	})
 }
 
-// probeNode 测速：返回 (延迟ms, 是否可达)。
-// 方案：TCP 连接 + (若启用TLS)真实握手。这是【连通性】信号，用于筛掉死节点。
-// 采样策略：首次成功立即返回（快的节点一次搞定）；仅失败时重试一次，
-// 显著加快全量测速，避免每个节点的 3 次等待叠加。
+func sortNodes(nodes []config.Node, asc bool) {
+	sort.SliceStable(nodes, func(i, j int) bool {
+		pi, pj := nodes[i].Ping, nodes[j].Ping
+		vi, vj := pi > 0, pj > 0
+		if vi != vj {
+			return vi
+		}
+		if !vi {
+			return false
+		}
+		if asc {
+			return pi < pj
+		}
+		return pi > pj
+	})
+}
+
 func probeNode(n config.Node, timeout time.Duration) (int64, bool) {
 	addr := net.JoinHostPort(n.Server, n.Port)
 	useTLS := n.TLS == "tls" || n.TLS == "xtls" || n.TLS == "reality" ||
 		n.Protocol == "trojan" || n.Security == "tls" || n.Security == "reality"
 
-	// 第一次尝试
 	if ms, reach := probeOnce(n, addr, useTLS, timeout); reach {
 		return ms, true
 	}
-	// 首次失败（可能瞬时网络抖动），再试一次
 	if ms, reach := probeOnce(n, addr, useTLS, timeout); reach {
 		return ms, true
 	}
@@ -579,7 +645,6 @@ func probeOnce(n config.Node, addr string, useTLS bool, timeout time.Duration) (
 	conn.SetDeadline(time.Now().Add(timeout))
 
 	if useTLS {
-		// TLS 握手验证：能完成握手说明节点的 TLS 层真实可用
 		sni := n.SNI
 		if sni == "" {
 			sni = n.RequestHost
@@ -589,13 +654,12 @@ func probeOnce(n config.Node, addr string, useTLS bool, timeout time.Duration) (
 		}
 		tconn := tls.Client(conn, &tls.Config{
 			ServerName:         sni,
-			InsecureSkipVerify: true, // 节点IP与证书未必匹配，只验证握手
+			InsecureSkipVerify: true,
 			MinVersion:         tls.VersionTLS12,
 		})
 		if err := tconn.Handshake(); err != nil {
 			return -1, false
 		}
-		// 读服务器首字节验证协议栈活跃；多数服务器不会主动推送，超时也算可达
 		br := bufio.NewReader(tconn)
 		tconn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
 		_, _ = br.ReadByte()
@@ -606,7 +670,6 @@ func probeOnce(n config.Node, addr string, useTLS bool, timeout time.Duration) (
 		return elapsed, true
 	}
 
-	// 非 TLS：TCP 连上即认为可达（vless/vmess 服务器不会主动推送数据）
 	if n.Protocol == "vmess" || n.Protocol == "vless" {
 		conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 		buf := make([]byte, 1)

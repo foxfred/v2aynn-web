@@ -56,11 +56,8 @@ func (m *Manager) Start() error {
 
 	var node *config.Node
 	m.cfg.Lock()
-	for i := range m.cfg.Nodes {
-		if m.cfg.Nodes[i].ID == m.cfg.ActiveNode {
-			node = &m.cfg.Nodes[i]
-			break
-		}
+	if n, _ := m.cfg.FindNode(m.cfg.ActiveNode); n != nil {
+		node = n
 	}
 	m.cfg.Unlock()
 	if node == nil {
@@ -142,17 +139,16 @@ func (m *Manager) SwitchNode(id string) error {
 	// 先确认节点存在，避免把 ActiveNode 设置为已不存在的 ID（订阅刷新竞态下会报"不在节点列表中"）
 	m.cfg.Lock()
 	found := false
-	for _, n := range m.cfg.Nodes {
-		if n.ID == id {
-			found = true
-			break
-		}
+	var grpID string
+	if _, grpID = m.cfg.FindNode(id); grpID != "" {
+		found = true
 	}
 	if !found {
 		m.cfg.Unlock()
 		return fmt.Errorf("节点(%s)不在节点列表中", id)
 	}
 	m.cfg.ActiveNode = id
+	m.cfg.ActiveGrp = grpID
 	_ = m.cfg.Save()
 	m.cfg.Unlock()
 	// 重置重启计数
@@ -172,11 +168,8 @@ func (m *Manager) Status() map[string]interface{} {
 	activeName := m.activeName
 	if activeName == "" {
 		m.cfg.Lock()
-		for _, n := range m.cfg.Nodes {
-			if n.ID == m.cfg.ActiveNode {
-				activeName = n.Name
-				break
-			}
+		if n, _ := m.cfg.FindNode(m.cfg.ActiveNode); n != nil {
+			activeName = n.Name
 		}
 		m.cfg.Unlock()
 	}
