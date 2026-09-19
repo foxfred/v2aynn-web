@@ -32,6 +32,15 @@ func main() {
 	// 定时拉取订阅（后台）：首轮同步拉取放在web服务启动前完成
 	go subscription.Poll(cfg)
 
+	// 合并落盘：测速结果等高频改动只标脏，由此处每5秒合并写一次，减少磁盘写入
+	go func() {
+		for range time.Tick(5 * time.Second) {
+			cfg.Lock()
+			cfg.Flush()
+			cfg.Unlock()
+		}
+	}()
+
 	// 开机自动启动代理：先同步拉取确保节点有效，再启动（带重试）
 	go func() {
 		if cfg.ActiveNode == "" {

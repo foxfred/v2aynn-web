@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"sort"
 	"sync"
 	"time"
 
@@ -22,9 +23,9 @@ type Manager struct {
 	activeName   string // 缓存实际启动节点的名称，避免依赖 cfg.Nodes 反查
 	activeNodeID string
 
-	restartCount    int       // 连续重启次数
-	lastRestart     time.Time // 上次重启时间
-	restartMu       sync.Mutex
+	restartCount int       // 连续重启次数
+	lastRestart  time.Time // 上次重启时间
+	restartMu    sync.Mutex
 }
 
 func NewManager(dataDir string) *Manager {
@@ -111,8 +112,14 @@ func (m *Manager) watch(cmd *exec.Cmd) {
 		m.restartCount++
 		m.lastRestart = now
 		if m.restartCount > 3 {
-			log.Printf("xray 连续重启 %d 次失败，放弃自动重启，请检查节点配置", m.restartCount)
+			giveUpCount := m.restartCount
+			// 必须先释放 restartMu：SwitchNode 内部会再次加锁，否则死锁
 			m.restartMu.Unlock()
+			// 当前节点已判定不可用，先尝试自动故障转移，而不是直接放弃
+			if m.tryFailover() {
+				return
+			}
+			log.Printf("xray 连续重启 %d 次失败，放弃自动重启，请检查节点配置", giveUpCount)
 			return
 		}
 		restartCount := m.restartCount
@@ -122,6 +129,55 @@ func (m *Manager) watch(cmd *exec.Cmd) {
 		time.Sleep(5 * time.Second)
 		_ = m.Start()
 	}
+}
+
+// tryFailover 当前节点连续失败后，自动切换到其他可用节点。
+// 优先选择已测速可达（ping>0）且延迟最低的节点，最多尝试 3 个。
+// 返回 true 表示已成功切换到新节点。
+func (m *Manager) tryFailover() bool {
+	if !m.cfg.FailoverEnabled() {
+		return false
+	}
+
+	m.cfg.Lock()
+	cur := m.cfg.ActiveNode
+	var cands []config.Node
+	for _, n := range m.cfg.AllNodes() {
+		if n.ID != cur {
+			cands = append(cands, n)
+		}
+	}
+	m.cfg.Unlock()
+
+	if len(cands) == 0 {
+		return false
+	}
+	// 可达节点优先，其次按延迟升序
+	sort.SliceStable(cands, func(i, j int) bool {
+		pi, pj := cands[i].Ping, cands[j].Ping
+		vi, vj := pi > 0, pj > 0
+		if vi != vj {
+			return vi
+		}
+		if !vi {
+			return false
+		}
+		return pi < pj
+	})
+
+	const maxTry = 3
+	tried := 0
+	for i := 0; i < len(cands) && i < maxTry; i++ {
+		tried++
+		log.Printf("自动故障转移: 尝试切换到[%s]", cands[i].Name)
+		if err := m.SwitchNode(cands[i].ID); err == nil {
+			log.Printf("自动故障转移成功 -> [%s]", cands[i].Name)
+			return true
+		}
+		time.Sleep(2 * time.Second)
+	}
+	log.Printf("自动故障转移失败: 已尝试 %d 个节点均未成功", tried)
+	return false
 }
 
 func (m *Manager) Stop() {

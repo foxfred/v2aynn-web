@@ -86,6 +86,8 @@ body{font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;line-heig
 /* 设置面板 */
 .st-ft{font-size:12px;color:#8b949e;margin-bottom:8px;padding-top:6px;border-top:1px solid #21262d}
 .st-full{grid-column:1/-1}
+.modal .mp label.ck{display:flex;align-items:center;gap:6px;cursor:pointer;margin:4px 0 10px}
+.modal .mp label.ck input{width:auto;margin:0}
 </style></head>
 <body><div class="app">
 <div class="topbar">
@@ -177,10 +179,16 @@ body{font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;line-heig
 <div><label>SOCKS5 端口</label><input id="setSocks" type="number" placeholder="10808"></div>
 <div><label>HTTP 代理端口</label><input id="setHttp" type="number" placeholder="10810"></div>
 <div class="st-full"><label>Web 监听地址</label><input id="setListen" placeholder="0.0.0.0"></div>
-<div><label>订阅刷新间隔(秒)</label><input id="setRefresh" type="number" placeholder="300"></div>
+<div><label>订阅刷新间隔(秒，0=禁用自动刷新)</label><input id="setRefresh" type="number" min="0" placeholder="300"></div>
 <div><label>代理模式</label><select id="setMode"><option value="smart">智能（仅直连受阻走代理）</option><option value="global">全局</option><option value="direct">直连</option></select></div>
+<div class="st-full"><label class="ck"><input type="checkbox" id="setFailover">节点连续失败时，自动切换到其他可用节点</label></div>
 <div class="st-full"><label>全局订阅代理（HTTP代理，可选）</label><input id="setSubProxy" placeholder="http://127.0.0.1:7890"></div>
 <div class="st-full"><label>测速URL（用于真实测速）</label><input id="setSpeedURL" placeholder="https://speed.cloudflare.com/__down?bytes=2000000"></div>
+<div class="st-full"><label>配置备份 / 恢复</label>
+<button class="btn" onclick="backupCfg()">导出配置</button>
+<button class="btn" onclick="document.getElementById('restoreFile').click()">导入配置</button>
+<input type="file" id="restoreFile" accept=".json,application/json" style="display:none" onchange="restoreCfg(this)">
+</div>
 <div class="st-full st-ft">提示：修改端口 / 监听地址 / 代理模式后，代理会自动重启以应用新配置；若修改了 Web 端口，需重启系统服务后生效。</div>
 </div>
 <div><button class="btn st" onclick="saveSettings()">保存</button><button class="btn" onclick="closeModal('settingsModal')">取消</button></div>
@@ -361,10 +369,13 @@ async function showSettings(){
     document.getElementById('setSocks').value=s.socksPort||'';
     document.getElementById('setHttp').value=s.httpPort||'';
     document.getElementById('setListen').value=s.listenAddr||'';
-    document.getElementById('setRefresh').value=s.subRefresh||'';
+    // 注意：subRefresh 的 0 是合法值（禁用自动刷新），不能用 `||''` 兜底，
+    // 否则 0 会显示成空白，用户会误以为没设置成功。
+    document.getElementById('setRefresh').value=(s.subRefresh===0||s.subRefresh)?String(s.subRefresh):'';
     document.getElementById('setMode').value=s.proxyMode||'smart';
     document.getElementById('setSubProxy').value=s.subProxy||'';
     document.getElementById('setSpeedURL').value=s.speedURL||'';
+    document.getElementById('setFailover').checked=(s.autoFailover!==false);
   }catch(e){}
   document.getElementById('settingsModal').classList.add('show');
 }
@@ -372,10 +383,15 @@ async function showSettings(){
 async function saveSettings(){
   const socks=parseInt(document.getElementById('setSocks').value);
   const http=parseInt(document.getElementById('setHttp').value);
-  const refresh=parseInt(document.getElementById('setRefresh').value);
+  // 单独取原始文本：空串要判为"未填"，而 0 是合法值，两者不能混为一谈
+  const rawRefresh=document.getElementById('setRefresh').value.trim();
+  const refresh=rawRefresh===''?NaN:parseInt(rawRefresh,10);
   if(!socks||socks<=0||socks>65535){alert('SOCKS5端口无效');return}
   if(!http||http<=0||http>65535){alert('HTTP端口无效');return}
-  if(!refresh||refresh<10){alert('订阅刷新间隔需≥10秒');return}
+  // 0 = 禁用自动刷新（合法）；其余需在 10-86400 秒之间。
+  // 原先的 `!refresh||refresh<10` 会把 0 一并拦下，导致"禁用"这个功能在界面上根本无法设置。
+  if(isNaN(refresh)){alert('订阅刷新间隔请填写数字（0 = 禁用自动刷新）');return}
+  if(refresh!==0&&(refresh<10||refresh>86400)){alert('订阅刷新间隔需为 0（禁用自动刷新）或 10-86400 秒');return}
   const b={
     socksPort:socks,
     httpPort:http,
@@ -383,12 +399,37 @@ async function saveSettings(){
     subRefresh:refresh,
     proxyMode:document.getElementById('setMode').value,
     subProxy:document.getElementById('setSubProxy').value.trim(),
-    speedURL:document.getElementById('setSpeedURL').value.trim()||'https://speed.cloudflare.com/__down?bytes=2000000'
+    speedURL:document.getElementById('setSpeedURL').value.trim()||'https://speed.cloudflare.com/__down?bytes=2000000',
+    autoFailover:document.getElementById('setFailover').checked
   };
   const r=await api('POST','/api/settings',b);
   closeModal('settingsModal');
   if(r.error){alert('保存失败: '+r.error);return}
   alert('设置已保存，代理配置已应用');
+}
+
+// 配置备份 / 恢复
+function backupCfg(){location.href='/api/backup'}
+
+function restoreCfg(el){
+  const f=el.files[0];
+  el.value='';
+  if(!f)return;
+  if(!confirm('导入将覆盖当前全部分组与节点，确定继续？'))return;
+  const rd=new FileReader();
+  rd.onload=async()=>{
+    try{
+      const res=await fetch('/api/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:rd.result});
+      const r=await res.json();
+      if(r.error){alert('恢复失败: '+r.error);return}
+      closeModal('settingsModal');
+      alert('配置已恢复（'+r.groups+' 个分组），列表即将刷新');
+      curGrp='';
+      await loadGroups();
+      loadStatus();
+    }catch(e){alert('恢复失败: 文件内容不是合法 JSON')}
+  };
+  rd.readAsText(f);
 }
 
 loadGroups();loadStatus();setInterval(loadStatus,5000);

@@ -15,9 +15,24 @@ import (
 	"v2aynn-web/internal/config"
 )
 
+// 订阅自动刷新的取值边界（web 层校验与 Poll 保护共用，避免魔数分散）
+const (
+	// MinSubRefresh 最小刷新间隔（秒）。低于此值视为无意义的过于频繁刷新。
+	// 注意：0 不在此范围内，但 0 是合法值，表示"禁用自动刷新"。
+	MinSubRefresh = 10
+	// MaxSafeRefresh 最大刷新间隔（秒，1天）。超过此值视为禁用。
+	// 同时是防溢出的保护上限：time.Duration(n) * time.Second 在 n 极大时会溢出为负数，
+	// 导致 time.NewTicker panic("non-positive interval")，服务启动即崩溃。
+	MaxSafeRefresh = 86400
+)
+
 func Poll(cfg *config.Config) {
-	if cfg.SubRefresh <= 0 {
-		log.Printf("Poll: 自动更新已禁用(SubRefresh=%d)", cfg.SubRefresh)
+	// 0 表示禁用；超过上限（含历史遗留的 MaxInt64 "禁用"标记）同样跳过，
+	// 既避免无意义轮询，也避免 time.Duration 溢出导致 NewTicker panic
+	if cfg.SubRefresh <= 0 || cfg.SubRefresh > MaxSafeRefresh {
+		if cfg.SubRefresh > MaxSafeRefresh {
+			log.Printf("Poll: 自动更新已禁用(SubRefresh=%d 超出上限%d秒)", cfg.SubRefresh, MaxSafeRefresh)
+		}
 		return
 	}
 	ticker := time.NewTicker(time.Duration(cfg.SubRefresh) * time.Second)
@@ -239,7 +254,7 @@ func dedupNodes(nodes []config.Node) []config.Node {
 func parse(raw, subID string) (config.Node, error) {
 	raw = strings.TrimSpace(raw)
 	n := config.Node{
-		ID: config.NewUUID(),
+		ID:      config.NewUUID(),
 		RawLink: raw, LastSeen: time.Now().Format("2006-01-02 15:04:05"),
 	}
 	switch {

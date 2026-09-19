@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -59,6 +60,8 @@ func (w *WebServer) Run(addr string) error {
 	mux.HandleFunc("POST /api/proxy/stop", w.apiStop)
 	mux.HandleFunc("GET /api/settings", w.apiGetSettings)
 	mux.HandleFunc("POST /api/settings", w.apiSettings)
+	mux.HandleFunc("GET /api/backup", w.apiBackup)
+	mux.HandleFunc("POST /api/restore", w.apiRestore)
 	subFS, _ := fs.Sub(staticFS, "static")
 	mux.Handle("/static/", http.FileServer(http.FS(subFS)))
 	mux.HandleFunc("/", w.apiIndex)
@@ -387,7 +390,8 @@ func (w *WebServer) apiPing(rw http.ResponseWriter, r *http.Request) {
 	w.cfg.Lock()
 	if n, _ := w.cfg.FindNode(id); n != nil {
 		n.Ping = int(ms)
-		_ = w.cfg.Save()
+		// 单节点测速属高频可丢失写入，只标脏，由后台每5秒合并落盘一次
+		w.cfg.MarkDirty()
 	}
 	w.cfg.Unlock()
 	w.writeJSON(rw, map[string]interface{}{"id": id, "ms": ms, "groupId": gid})
@@ -542,7 +546,7 @@ func (w *WebServer) apiGetSettings(rw http.ResponseWriter, r *http.Request) {
 		"socksPort": w.cfg.SocksPort, "httpPort": w.cfg.HttpPort,
 		"listenAddr": w.cfg.ListenAddr, "subRefresh": w.cfg.SubRefresh,
 		"subProxy": w.cfg.SubProxy, "proxyMode": w.cfg.ProxyMode,
-		"speedURL": w.cfg.SpeedURL,
+		"speedURL": w.cfg.SpeedURL, "autoFailover": w.cfg.FailoverEnabled(),
 	}
 	w.cfg.Unlock()
 	w.writeJSON(rw, st)
@@ -554,36 +558,193 @@ func (w *WebServer) apiSettings(rw http.ResponseWriter, r *http.Request) {
 		w.writeJSON(rw, map[string]string{"error": "bad json"})
 		return
 	}
-	w.cfg.Lock()
-	if v, ok := req["socksPort"]; ok {
-		w.cfg.SocksPort = int(v.(float64))
+
+	if err := w.applySettings(req); err != nil {
+		w.writeJSON(rw, map[string]string{"error": err.Error()})
+		return
 	}
-	if v, ok := req["httpPort"]; ok {
-		w.cfg.HttpPort = int(v.(float64))
-	}
-	if v, ok := req["listenAddr"]; ok {
-		w.cfg.ListenAddr = v.(string)
-	}
-	if v, ok := req["subRefresh"]; ok {
-		w.cfg.SubRefresh = int(v.(float64))
-	}
-	if v, ok := req["subProxy"]; ok {
-		w.cfg.SubProxy = v.(string)
-	}
-	if v, ok := req["proxyMode"]; ok {
-		w.cfg.ProxyMode = v.(string)
-	}
-	if v, ok := req["speedURL"]; ok {
-		w.cfg.SpeedURL = v.(string)
-	}
-	_ = w.cfg.Save()
-	w.cfg.Unlock()
+
+	// 端口/监听地址/代理模式变化需要重启代理才能生效
 	if w.v2m.IsRunning() {
 		w.v2m.Stop()
 		time.Sleep(300 * time.Millisecond)
 		_ = w.v2m.Start()
 	}
 	w.writeJSON(rw, map[string]string{"ok": "true"})
+}
+
+// applySettings 校验并应用设置请求，全部通过后写盘。
+//
+// 两条硬性要求，改动本函数时必须保持：
+//
+//  1. 必须用 defer 释放锁。裸 w.cfg.Unlock() 在 panic 时执行不到，配置锁会永久无法释放，
+//     整个服务（所有 API + 前端）会彻底挂死且无法自愈。历史上 v.(float64) 裸断言
+//     在字段类型不符时 panic，一个畸形请求即可打死服务。
+//
+//  2. 取值一律走带 ok 判断的类型转换，禁止 v.(float64) / v.(string) 裸断言。
+//     若中途 panic，配置会处于"改了一半且未落盘"的不一致状态，比直接报错更糟。
+func (w *WebServer) applySettings(req map[string]interface{}) error {
+	w.cfg.Lock()
+	defer w.cfg.Unlock()
+
+	if v, ok := req["socksPort"]; ok {
+		n, err := toPort(v, "SOCKS5 端口")
+		if err != nil {
+			return err
+		}
+		w.cfg.SocksPort = n
+	}
+	if v, ok := req["httpPort"]; ok {
+		n, err := toPort(v, "HTTP 代理端口")
+		if err != nil {
+			return err
+		}
+		w.cfg.HttpPort = n
+	}
+	if v, ok := req["listenAddr"]; ok {
+		s, err := toStr(v, "Web 监听地址")
+		if err != nil {
+			return err
+		}
+		if s != "" {
+			w.cfg.ListenAddr = s
+		}
+	}
+	if v, ok := req["subRefresh"]; ok {
+		n, err := toInt(v, "订阅刷新间隔")
+		if err != nil {
+			return err
+		}
+		// 0 是合法值（禁用自动刷新），不能按"空值即缺失"处理。
+		// 1-9 秒视为无意义的过于频繁刷新，直接拒绝而不是静默接受。
+		if n != 0 && (n < subscription.MinSubRefresh || n > subscription.MaxSafeRefresh) {
+			return fmt.Errorf("订阅刷新间隔需为 0（禁用自动刷新）或 %d-%d 秒",
+				subscription.MinSubRefresh, subscription.MaxSafeRefresh)
+		}
+		w.cfg.SubRefresh = n
+	}
+	if v, ok := req["subProxy"]; ok {
+		s, err := toStr(v, "全局订阅代理")
+		if err != nil {
+			return err
+		}
+		w.cfg.SubProxy = s
+	}
+	if v, ok := req["proxyMode"]; ok {
+		s, err := toStr(v, "代理模式")
+		if err != nil {
+			return err
+		}
+		switch s {
+		case "smart", "global", "direct":
+			w.cfg.ProxyMode = s
+		default:
+			return fmt.Errorf("代理模式只能是 smart / global / direct")
+		}
+	}
+	if v, ok := req["speedURL"]; ok {
+		s, err := toStr(v, "测速URL")
+		if err != nil {
+			return err
+		}
+		w.cfg.SpeedURL = s
+	}
+	if v, ok := req["autoFailover"]; ok {
+		b, isBool := v.(bool)
+		if !isBool {
+			return fmt.Errorf("自动故障转移开关必须是布尔值")
+		}
+		w.cfg.AutoFailover = &b
+	}
+
+	return w.cfg.Save()
+}
+
+// toInt 把 JSON 解出的值安全转成 int。
+// encoding/json 会把所有数字解成 float64，故只接受 float64。
+func toInt(v interface{}, field string) (int, error) {
+	f, ok := v.(float64)
+	if !ok {
+		return 0, fmt.Errorf("%s必须是数字", field)
+	}
+	if math.IsNaN(f) || math.IsInf(f, 0) || f != math.Trunc(f) {
+		return 0, fmt.Errorf("%s必须是整数", field)
+	}
+	if f < math.MinInt32 || f > math.MaxInt32 {
+		return 0, fmt.Errorf("%s超出允许范围", field)
+	}
+	return int(f), nil
+}
+
+// toStr 安全取字符串字段，类型不符时返回错误而非 panic
+func toStr(v interface{}, field string) (string, error) {
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("%s必须是字符串", field)
+	}
+	return s, nil
+}
+
+// toPort 取端口并校验范围（1-65535）
+func toPort(v interface{}, field string) (int, error) {
+	n, err := toInt(v, field)
+	if err != nil {
+		return 0, err
+	}
+	if n < 1 || n > 65535 {
+		return 0, fmt.Errorf("%s需在 1-65535 之间", field)
+	}
+	return n, nil
+}
+
+// apiBackup 导出当前配置为可下载的 JSON 文件
+func (w *WebServer) apiBackup(rw http.ResponseWriter, r *http.Request) {
+	w.cfg.Lock()
+	b, err := json.MarshalIndent(w.cfg, "", "  ")
+	w.cfg.Unlock()
+	if err != nil {
+		w.writeJSON(rw, map[string]string{"error": "序列化失败"})
+		return
+	}
+	rw.Header().Set("Content-Type", "application/json")
+	rw.Header().Set("Content-Disposition",
+		"attachment; filename=v2aynn-backup-"+time.Now().Format("20060102-150405")+".json")
+	_, _ = rw.Write(b)
+}
+
+// apiRestore 用上传的 JSON 覆盖当前配置（校验后热替换内存配置并写盘）
+func (w *WebServer) apiRestore(rw http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
+	if err != nil {
+		w.writeJSON(rw, map[string]string{"error": "读取上传内容失败"})
+		return
+	}
+	var nc config.Config
+	if err := json.Unmarshal(body, &nc); err != nil {
+		w.writeJSON(rw, map[string]string{"error": "不是合法的配置文件"})
+		return
+	}
+	if len(nc.Groups) == 0 {
+		w.writeJSON(rw, map[string]string{"error": "配置里没有任何分组，已拒绝导入"})
+		return
+	}
+
+	w.cfg.Lock()
+	w.cfg.Restore(&nc)
+	err = w.cfg.Save()
+	w.cfg.Unlock()
+	if err != nil {
+		w.writeJSON(rw, map[string]string{"error": "写入配置失败: " + err.Error()})
+		return
+	}
+
+	// 恢复后原节点可能已失效，重启代理以套用新配置
+	if w.v2m.IsRunning() {
+		w.v2m.Stop()
+		time.Sleep(300 * time.Millisecond)
+		_ = w.v2m.Start()
+	}
+	w.writeJSON(rw, map[string]interface{}{"ok": "true", "groups": len(nc.Groups)})
 }
 
 func (w *WebServer) writeJSON(rw http.ResponseWriter, data interface{}) {
