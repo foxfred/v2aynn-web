@@ -14,14 +14,21 @@ import (
 )
 
 type Manager struct {
-	mu           sync.Mutex
-	cfg          *config.Config
-	dataDir      string
-	xrayBin      string
-	cmd          *exec.Cmd
-	running      bool
-	activeName   string // 缓存实际启动节点的名称，避免依赖 cfg.Nodes 反查
-	activeNodeID string
+	mu      sync.Mutex
+	cfg     *config.Config
+	dataDir string
+	xrayBin string
+	cmd     *exec.Cmd
+	running bool
+	// stopRequested 记录「有人显式要求停止」，由 Stop() 置位、Start() 清除。
+	//
+	// 为什么需要它：进程退出后 watch 会把 running 置回 false，而 Stop() 同样把
+	// running 置为 false —— 两种状态无法区分。只凭 running/cmd 判断的话，
+	// 用户在 5 秒自愈窗口内点「停止」，xray 仍会被 watch 自己拉起来，
+	// 停止功能形同虚设。有这个标记才能区分「进程崩了，该自愈」与「用户要停，别自愈」。
+	stopRequested bool
+	activeName    string // 缓存实际启动节点的名称，避免依赖 cfg.Nodes 反查
+	activeNodeID  string
 
 	restartCount int       // 连续重启次数
 	lastRestart  time.Time // 上次重启时间
@@ -51,6 +58,8 @@ func (m *Manager) Start() error {
 	if m.running {
 		return nil
 	}
+	// 这是一次显式启动，清除「已要求停止」标记，允许后续崩溃重新自愈
+	m.stopRequested = false
 	if m.cfg.ActiveNode == "" {
 		return fmt.Errorf("未设置当前节点")
 	}
@@ -102,33 +111,67 @@ func (m *Manager) watch(cmd *exec.Cmd) {
 		m.cmd = nil
 	}
 	m.mu.Unlock()
-	if !m.running && isCurrent {
-		// 防无限重启：3次内如果始终撑不过30秒，判定为配置问题，放弃
-		m.restartMu.Lock()
-		now := time.Now()
-		if now.Sub(m.lastRestart) > 30*time.Second {
-			m.restartCount = 0 // 上次重启已过30s，重置计数
-		}
-		m.restartCount++
-		m.lastRestart = now
-		if m.restartCount > 3 {
-			giveUpCount := m.restartCount
-			// 必须先释放 restartMu：SwitchNode 内部会再次加锁，否则死锁
-			m.restartMu.Unlock()
-			// 当前节点已判定不可用，先尝试自动故障转移，而不是直接放弃
-			if m.tryFailover() {
-				return
-			}
-			log.Printf("xray 连续重启 %d 次失败，放弃自动重启，请检查节点配置", giveUpCount)
+	// 只有"退出的正是当前进程"才进入自愈流程。Stop()/SwitchNode() 会把 m.cmd 置 nil，
+	// 此时 isCurrent 为 false，说明这次退出是主动停机的结果，不应重启。
+	if !isCurrent {
+		return
+	}
+
+	// 防无限重启：3次内如果始终撑不过30秒，判定为配置问题，放弃
+	m.restartMu.Lock()
+	now := time.Now()
+	if now.Sub(m.lastRestart) > 30*time.Second {
+		m.restartCount = 0 // 上次重启已过30s，重置计数
+	}
+	m.restartCount++
+	m.lastRestart = now
+	restartCount := m.restartCount
+	// 统一在此处释放 restartMu，不要挪到分支内部：
+	// 下面的 tryFailover → SwitchNode 内部会再次获取它，持锁进入必然死锁。
+	// 原实现是在放弃分支里手工 Unlock，这种写法在后续改动中很容易被漏掉。
+	m.restartMu.Unlock()
+
+	if restartCount > 3 {
+		// 当前节点已判定不可用，先尝试自动故障转移，而不是直接放弃
+		if m.tryFailover() {
 			return
 		}
-		restartCount := m.restartCount
-		m.restartMu.Unlock()
-
-		log.Printf("xray 异常退出 (%d/3)，5秒后自动重启", restartCount)
-		time.Sleep(5 * time.Second)
-		_ = m.Start()
+		log.Printf("xray 连续重启 %d 次失败，放弃自动重启，请检查节点配置", restartCount)
+		return
 	}
+
+	log.Printf("xray 异常退出 (%d/3)，5秒后自动重启", restartCount)
+	time.Sleep(5 * time.Second)
+
+	// 临重启前在锁内确认此刻到底该不该自愈。三点要点：
+	//
+	//  1. 原实现在 m.mu.Unlock() 之后直接读 `!m.running`，而 m.running 由
+	//     Start()/Stop() 在锁内并发写入 —— 无锁读 + 锁内写 = 数据竞争。
+	//     目标平台是 ARM64（弱内存模型），不能依赖这种读法的偶然正确性。
+	//     m.running / m.cmd / m.stopRequested 的一切访问都必须在 m.mu 内进行。
+	//
+	//  2. 判定时机要尽量靠后。并发的显式 Start()（用户点启动、改端口、恢复配置、
+	//     开机重试）若发生在判定之后就会被漏看，于是把"用户有意重启"误记成
+	//     "节点故障"；重启计数累积到 4 次还会触发一次不必要的自动故障转移。
+	//     放到 5 秒等待之后再判定，能观察到的窗口最大。
+	//
+	//  3. 必须显式判断 stopRequested。仅凭 running/cmd 无法区分"进程崩了"与
+	//     "用户点了停止"—— 两者都是 running=false、cmd=nil。原实现在 5 秒自愈
+	//     窗口内点停止后 xray 仍会被拉起，停止功能形同虚设。
+	m.mu.Lock()
+	stopped := m.stopRequested
+	alreadyRunning := m.running || m.cmd != nil
+	m.mu.Unlock()
+	if stopped {
+		log.Printf("已收到停止指令，取消本次自愈重启")
+		return
+	}
+	if alreadyRunning {
+		log.Printf("xray 已由其他操作启动，跳过本次自愈")
+		return
+	}
+
+	_ = m.Start()
 }
 
 // tryFailover 当前节点连续失败后，自动切换到其他可用节点。
@@ -183,6 +226,10 @@ func (m *Manager) tryFailover() bool {
 func (m *Manager) Stop() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// 必须先置位再置 running=false：watch 会用这个标记区分
+	// 「进程崩了该自愈」与「用户点了停止不该自愈」。否则在 5 秒自愈窗口内点停止，
+	// xray 会被自己拉起来（原缺陷，见 TestStopDoesNotTriggerRestart）。
+	m.stopRequested = true
 	if m.cmd != nil && m.cmd.Process != nil {
 		m.cmd.Process.Kill()
 		// 不在此处 Wait，由 watch goroutine 收尸，避免重复 Wait panic

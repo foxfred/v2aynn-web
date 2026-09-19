@@ -185,6 +185,19 @@ v2aynn-web/
   - 新增 `internal/v2ray/manager_test.go`，其中
     `TestGenerateConfigDirectDiffersFromSmart` 断言两种模式生成的 routing **不相等** ——
     只断言"direct 有 routing"挡不住这个缺陷，因为 smart 也有
+- **修复「点停止后代理又自己起来」**：`Stop()` 与「进程崩溃」对 `Manager` 而言状态完全相同
+  （都是 `running=false`、`cmd=nil`），watch 无法区分，于是在崩溃后那 5 秒自愈窗口内点停止，
+  xray 仍会被自己拉起来，停止功能形同虚设。现增加 `stopRequested` 标记（`Stop()` 置位、
+  `Start()` 清除），watch 重启前先判断它。该缺陷在修改前的代码上同样存在，非本次引入
+- **修复 `watch()` 对 `m.running` 的数据竞争**：原实现在释放 `m.mu` 之后直接读 `m.running`，
+  而该字段由 `Start()`/`Stop()` 在锁内并发写入 —— 无锁读 + 锁内写 = 数据竞争。
+  目标平台是 ARM64（弱内存模型），不应依赖这种读法的偶然正确性。现在该字段的所有访问
+  都在 `m.mu` 内，且重启判定挪到 5 秒等待之后（能观察到并发启动的窗口最大），
+  避免把"用户有意重启"误记成"节点故障"进而触发不必要的自动故障转移
+  - 新增 `TestWatchRestartsDeadProcess`（自愈重启链路真的能拉起进程）与
+    `TestStopDoesNotTriggerRestart`（主动停止后不再被拉起）两个运行时用例
+  - 另加 `TestWatchDoesNotRaceOnRunningFlag`，**只在 `go test -race` 下运行**，
+    未启用竞争检测时显式跳过 —— 否则它会变成"永远通过"的测试，给出虚假安全感
 
 ### 2026-08-21
 
