@@ -226,7 +226,13 @@ func fetchOne(g config.Group, proxyURL string) ([]config.Node, error) {
 			}
 		}
 	}
-	return nodes, nil
+	// 按 server:port:protocol 去重。订阅源自身常有重复条目，同一订阅里不同名称
+	// 指向同一服务器的情况也不少见。去重后节点数更少，列表更清爽、全量测速更快，
+	// 也避免同一节点被重复测速浪费流量。
+	//
+	// 放在这里而不是各个调用方，是为了让 FetchAll 与 FetchGroup 两条路径都生效
+	// —— dedupNodes 曾长期定义了却无人调用，导致 README 宣传的"自动去重"实际未生效。
+	return dedupNodes(nodes), nil
 }
 
 func min(a, b int) int {
