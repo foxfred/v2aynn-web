@@ -268,8 +268,31 @@ func generateConfig(n *config.Node, socksPort, httpPort int, proxyMode string) m
 			map[string]interface{}{"protocol": "freedom", "tag": "direct"},
 		},
 	}
-	// 智能分流: 国内域名和IP直连, 其余走代理
-	if proxyMode != "global" {
+	// 分流模式必须显式区分。历史上这里只判断 `proxyMode != "global"`，
+	// 导致 direct 落进与 smart 相同的分支 —— 界面选「直连」实际仍在按国内/国外分流，
+	// 是个静默的空操作。三种模式现在各有独立分支：
+	//
+	//   smart  —— 国内域名/IP 直连，其余走代理
+	//   global —— 全部走代理（不加 routing，xray 默认使用第一个出站）
+	//   direct —— 全部直连（所有流量指向 freedom 出站，即真直连）
+	//
+	// 未知取值回落到 smart（与 web 层白名单校验互为兜底，防手工改配置文件写错）。
+	switch proxyMode {
+	case "global":
+		// 不加 routing 规则：xray 默认把所有流量交给第一个出站（代理节点）
+	case "direct":
+		// 兜底规则：不带任何匹配条件的 field 规则会命中全部流量。
+		// 只带 network 是为了同时覆盖 TCP 与 UDP，避免只直连 TCP 而 UDP 仍走代理。
+		cfg["routing"] = map[string]interface{}{
+			"rules": []interface{}{
+				map[string]interface{}{
+					"type": "field", "outboundTag": "direct",
+					"network": "tcp,udp",
+				},
+			},
+		}
+	default: // smart
+		// 智能分流: 国内域名和IP直连, 其余走代理
 		cfg["routing"] = map[string]interface{}{
 			"rules": []interface{}{
 				map[string]interface{}{

@@ -180,7 +180,7 @@ body{font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;line-heig
 <div><label>HTTP 代理端口</label><input id="setHttp" type="number" placeholder="10810"></div>
 <div class="st-full"><label>Web 监听地址</label><input id="setListen" placeholder="0.0.0.0"></div>
 <div><label>订阅刷新间隔(秒，0=禁用自动刷新)</label><input id="setRefresh" type="number" min="0" placeholder="300"></div>
-<div><label>代理模式</label><select id="setMode"><option value="smart">智能（仅直连受阻走代理）</option><option value="global">全局</option><option value="direct">直连</option></select></div>
+<div><label>代理模式</label><select id="setMode"><option value="smart">智能（国内直连，国外走代理）</option><option value="global">全局（全部走代理）</option><option value="direct">直连（全部不走代理）</option></select></div>
 <div class="st-full"><label class="ck"><input type="checkbox" id="setFailover">节点连续失败时，自动切换到其他可用节点</label></div>
 <div class="st-full"><label>全局订阅代理（HTTP代理，可选）</label><input id="setSubProxy" placeholder="http://127.0.0.1:7890"></div>
 <div class="st-full"><label>测速URL（用于真实测速）</label><input id="setSpeedURL" placeholder="https://speed.cloudflare.com/__down?bytes=2000000"></div>

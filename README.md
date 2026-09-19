@@ -172,6 +172,19 @@ v2aynn-web/
   现已接入 `fetchOne()`，手动拉取与后台自动刷新两条路径都会去重。
   效果：订阅源自身重复、或同一订阅里不同名称指向同一服务器时，节点不再重复占用列表与测速时间。
   新增 `internal/subscription/parser_test.go` 覆盖去重逻辑（按三字段区分、保持顺序、不修改入参等）
+- **修复「代理模式-直连」是空操作**：`generateConfig()` 原先只判断 `proxyMode != "global"`，
+  于是 `direct` 落进与 `smart` 完全相同的分支 —— 界面选「直连」，实际仍在按
+  geosite:cn / geoip:cn 分流，国外流量照旧走代理节点。现在三种模式各有独立分支：
+  - `smart`：国内域名/IP 直连，其余走代理（行为不变）
+  - `global`：不生成 `routing`，xray 默认全部走第一个出站（代理节点）
+  - `direct`：生成一条不带匹配条件的兜底规则（`network: tcp,udp` → `direct` 出站），
+    全部流量直连；只带 `network` 是为了同时覆盖 TCP 与 UDP，避免 UDP 仍走代理
+  - 未知取值回落到 `smart`（与设置接口的白名单校验互为兜底，防手工改配置文件写错）
+  - 顺带修正设置界面三个选项的文案，原「智能」标签写作"仅直连受阻走代理"，
+    与真实的分流逻辑（按国内/国外）并不相符
+  - 新增 `internal/v2ray/manager_test.go`，其中
+    `TestGenerateConfigDirectDiffersFromSmart` 断言两种模式生成的 routing **不相等** ——
+    只断言"direct 有 routing"挡不住这个缺陷，因为 smart 也有
 
 ### 2026-08-21
 
