@@ -198,6 +198,17 @@ v2aynn-web/
     `TestStopDoesNotTriggerRestart`（主动停止后不再被拉起）两个运行时用例
   - 另加 `TestWatchDoesNotRaceOnRunningFlag`，**只在 `go test -race` 下运行**，
     未启用竞争检测时显式跳过 —— 否则它会变成"永远通过"的测试，给出虚假安全感
+- **清理死代码与补上缺失的断言**
+  - `TestProbeTLSMismatch` 原先**只有 `t.Log`、没有任何断言**，永远通过 ——
+    比没有测试更糟，会让人误以为"TCP 通但 TLS 不通"这条边界已被覆盖。
+    现补上真实断言（应判为不可达、延迟返回 -1），并用"故意忽略握手错误"验证它会失败
+  - 移除 `parser.go` 里自定义 `min()`：go.mod 是 go 1.22，内置 `min` 已可用，
+    两处调用点都是 `int`，语义一致，留着只会遮蔽内置函数
+  - 移除 `parse()` / `parseXrayJSON()` / `parseXrayConfig()` 中未使用的 `subID` 参数
+    （旧扁平 `subs`/`nodes` 模型的遗留，改成分组模型后已无意义）
+  - 移除无任何调用点的 `FindGroup()`
+  - 移除前端 `activeGrp=d.activeGrp||''` —— 该变量赋值后从未读取，且未声明，
+    是隐式全局变量。界面实际使用的是已在第 211 行声明的 `curGrp`
 
 ### 2026-08-21
 

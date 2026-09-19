@@ -92,13 +92,23 @@ func TestProbeUnreachable(t *testing.T) {
 	}
 }
 
+// TestProbeTLSMismatch 验证"TCP 通 ≠ 代理协议能工作"这个场景。
+//
+// 明文服务器只是把收到的字节读走然后回写 "hp"；客户端用 TLS 去握手时，
+// 拿到的是 "hp" 而不是 ServerHello —— 握手必然失败。
+//
+// 历史缺陷：本用例原先只有 t.Log 没有任何断言，**永远通过**，比没有测试更糟
+// （会让人误以为这条边界情况已被覆盖）。现已改为真实断言。
 func TestProbeTLSMismatch(t *testing.T) {
 	addr, stop := startTCPServer(t, false) // 明文服务器
 	defer stop()
 	h, p, _ := net.SplitHostPort(addr)
 	n := config.Node{Server: h, Port: p, Protocol: "vless", TLS: "tls"}
-	// 对明文服务器做TLS握手应失败 -> 不可达
-	if _, ok := probeNode(n, 1200*time.Millisecond); ok {
-		t.Log("TLS/明文不匹配探测(允许边界判定)")
+	ms, ok := probeNode(n, 1200*time.Millisecond)
+	if ok {
+		t.Fatalf("对明文服务器做 TLS 握手应判为不可达，实际 ok=true ms=%d", ms)
+	}
+	if ms != -1 {
+		t.Errorf("不可达时延迟应返回 -1，实际 %d", ms)
 	}
 }

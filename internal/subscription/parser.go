@@ -177,7 +177,7 @@ func fetchOne(g config.Group, proxyURL string) ([]config.Node, error) {
 	log.Printf("fetchOne[%s]: 原始响应前%d字节: %q", g.Name, previewLen, raw[:previewLen])
 
 	// 支持 Xray JSON 订阅
-	if jnodes, ok := parseXrayJSON(raw, g.ID); ok {
+	if jnodes, ok := parseXrayJSON(raw); ok {
 		log.Printf("fetchOne[%s]: Xray JSON 订阅, 解析出 %d 个节点", g.Name, len(jnodes))
 		return jnodes, nil
 	}
@@ -191,7 +191,7 @@ func fetchOne(g config.Group, proxyURL string) ([]config.Node, error) {
 		if line == "" {
 			continue
 		}
-		if n, err := parse(line, g.ID); err == nil {
+		if n, err := parse(line); err == nil {
 			nodes = append(nodes, n)
 			continue
 		}
@@ -219,7 +219,7 @@ func fetchOne(g config.Group, proxyURL string) ([]config.Node, error) {
 			if subline == "" {
 				continue
 			}
-			if n, err := parse(subline, g.ID); err == nil {
+			if n, err := parse(subline); err == nil {
 				nodes = append(nodes, n)
 			} else {
 				log.Printf("fetchOne[%s]: 解析行失败: %v, 前80字节: %q", g.Name, err, subline[:min(len(subline), 80)])
@@ -233,13 +233,6 @@ func fetchOne(g config.Group, proxyURL string) ([]config.Node, error) {
 	// 放在这里而不是各个调用方，是为了让 FetchAll 与 FetchGroup 两条路径都生效
 	// —— dedupNodes 曾长期定义了却无人调用，导致 README 宣传的"自动去重"实际未生效。
 	return dedupNodes(nodes), nil
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // dedupNodes 按 server:port:protocol 去重，保持第一个出现的顺序
@@ -257,7 +250,7 @@ func dedupNodes(nodes []config.Node) []config.Node {
 	return out
 }
 
-func parse(raw, subID string) (config.Node, error) {
+func parse(raw string) (config.Node, error) {
 	raw = strings.TrimSpace(raw)
 	n := config.Node{
 		ID:      config.NewUUID(),
@@ -279,7 +272,7 @@ func parse(raw, subID string) (config.Node, error) {
 
 // Parse 从单个节点URL解析出一个Node
 func Parse(raw string) (config.Node, error) {
-	return parse(raw, "")
+	return parse(raw)
 }
 
 func parseVmess(link string, n config.Node) (config.Node, error) {
@@ -449,7 +442,7 @@ func parseSS(link string, n config.Node) (config.Node, error) {
 }
 
 // parseXrayJSON 解析 Xray 原生 JSON 订阅
-func parseXrayJSON(raw, subID string) ([]config.Node, bool) {
+func parseXrayJSON(raw string) ([]config.Node, bool) {
 	trimmed := strings.TrimSpace(raw)
 	var data interface{}
 	if err := json.Unmarshal([]byte(trimmed), &data); err != nil {
@@ -488,7 +481,7 @@ func parseXrayJSON(raw, subID string) ([]config.Node, bool) {
 
 	nodes := make([]config.Node, 0, len(configs))
 	for _, cfg := range configs {
-		if n, ok := parseXrayConfig(cfg, subID); ok {
+		if n, ok := parseXrayConfig(cfg); ok {
 			nodes = append(nodes, n)
 		}
 	}
@@ -498,7 +491,7 @@ func parseXrayJSON(raw, subID string) ([]config.Node, bool) {
 	return nodes, true
 }
 
-func parseXrayConfig(cfg map[string]interface{}, subID string) (config.Node, bool) {
+func parseXrayConfig(cfg map[string]interface{}) (config.Node, bool) {
 	outs, ok := cfg["outbounds"].([]interface{})
 	if !ok || len(outs) == 0 {
 		return config.Node{}, false

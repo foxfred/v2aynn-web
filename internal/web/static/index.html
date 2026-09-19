@@ -218,7 +218,6 @@ function closeModal(id){document.getElementById(id).classList.remove('show')}
 async function loadGroups(){
   const d=await api('GET','/api/groups');
   groups=d.groups||[];
-  activeGrp=d.activeGrp||'';
   const el=document.getElementById('gl');
   el.innerHTML=groups.map(g=>{
     const isActive=g.id===curGrp;

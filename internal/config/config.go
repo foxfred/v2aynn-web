@@ -105,16 +105,6 @@ type Config struct {
 // 默认分组ID（手动节点/导入节点存放于此）
 const DefaultGroupID = "__default__"
 
-// FindGroup 按ID查找分组
-func (c *Config) FindGroup(id string) *Group {
-	for i := range c.Groups {
-		if c.Groups[i].ID == id {
-			return &c.Groups[i]
-		}
-	}
-	return nil
-}
-
 // AllNodes 返回所有分组的全部节点（扁平化）
 func (c *Config) AllNodes() []Node {
 	var all []Node
