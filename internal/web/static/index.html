@@ -1,481 +1,190 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#F7F8FA">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>v2aynn-web</title>
 <script>
-/* 主题初始化。必须放在样式表之前执行，否则浅色变量会先渲染一帧再被深色覆盖，
-   出现肉眼可见的闪白。取值优先级：localStorage 手动选择 > 系统偏好。 */
-(function(){
-  var t='light';
-  try{
-    var s=localStorage.getItem('v2aynn-theme');
-    if(s==='light'||s==='dark'){t=s}
-    else if(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches){t='dark'}
-  }catch(e){}
-  document.documentElement.setAttribute('data-theme',t);
-})();
+/* 主题初始化：必须放在样式表之前执行。若放在样式表之后，浏览器会先用浅色渲染一帧
+   再被深色覆盖，出现肉眼可见的闪白。
+   默认浅色（主主题）。只认用户手动选过的值，不跟随系统偏好——
+   否则用户在系统里切到深色，会把自己设好的浅色又冲掉。 */
+(function(){try{if(localStorage.getItem('v2aynn-theme')==='dark')document.documentElement.setAttribute('data-theme','dark')}catch(e){}})();
 </script>
 <style>
-/* ========== 设计变量 ========== */
+/* ========== 主题变量 ==========
+   浅色是默认（:root），深色靠 html[data-theme="dark"] 覆盖。
+   两套主题的「明暗关系」是相反的，不能互相照搬：
+   深色靠「越亮越靠前」建立层次（底 #0d1117 → 面板 #161b22 → 按钮 #21262d）；
+   浅色靠「边框 + 阴影 + 底色差」建立层次，因为浅色之间色差天然很小。
+   刻意不声明 color-scheme：原版就没有声明，浏览器按原生浅色渲染那些没写样式的
+   控件（侧栏的「+」按钮、原生下拉框、复选框、滚动条）。一旦写上 color-scheme:dark，
+   侧栏「+」会从白底黑字变成深底浅字，与原版不一致。浅色主题下原生控件本来就是
+   浅色，所以不声明两边都对。
+   另注意：实心按钮的底色深色与浅色不是同一组值（浅色下要更深才够对比度），
+   文字色也分开给 —— 原版实心按钮是继承 #e6edf3，不是纯白。 */
 :root{
-  --font-sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
-  --font-mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
-  --fs-xs:11px; --fs-sm:12px; --fs-base:13px; --fs-md:15px; --fs-lg:18px;
-  --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px; --sp-5:24px; --sp-6:32px;
-  --r-sm:6px; --r-md:8px; --r-lg:12px;
-  --ease:cubic-bezier(.16,1,.3,1);
-  --dur:.15s;
-}
-/* 浅色（默认主题）。全部颜色对 --bg-base 实测通过 WCAG AA。
-   层次：页面底(深灰) > 容器(浅灰) > 顶栏/弹窗(纯白)。
-   浅色主题的背景色彼此太接近，结构感必须靠边框、阴影和底色差来建立，
-   不能照搬深色主题那套参数。 */
-:root,:root[data-theme="light"]{
-  color-scheme:light;
-  --bg-page:#E9EDF3;         /* body：比容器深，让容器"浮"起来 */
-  --bg-base:#F5F7FA;         /* 容器内底色、输入框 */
-  --bg-surface:#FFFFFF;      /* 顶栏、表头、弹窗 */
-  --bg-raised:#FFFFFF;
-  --bg-hover:#EAEEF4;
-  --bg-active:#E3EEFF;
-  --btn-bg:#F1F4F8;          /* 按钮：不能与顶栏同色，否则按钮会隐形 */
-  --btn-bg-hover:#E6EBF2;
-  --border-subtle:#DDE3EB;   /* 行分隔线，要看得见 */
-  --border:#D3DAE4;
-  --border-strong:#B9C2D0;   /* 按钮 / 输入框边框 */
-  --bw:1px;                  /* 浅色下 0.5px 太细，几乎不可见 */
-  --text-primary:#161A22;    /* 16.3:1 */
-  --text-secondary:#4A5464;  /*  7.1:1 */
-  --text-muted:#64707F;      /*  4.7:1 */
-  --accent:#1667D8;          /*  4.9:1 */
-  --accent-hover:#1157BC;
-  --accent-fg:#FFFFFF;       /* 白字压在 accent 上 5.3:1 */
-  --accent-soft:#1667D81A;
-  --accent-soft-hover:#1667D826;
-  --accent-line:#1667D840;
+  --bg-body:#E9EDF2;      /* 页面底：比容器深一档，容器才「浮」得起来 */
+  --bg-app:#FFFFFF;       /* 应用容器、侧栏、节点区 */
+  --bg-surface:#F6F8FA;   /* 顶栏、表头、弹窗面板 */
+  --bg-hover:#F6F8FA;     /* 行悬停 */
+  --bg-chip:#EAEEF2;      /* 数量角标 */
+  --bg-input:#FFFFFF;
+  --btn-bg:#F6F8FA;       /* 默认按钮：落在白色区域上 */
+  --btn-bg-band:#FFFFFF;  /* 默认按钮：落在浅灰顶栏上，白底才看得出是按钮 */
+  --btn-bg-hover:#EAEEF2;
+  --border:#D0D7DE;
+  --border-subtle:#E4E8ED;
+  --text:#1F2328;
+  --text-muted:#59636E;
+  --on-solid:#FFFFFF;     /* 实心按钮上的文字 */
+  --accent:#0969DA;       /* 用作文字/描边 */
+  --accent-soft:#0969DA1F;
+  --solid-accent:#0969DA;
+  --solid-accent-border:#0969DA;
+  --solid-green:#1A7F37;
+  --solid-green-border:#1A7F37;
+  --solid-red:#CF222E;
+  --solid-red-border:#CF222E;
   --success:#1A7F37;
   --warning:#9A6700;
   --danger:#CF222E;
-  --danger-soft:#CF222E14;
-  --danger-soft-hover:#CF222E22;
-  --danger-line:#CF222E40;
-  --shadow:0 1px 3px rgba(16,22,34,.08),0 12px 32px rgba(16,22,34,.12);
-  --app-ring:rgba(16,22,34,.07);
+  --tag-vmess-bg:#0969DA1F;  --tag-vmess-fg:#0969DA;
+  --tag-vless-bg:#8250DF1F;  --tag-vless-fg:#8250DF;
+  --tag-trojan-bg:#CF222E1F; --tag-trojan-fg:#CF222E;
+  --tag-ss-bg:#9A67001F;     --tag-ss-fg:#9A6700;
+  --overlay:rgba(16,22,34,.45);
+  --app-shadow:0 0 20px rgba(16,22,34,.12);
 }
-/* 深色（辅助主题） */
 :root[data-theme="dark"]{
-  color-scheme:dark;
-  --bg-page:#07090D;
-  --bg-base:#0B0E14;
-  --bg-surface:#12161F;
-  --bg-raised:#1A1F2B;
-  --bg-hover:#1E2430;
-  --bg-active:#16233A;
-  --btn-bg:#1A1F2B;
-  --btn-bg-hover:#232A38;
-  --border-subtle:#1E2430;
-  --border:#262D3D;
-  --border-strong:#333C4F;
-  --bw:.5px;
-  --text-primary:#E8ECF2;    /* 16.3:1 */
-  --text-secondary:#9BA6B8;  /*  7.9:1 */
-  --text-muted:#7A8598;      /*  5.2:1 */
-  --accent:#4C9AFF;          /*  6.8:1 */
-  --accent-hover:#6BAEFF;
-  --accent-fg:#0B0E14;       /* 深字压在 accent 上 6.8:1（白字只有 2.9:1，不合格） */
-  --accent-soft:#4C9AFF1F;
-  --accent-soft-hover:#4C9AFF2E;
-  --accent-line:#4C9AFF59;
-  --success:#3FB950;
-  --warning:#D29922;
-  --danger:#F85149;
-  --danger-soft:#F851491A;
-  --danger-soft-hover:#F851492E;
-  --danger-line:#F8514959;
-  --shadow:0 1px 2px rgba(0,0,0,.4),0 12px 32px rgba(0,0,0,.5);
-  --app-ring:rgba(0,0,0,.45);
+  --bg-body:#0d1117;
+  --bg-app:#0d1117;
+  --bg-surface:#161b22;
+  --bg-hover:#161b22;
+  --bg-chip:#21262d;
+  --bg-input:#0d1117;
+  --btn-bg:#21262d;
+  --btn-bg-band:#21262d;
+  --btn-bg-hover:#30363d;
+  --border:#30363d;
+  --border-subtle:#21262d;
+  --text:#e6edf3;
+  --text-muted:#8b949e;
+  --on-solid:#e6edf3;     /* 原版实心按钮继承的就是这个值，不是纯白 */
+  --accent:#58a6ff;
+  --accent-soft:#0d419d22;
+  --solid-accent:#1f6feb;
+  --solid-accent-border:#388bfd;
+  --solid-green:#238636;
+  --solid-green-border:#2ea043;
+  --solid-red:#b62324;
+  --solid-red-border:#da3633;
+  --success:#3fb950;
+  --warning:#e3b341;
+  --danger:#f85149;
+  --tag-vmess-bg:#1f6feb33;  --tag-vmess-fg:#58a6ff;
+  --tag-vless-bg:#8957e533;  --tag-vless-fg:#bc8cff;
+  --tag-trojan-bg:#f8514933; --tag-trojan-fg:#ff7b72;
+  --tag-ss-bg:#d2992233;     --tag-ss-fg:#e3b341;
+  --overlay:rgba(0,0,0,.5);
+  --app-shadow:0 0 20px rgba(0,0,0,.3);
 }
 
-/* ========== 基础 ========== */
 *{margin:0;padding:0;box-sizing:border-box}
-body{
-  font-family:var(--font-sans);
-  font-size:var(--fs-base);
-  line-height:1.6;
-  background:var(--bg-page);
-  color:var(--text-primary);
-  height:100vh;height:100dvh;
-  overflow:hidden;
-  -webkit-font-smoothing:antialiased;
-  transition:background var(--dur) var(--ease),color var(--dur) var(--ease);
-}
-:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:var(--r-sm)}
-*::-webkit-scrollbar{width:8px;height:8px}
-*::-webkit-scrollbar-track{background:transparent}
-*::-webkit-scrollbar-thumb{background:var(--border-strong);border-radius:4px}
-*::-webkit-scrollbar-thumb:hover{background:var(--text-muted)}
+body{font-family:system-ui,sans-serif;background:var(--bg-body);color:var(--text);line-height:1.6;height:100vh;overflow:hidden;font-size:14px}
+.app{display:flex;flex-direction:column;height:100vh;max-width:1100px;margin:0 auto;background:var(--bg-app);border-left:1px solid var(--border);border-right:1px solid var(--border);box-shadow:var(--app-shadow)}
 
-/* 居中容器。浅色主题下必须靠边框 + 外阴影把容器从页面底上"抬起来"，
-   否则白底压白底、居中感完全看不见（曾被误认为"居中布局被删了"）。 */
-.app{
-  display:flex;flex-direction:column;
-  height:100vh;height:100dvh;
-  max-width:1100px;margin:0 auto;
-  background:var(--bg-base);
-  border-left:var(--bw) solid var(--border);
-  border-right:var(--bw) solid var(--border);
-  box-shadow:0 0 28px var(--app-ring);
-}
+/* 顶栏 */
+.topbar{display:flex;align-items:center;gap:10px;padding:8px 16px;background:var(--bg-surface);border-bottom:1px solid var(--border);flex-shrink:0}
+.topbar .dot{width:11px;height:11px;border-radius:50%;background:var(--danger);display:inline-block;flex-shrink:0}
+.topbar .dot.on{background:var(--success)}
+.topbar .st{flex:1;min-width:0;font-size:13px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.topbar .btn{padding:5px 14px;border:1px solid var(--border);border-radius:5px;background:var(--btn-bg-band);color:var(--text);cursor:pointer;font-size:13px;flex-shrink:0}
+.topbar .btn:hover{background:var(--btn-bg-hover)}
+.topbar .btn.st{background:var(--solid-green);border-color:var(--solid-green-border);color:var(--on-solid)}
+.topbar .btn.sp{background:var(--solid-red);border-color:var(--solid-red-border);color:var(--on-solid)}
+.topbar .btn.ac{background:var(--solid-accent);border-color:var(--solid-accent-border);color:var(--on-solid)}
+.topbar .spd{font-size:13px;color:var(--text-muted);flex-shrink:0}
 
-/* ========== 按钮：1 套尺寸 × 4 语义 ========== */
-.btn{
-  display:inline-flex;align-items:center;justify-content:center;gap:6px;
-  height:32px;padding:0 var(--sp-3);
-  font-family:inherit;font-size:var(--fs-sm);font-weight:500;line-height:1;
-  color:var(--text-secondary);
-  background:var(--btn-bg);
-  border:var(--bw) solid var(--border-strong);
-  border-radius:var(--r-md);
-  cursor:pointer;white-space:nowrap;
-  transition:background var(--dur) var(--ease),color var(--dur) var(--ease),
-             border-color var(--dur) var(--ease),transform var(--dur) var(--ease);
-}
-.btn:hover{background:var(--btn-bg-hover);color:var(--text-primary)}
-.btn:active{transform:translateY(1px)}
-.btn:disabled{opacity:.45;cursor:not-allowed;transform:none}
-.btn-primary{background:var(--accent);border-color:var(--accent);color:var(--accent-fg)}
-.btn-primary:hover{background:var(--accent-hover);border-color:var(--accent-hover);color:var(--accent-fg)}
-.btn-soft{background:var(--accent-soft);border-color:var(--accent-line);color:var(--accent)}
-.btn-soft:hover{background:var(--accent-soft-hover);border-color:var(--accent);color:var(--accent-hover)}
-.btn-danger{background:var(--danger-soft);border-color:var(--danger-line);color:var(--danger)}
-.btn-danger:hover{background:var(--danger-soft-hover);border-color:var(--danger);color:var(--danger)}
-.btn-sm{height:26px;padding:0 10px;font-size:var(--fs-xs);border-radius:var(--r-sm)}
-.btn-icon{width:32px;padding:0}
-.btn svg{display:block}
-
-/* ========== 顶栏 ========== */
-.topbar{
-  display:flex;align-items:center;gap:var(--sp-2);
-  padding:var(--sp-3) var(--sp-4);
-  background:var(--bg-surface);
-  border-bottom:var(--bw) solid var(--border);
-  flex-shrink:0;
-  transition:background var(--dur) var(--ease),border-color var(--dur) var(--ease);
-}
-.dot{width:8px;height:8px;border-radius:50%;background:var(--danger);flex-shrink:0;
-     transition:background var(--dur) var(--ease)}
-.dot.on{background:var(--success)}
-.status{
-  flex:1;min-width:0;font-size:var(--fs-base);color:var(--text-secondary);
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-}
-.spd{
-  font-family:var(--font-mono);font-variant-numeric:tabular-nums;
-  font-size:var(--fs-sm);color:var(--text-muted);flex-shrink:0;
-}
-.spd.ok{color:var(--success)}
-.spd.warn{color:var(--warning)}
-.spd.err{color:var(--danger)}
-
-/* ========== 主体：左右双栏 ========== */
-.main{display:flex;flex:1;overflow:hidden;min-height:0}
+/* 主体：左右双栏 */
+.main{display:flex;flex:1;overflow:hidden}
 
 /* 左侧分组列表 */
-.sidebar{
-  width:200px;flex-shrink:0;display:flex;flex-direction:column;
-  border-right:var(--bw) solid var(--border);
-  transition:border-color var(--dur) var(--ease);
-}
-.sidebar .sh{
-  display:flex;align-items:center;justify-content:space-between;
-  padding:var(--sp-3) var(--sp-3) var(--sp-2);
-  font-size:var(--fs-xs);font-weight:500;color:var(--text-muted);
-}
-.sidebar .gl{flex:1;overflow-y:auto;overflow-x:hidden}
-.sidebar .gi{
-  display:flex;align-items:center;gap:var(--sp-2);
-  padding:var(--sp-2) var(--sp-3);
-  border-left:2px solid transparent;
-  border-bottom:var(--bw) solid var(--border-subtle);
-  cursor:pointer;
-  transition:background var(--dur) var(--ease),border-color var(--dur) var(--ease);
-}
-.sidebar .gi:last-child{border-bottom:0}
+.sidebar{width:220px;min-width:180px;border-right:1px solid var(--border);display:flex;flex-direction:column;background:var(--bg-app);flex-shrink:0}
+.sidebar .sh{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;border-bottom:1px solid var(--border-subtle);font-size:13px;color:var(--text-muted);font-weight:600}
+.sidebar .sh .btn{padding:3px 8px;font-size:12px;border:1px solid var(--border);border-radius:4px;background:var(--btn-bg);color:var(--text);cursor:pointer}
+.sidebar .sh .btn:hover{background:var(--btn-bg-hover)}
+.sidebar .gl{flex:1;overflow-y:auto}
+.sidebar .gi{display:flex;align-items:center;padding:9px 10px;cursor:pointer;border-bottom:1px solid var(--border-subtle);transition:background .1s}
 .sidebar .gi:hover{background:var(--bg-hover)}
-.sidebar .gi.ac{background:var(--bg-active);border-left-color:var(--accent)}
+.sidebar .gi.ac{border-left:3px solid var(--accent);background:var(--accent-soft)}
 .sidebar .gi .gn{flex:1;min-width:0}
-.sidebar .gi .gnm{
-  font-size:var(--fs-sm);font-weight:500;color:var(--text-secondary);
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-}
-.sidebar .gi.ac .gnm{color:var(--text-primary)}
-.sidebar .gi .gns{
-  font-size:var(--fs-xs);color:var(--text-muted);
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-}
-.sidebar .gi .gcnt{
-  font-family:var(--font-mono);font-variant-numeric:tabular-nums;
-  font-size:var(--fs-xs);color:var(--text-secondary);
-  background:var(--bg-hover);border-radius:var(--r-sm);
-  padding:1px 6px;flex-shrink:0;
-}
+.sidebar .gi .gnm{font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sidebar .gi .gns{font-size:11px;color:var(--text-muted)}
+.sidebar .gi .gcnt{font-size:11px;color:var(--text-muted);padding:1px 6px;background:var(--bg-chip);border-radius:8px}
+.sidebar .gi .gact{font-size:11px;padding:2px 6px;background:var(--solid-accent);color:#fff;border-radius:3px;margin-left:4px}
 
 /* 右侧节点区域 */
-.content{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0}
-.content .ch{
-  display:flex;align-items:center;gap:var(--sp-2);
-  padding:var(--sp-3) var(--sp-4);
-  border-bottom:var(--bw) solid var(--border);
-  flex-shrink:0;flex-wrap:wrap;
-  transition:border-color var(--dur) var(--ease);
-}
-.content .ch .cht{
-  font-size:var(--fs-md);font-weight:500;color:var(--text-primary);
-  margin-right:auto;white-space:nowrap;
-}
-.content select{
-  height:32px;padding:0 var(--sp-2);
-  font-family:inherit;font-size:var(--fs-sm);
-  background:var(--bg-raised);color:var(--text-secondary);
-  border:var(--bw) solid var(--border-strong);border-radius:var(--r-md);
-  cursor:pointer;
-}
-.content select:disabled{opacity:.45;cursor:not-allowed}
+.content{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.content .ch{display:flex;align-items:center;gap:6px;padding:6px 12px;border-bottom:1px solid var(--border-subtle);flex-shrink:0;flex-wrap:wrap}
+.content .ch .cht{font-size:15px;font-weight:600;color:var(--text)}
+.content .ch .btn{padding:3px 10px;border:1px solid var(--border);border-radius:4px;background:var(--btn-bg);color:var(--text);cursor:pointer;font-size:12px}
+.content .ch .btn:hover{background:var(--btn-bg-hover)}
+.content .ch .btn.st{background:var(--solid-green);border-color:var(--solid-green-border);color:var(--on-solid)}
+.content .ch .btn.ac{background:var(--solid-accent);border-color:var(--solid-accent-border);color:var(--on-solid)}
+.content .ch .btn.sp{background:var(--solid-red);border-color:var(--solid-red-border);color:var(--on-solid)}
+.content .ch select{font-size:12px;padding:3px 5px;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;color:var(--text)}
 
-/* ========== 节点列表 ========== */
-.nwrap{flex:1;overflow-y:auto;overflow-x:hidden}
-.nlh{
-  display:flex;align-items:center;gap:var(--sp-2);
-  padding:var(--sp-2) var(--sp-4);
-  font-size:var(--fs-sm);font-weight:500;color:var(--text-secondary);
-  background:var(--bg-surface);
-  border-bottom:var(--bw) solid var(--border);
-  position:sticky;top:0;z-index:1;
-  transition:background var(--dur) var(--ease),border-color var(--dur) var(--ease);
-}
-/* 名称列必须封顶：不封顶时它会吃掉所有空间，把延迟/操作推到最右边，
-   中间空出一大片，整行散架。这是浅色改版时误删的一处约束。 */
-.nlh .c1,.ni .c1{flex:1 1 auto;min-width:120px;max-width:520px}
-.nlh .c2{width:76px;text-align:right;flex-shrink:0}
-.nlh .c3{width:84px;text-align:right;flex-shrink:0}
-
-.ni{
-  display:flex;align-items:center;gap:var(--sp-2);
-  padding:var(--sp-2) var(--sp-4);
-  border-left:2px solid transparent;
-  border-bottom:var(--bw) solid var(--border-subtle);
-  cursor:pointer;
-  transition:background var(--dur) var(--ease),border-color var(--dur) var(--ease);
-}
-.ni:last-child{border-bottom:0}
+/* 节点列表 */
+.nwrap{flex:1;overflow-y:auto;overflow-x:auto}
+.nlh{display:flex;align-items:center;padding:6px 10px;background:var(--bg-surface);border-bottom:1px solid var(--border);font-size:12px;color:var(--text-muted);font-weight:600;position:sticky;top:0;z-index:1}
+.nlh .c1{flex:1;min-width:100px;max-width:480px}
+.nlh .c2{width:52px;text-align:right;flex-shrink:0}.nlh .c3{width:118px;text-align:right;flex-shrink:0}
+.ni{display:flex;align-items:center;padding:7px 10px;border-bottom:1px solid var(--border-subtle);cursor:pointer;min-width:360px;transition:background .1s}
 .ni:hover{background:var(--bg-hover)}
-.ni.ac{background:var(--bg-active);border-left-color:var(--accent)}
-.ni .c1{display:flex;flex-direction:column;gap:2px}
-.ni .nn{
-  font-size:var(--fs-base);font-weight:500;line-height:1.4;color:var(--text-secondary);
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-}
-.ni.ac .nn{color:var(--text-primary)}
-.ni .nm{display:flex;align-items:center;gap:6px;min-width:0;line-height:1.4}
-.ni .nm .addr{
-  font-family:var(--font-mono);font-size:var(--fs-xs);color:var(--text-muted);
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-}
-.ni .c2{
-  width:76px;text-align:right;flex-shrink:0;
-  font-family:var(--font-mono);font-variant-numeric:tabular-nums;
-}
-.ni .c2 .ms{display:block;font-size:var(--fs-sm);color:var(--text-secondary)}
-.ni .c2 .ms.to{color:var(--danger)}
-.ni .c2 .sp{display:block;font-size:var(--fs-xs);color:var(--success)}
-.ni .c3{width:84px;flex-shrink:0;display:flex;justify-content:flex-end}
-/* 操作按钮默认常显，只在确认存在精确指针（真鼠标）时才收起。
-   为什么反着写：如果写成"默认藏、靠 @media(hover:none) 唤出"，一旦某个浏览器
-   不支持该媒体查询，触屏用户就永远点不到删除按钮 —— 失败方向是"功能不可用"。
-   现在这样最坏情况只是"按钮一直显示"，属于外观退化，不会让人用不了。
-   hover 与 pointer 同时判断：触摸屏笔记本的 (hover:hover) 也会命中（有鼠标），
-   只判 hover 会让那类设备在触屏下点不到。 */
-.ni .acts{display:flex;gap:2px;transition:opacity var(--dur) var(--ease)}
-@media (hover:hover) and (pointer:fine){
-  .ni .acts{opacity:0}
-  .ni:hover .acts,.ni:focus-within .acts{opacity:1}
-}
-.ni .acts button{
-  background:none;border:0;padding:2px 5px;cursor:pointer;
-  font-family:inherit;font-size:var(--fs-xs);color:var(--text-secondary);
-  border-radius:var(--r-sm);
-  transition:background var(--dur) var(--ease),color var(--dur) var(--ease);
-}
-.ni .acts button:hover{background:var(--bg-raised);color:var(--text-primary)}
-.ni .acts button.del:hover{color:var(--danger)}
+.ni.ac{border-left:3px solid var(--accent);background:var(--accent-soft)}
+.ni .nn{font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ni .nm{font-size:11px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ni .c1{flex:1;min-width:100px;max-width:480px;overflow:hidden}
+.ni .c2{width:52px;text-align:right;font-size:12px;flex-shrink:0}
+.ni .c3{width:118px;text-align:right;white-space:nowrap;flex-shrink:0}
+.ni .c3 .btn{padding:3px 7px;font-size:11px;border:1px solid var(--border);border-radius:3px;background:var(--btn-bg);color:var(--text);cursor:pointer}
+.ni .c3 .btn:hover{background:var(--btn-bg-hover)}
+.ni .c3 .btn.ac{background:var(--solid-accent);border-color:var(--solid-accent-border);color:var(--on-solid)}
+.tag{display:inline-block;padding:0 4px;border-radius:2px;font-size:10px;margin-left:3px;line-height:16px}
+.tag.vmess{background:var(--tag-vmess-bg);color:var(--tag-vmess-fg)}
+.tag.vless{background:var(--tag-vless-bg);color:var(--tag-vless-fg)}
+.tag.trojan{background:var(--tag-trojan-bg);color:var(--tag-trojan-fg)}
+.tag.ss{background:var(--tag-ss-bg);color:var(--tag-ss-fg)}
 
-.tag{
-  display:inline-block;padding:0 5px;border-radius:var(--r-sm);
-  font-size:var(--fs-xs);line-height:16px;flex-shrink:0;
-  background:var(--bg-hover);color:var(--text-secondary);
-}
-
-.empty{
-  display:flex;align-items:center;justify-content:center;
-  padding:var(--sp-6) var(--sp-4);
-  font-size:var(--fs-base);color:var(--text-muted);text-align:center;
-}
-
-/* ========== 下拉菜单 ========== */
-.menu-wrap{position:relative;flex-shrink:0}
-.menu{
-  position:absolute;right:0;top:calc(100% + 4px);z-index:50;
-  min-width:132px;padding:var(--sp-1);
-  display:none;flex-direction:column;
-  background:var(--bg-surface);
-  border:var(--bw) solid var(--border-strong);
-  border-radius:var(--r-md);
-  box-shadow:var(--shadow);
-}
-.menu.show{display:flex}
-.menu button{
-  background:none;border:0;text-align:left;cursor:pointer;
-  padding:7px var(--sp-2);border-radius:var(--r-sm);
-  font-family:inherit;font-size:var(--fs-sm);color:var(--text-secondary);
-  transition:background var(--dur) var(--ease),color var(--dur) var(--ease);
-}
-.menu button:hover{background:var(--bg-hover);color:var(--text-primary)}
-.menu button.del{color:var(--danger)}
-.menu button.del:hover{background:var(--danger-soft)}
-.menu button:disabled{opacity:.4;cursor:not-allowed;background:none;color:var(--text-muted)}
-
-/* ========== 弹窗 ========== */
-.modal{
-  position:fixed;inset:0;z-index:100;
-  display:flex;align-items:center;justify-content:center;
-  padding:var(--sp-4);
-  background:rgba(16,22,34,.45);
-  opacity:0;visibility:hidden;
-  transition:opacity var(--dur) var(--ease),visibility var(--dur) var(--ease);
-}
-:root[data-theme="dark"] .modal{background:rgba(0,0,0,.6)}
-.modal.show{opacity:1;visibility:visible}
-.modal .mp{
-  width:460px;max-width:100%;max-height:82vh;overflow-y:auto;
-  padding:var(--sp-5);
-  background:var(--bg-surface);
-  border:var(--bw) solid var(--border);
-  border-radius:var(--r-lg);
-  box-shadow:var(--shadow);
-  transform:scale(.97);
-  transition:transform var(--dur) var(--ease);
-}
-.modal.show .mp{transform:scale(1)}
-.modal .mp h3{
-  font-size:var(--fs-lg);font-weight:500;color:var(--text-primary);
-  margin-bottom:var(--sp-4);
-}
-.modal .mp label{display:block;font-size:var(--fs-xs);color:var(--text-muted);margin-bottom:var(--sp-1)}
-.modal .mp .fld{margin-bottom:var(--sp-3);min-width:0}
-.modal .mp input[type=text],.modal .mp input[type=number],.modal .mp input:not([type]),
-.modal .mp select,.modal .mp textarea{
-  width:100%;height:34px;padding:0 var(--sp-2);
-  font-family:inherit;font-size:var(--fs-base);
-  background:var(--bg-base);color:var(--text-primary);
-  border:var(--bw) solid var(--border-strong);border-radius:var(--r-md);
-  transition:border-color var(--dur) var(--ease),box-shadow var(--dur) var(--ease);
-}
-.modal .mp textarea{
-  height:auto;min-height:88px;padding:var(--sp-2);
-  line-height:1.6;resize:vertical;
-}
-.modal .mp input:focus,.modal .mp select:focus,.modal .mp textarea:focus{
-  outline:none;border-color:var(--accent);
-  box-shadow:0 0 0 3px var(--accent-soft);
-}
-.modal .mp .sg{display:grid;grid-template-columns:1fr 1fr;gap:0 var(--sp-3)}
-.modal .mp .sg>*{min-width:0}
-.modal .mp .st-full{grid-column:1/-1}
-.modal .mp label.ck{
-  display:flex;align-items:center;gap:var(--sp-2);
-  margin:0 0 var(--sp-3);cursor:pointer;
-  font-size:var(--fs-sm);color:var(--text-secondary);
-}
-.modal .mp label.ck input{
-  width:16px;height:16px;margin:0;flex-shrink:0;
-  accent-color:var(--accent);cursor:pointer;
-}
-.modal .mp .st-ft{
-  font-size:var(--fs-xs);color:var(--text-muted);line-height:1.6;
-  padding-top:var(--sp-3);margin-bottom:var(--sp-3);
-  border-top:var(--bw) solid var(--border-subtle);
-}
-.modal .mp .row{display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap}
-
-/* ========== Toast ========== */
-#toasts{
-  position:fixed;top:var(--sp-4);right:var(--sp-4);z-index:200;
-  display:flex;flex-direction:column;gap:var(--sp-2);
-  pointer-events:none;max-width:calc(100vw - 32px);
-}
-.toast{
-  max-width:320px;padding:10px var(--sp-3);
-  background:var(--bg-surface);
-  border:var(--bw) solid var(--border-strong);
-  border-left:3px solid var(--accent);
-  border-radius:var(--r-md);
-  box-shadow:var(--shadow);
-  font-size:var(--fs-sm);color:var(--text-primary);
-  opacity:0;transform:translateX(120%);
-  transition:transform .24s var(--ease),opacity .24s var(--ease);
-}
-.toast.in{opacity:1;transform:translateX(0)}
-.toast.ok{border-left-color:var(--success)}
-.toast.err{border-left-color:var(--danger)}
-
-/* ========== 无障碍：尊重系统的"减少动态效果"设置 ========== */
-@media (prefers-reduced-motion:reduce){
-  *,*::before,*::after{
-    transition-duration:.01ms !important;
-    animation-duration:.01ms !important;
-    animation-iteration-count:1 !important;
-  }
-}
-
-/* ========== 响应式 ========== */
-@media (max-width:720px){
-  .app{max-width:none;border-left:0;border-right:0}
-  .main{flex-direction:column}
-  .sidebar{width:auto;border-right:0;border-bottom:var(--bw) solid var(--border)}
-  .sidebar .sh{display:none}
-  .sidebar .gl{
-    flex:none;display:flex;gap:var(--sp-2);
-    overflow-x:auto;overflow-y:hidden;
-    padding:var(--sp-2) var(--sp-3);
-  }
-  .sidebar .gi{
-    flex-shrink:0;padding:6px 10px;gap:6px;
-    border-left:0;border:var(--bw) solid transparent;
-    border-radius:var(--r-md);background:var(--bg-raised);
-  }
-  .sidebar .gi.ac{border-color:var(--accent-line);background:var(--bg-active)}
-  .sidebar .gi .gns{display:none}
-  .topbar{flex-wrap:wrap;row-gap:var(--sp-2)}
-  .topbar .status{flex-basis:100%;order:9}
-  .content .ch .cht{flex-basis:100%;margin-right:0}
-  .nlh .c1,.ni .c1{min-width:0}
-  .nlh .c2,.ni .c2{width:64px}
-  .nlh .c3,.ni .c3{width:76px}
-}
+/* 弹窗/表单 */
+.modal{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:var(--overlay);z-index:100;align-items:center;justify-content:center}
+.modal.show{display:flex}
+.modal .mp{background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:18px;width:460px;max-width:92vw;max-height:82vh;overflow-y:auto}
+.modal .mp h3{font-size:15px;color:var(--accent);margin-bottom:12px}
+.modal .mp label{font-size:12px;color:var(--text-muted);display:block;margin-bottom:3px}
+.modal .mp input,.modal .mp select,.modal .mp textarea{width:100%;padding:6px 9px;margin-bottom:9px;background:var(--bg-input);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:13px}
+.modal .mp textarea{min-height:80px;resize:vertical}
+.modal .mp .sg{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.modal .mp .btn{padding:6px 16px;border:1px solid var(--border);border-radius:4px;background:var(--btn-bg);color:var(--text);cursor:pointer;font-size:13px;margin-right:8px}
+.modal .mp .btn.st{background:var(--solid-green);border-color:var(--solid-green-border);color:var(--on-solid)}
+.modal .mp .btn.sp{background:var(--solid-red);border-color:var(--solid-red-border);color:var(--on-solid)}
+.empty{color:var(--text-muted);font-size:13px;padding:20px;text-align:center}
+/* 设置面板 */
+.st-ft{font-size:12px;color:var(--text-muted);margin-bottom:8px;padding-top:6px;border-top:1px solid var(--border-subtle)}
+.st-full{grid-column:1/-1}
+.modal .mp label.ck{display:flex;align-items:center;gap:6px;cursor:pointer;margin:4px 0 10px}
+.modal .mp label.ck input{width:auto;margin:0}
 </style></head>
 <body><div class="app">
 <div class="topbar">
 <span class="dot" id="dot"></span>
-<span class="status" id="st">连接中...</span>
-<button class="btn btn-primary" id="powerBtn" onclick="togglePower()">启动</button>
+<span class="st" id="st">连接中...</span>
+<button class="btn st" onclick="doStart()">启动</button>
+<button class="btn sp" onclick="doStop()">停止</button>
 <button class="btn" onclick="refreshAll()">更新全部</button>
-<button class="btn" onclick="speedTest()">测速</button>
-<span class="spd" id="spd">--</span>
-<button class="btn btn-icon" id="themeBtn" onclick="toggleTheme()" title="切换主题" aria-label="切换主题">
-<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><g id="themeIcon"></g></svg>
-</button>
-<button class="btn" onclick="showSettings()">设置</button>
+<button class="btn ac" onclick="speedTest()">真实测速</button>
+<span class="spd" id="spd">速度 --</span>
+<button class="btn" onclick="showSettings()">设置 ⚙</button>
+<button class="btn" id="themeBtn" onclick="toggleTheme()" title="切换浅色 / 深色主题">☾ 深色</button>
 </div>
 
 <div class="main">
@@ -483,7 +192,7 @@ body{
 <div class="sidebar">
 <div class="sh">
 <span>订阅分组</span>
-<button class="btn btn-sm btn-icon" onclick="showAddGroup()" title="添加分组" aria-label="添加分组">+</button>
+<button onclick="showAddGroup()">+</button>
 </div>
 <div class="gl" id="gl"></div>
 </div>
@@ -492,38 +201,30 @@ body{
 <div class="content">
 <div class="ch" id="ch">
 <span class="cht" id="grpName">全部节点</span>
-<button class="btn btn-soft" onclick="toggleAddNode()">+ 节点</button>
-<button class="btn" onclick="toggleImport()">粘贴</button>
+<button class="btn ac" onclick="toggleAddNode()">+ 手动</button>
+<button class="btn st" onclick="toggleImport()">+ 粘贴</button>
 <button class="btn" onclick="pingGroup()">测速</button>
-<select id="sortSel" onchange="setSort(this.value)" title="排序方式">
-<option value="">默认排序</option><option value="ping_asc">延迟↑</option><option value="ping_desc">延迟↓</option>
+<button class="btn sp" onclick="delGroup()" id="delGrpBtn" style="display:none">删除分组</button>
+<select id="sortSel" onchange="setSort(this.value)">
+<option value="">默认</option><option value="ping_asc">延迟↑</option><option value="ping_desc">延迟↓</option>
 </select>
-<div class="menu-wrap">
-<button class="btn btn-icon" onclick="toggleMenu(event)" title="更多操作" aria-label="更多操作">⋯</button>
-<div class="menu" id="grpMenu">
-<button id="miEdit" onclick="editGroup()">编辑分组</button>
-<button class="del" id="miDel" onclick="delGroup()">删除分组</button>
-</div>
-</div>
 </div>
 <div class="nwrap">
-<div class="nlh"><div class="c1">节点</div><div class="c2">延迟</div><div class="c3">操作</div></div>
+<div class="nlh"><div class="c1">节点名称 / 地址</div><div class="c2">延迟</div><div class="c3">操作</div></div>
 <div class="nl" id="nl"><div class="empty">选择左侧分组查看节点</div></div>
 </div>
 </div>
 </div>
 </div>
 
-<div id="toasts"></div>
-
 <!-- 添加分组弹窗 -->
 <div class="modal" id="addGroupModal">
 <div class="mp">
 <h3>添加订阅分组</h3>
-<div class="fld"><label>名称</label><input id="gn" placeholder="例: 我的节点"></div>
-<div class="fld"><label>订阅URL</label><input id="gu" placeholder="https://..."></div>
-<div class="fld"><label>订阅代理（可选）</label><input id="gp" placeholder="http://127.0.0.1:7890"></div>
-<div class="row"><button class="btn btn-primary" onclick="addGroup()">添加</button><button class="btn" onclick="closeModal('addGroupModal')">取消</button></div>
+<label>名称</label><input id="gn" placeholder="例: 我的节点">
+<label>订阅URL</label><input id="gu" placeholder="https://...">
+<label>订阅代理（可选）</label><input id="gp" placeholder="http://127.0.0.1:7890">
+<div><button class="btn st" onclick="addGroup()">添加</button><button class="btn" onclick="closeModal('addGroupModal')">取消</button></div>
 </div>
 </div>
 
@@ -532,18 +233,18 @@ body{
 <div class="mp">
 <h3>手动添加节点</h3>
 <div class="sg">
-<div class="fld"><label>名称</label><input id="an"></div>
-<div class="fld"><label>协议</label><select id="ap"><option value="vless">vless</option><option value="vmess">vmess</option><option value="trojan">trojan</option><option value="ss">shadowsocks</option></select></div>
-<div class="fld"><label>服务器</label><input id="as"></div>
-<div class="fld"><label>端口</label><input id="aop" type="number" placeholder="443"></div>
-<div class="fld"><label>UUID/密码</label><input id="aid"></div>
-<div class="fld"><label>传输方式</label><select id="anet"><option value="tcp">tcp</option><option value="ws">ws</option></select></div>
-<div class="fld"><label>TLS</label><select id="atls"><option value="none">无</option><option value="tls">tls</option></select></div>
-<div class="fld"><label>SNI</label><input id="asni"></div>
-<div class="fld"><label>路径</label><input id="apath"></div>
-<div class="fld"><label>请求Host</label><input id="ahost"></div>
+<div><label>名称</label><input id="an"></div>
+<div><label>协议</label><select id="ap"><option value="vless">vless</option><option value="vmess">vmess</option><option value="trojan">trojan</option><option value="ss">shadowsocks</option></select></div>
+<div><label>服务器</label><input id="as"></div>
+<div><label>端口</label><input id="aop" type="number" placeholder="443"></div>
+<div><label>UUID/密码</label><input id="aid"></div>
+<div><label>传输方式</label><select id="anet"><option value="tcp">tcp</option><option value="ws">ws</option></select></div>
+<div><label>TLS</label><select id="atls"><option value="none">无</option><option value="tls">tls</option></select></div>
+<div><label>SNI</label><input id="asni"></div>
+<div><label>路径</label><input id="apath"></div>
+<div><label>请求Host</label><input id="ahost"></div>
 </div>
-<div class="row"><button class="btn btn-primary" onclick="addManualNode()">添加</button><button class="btn" onclick="closeModal('addNodeModal')">取消</button></div>
+<div><button class="btn st" onclick="addManualNode()">添加</button><button class="btn" onclick="closeModal('addNodeModal')">取消</button></div>
 </div>
 </div>
 
@@ -551,8 +252,8 @@ body{
 <div class="modal" id="importModal">
 <div class="mp">
 <h3>粘贴导入节点</h3>
-<div class="fld"><textarea id="imp" placeholder="每行一个链接，支持 vless/vmess/trojan/ss"></textarea></div>
-<div class="row"><button class="btn btn-primary" onclick="importNodes()">导入</button><button class="btn" onclick="closeModal('importModal')">取消</button></div>
+<textarea id="imp" placeholder="每行一个链接，支持 vless/vmess/trojan/ss"></textarea>
+<div><button class="btn st" onclick="importNodes()">导入</button><button class="btn" onclick="closeModal('importModal')">取消</button></div>
 </div>
 </div>
 
@@ -561,25 +262,22 @@ body{
 <div class="mp">
 <h3>设置</h3>
 <div class="sg">
-<div class="fld"><label>SOCKS5 端口</label><input id="setSocks" type="number" placeholder="10808"></div>
-<div class="fld"><label>HTTP 代理端口</label><input id="setHttp" type="number" placeholder="10810"></div>
-<div class="fld st-full"><label>Web 监听地址</label><input id="setListen" placeholder="0.0.0.0"></div>
-<div class="fld"><label>订阅刷新间隔(秒，0=禁用自动刷新)</label><input id="setRefresh" type="number" min="0" placeholder="300"></div>
-<div class="fld"><label>代理模式</label><select id="setMode"><option value="smart">智能（国内直连，国外走代理）</option><option value="global">全局（全部走代理）</option><option value="direct">直连（全部不走代理）</option></select></div>
+<div><label>SOCKS5 端口</label><input id="setSocks" type="number" placeholder="10808"></div>
+<div><label>HTTP 代理端口</label><input id="setHttp" type="number" placeholder="10810"></div>
+<div class="st-full"><label>Web 监听地址</label><input id="setListen" placeholder="0.0.0.0"></div>
+<div><label>订阅刷新间隔(秒，0=禁用自动刷新)</label><input id="setRefresh" type="number" min="0" placeholder="300"></div>
+<div><label>代理模式</label><select id="setMode"><option value="smart">智能（国内直连，国外走代理）</option><option value="global">全局（全部走代理）</option><option value="direct">直连（全部不走代理）</option></select></div>
 <div class="st-full"><label class="ck"><input type="checkbox" id="setFailover">节点连续失败时，自动切换到其他可用节点</label></div>
-<div class="fld st-full"><label>全局订阅代理（HTTP代理，可选）</label><input id="setSubProxy" placeholder="http://127.0.0.1:7890"></div>
-<div class="fld st-full"><label>测速URL（用于真实测速）</label><input id="setSpeedURL" placeholder="https://speed.cloudflare.com/__down?bytes=2000000"></div>
-<div class="st-full">
-<label>配置备份 / 恢复</label>
-<div class="row" style="margin-bottom:var(--sp-3)">
+<div class="st-full"><label>全局订阅代理（HTTP代理，可选）</label><input id="setSubProxy" placeholder="http://127.0.0.1:7890"></div>
+<div class="st-full"><label>测速URL（用于真实测速）</label><input id="setSpeedURL" placeholder="https://speed.cloudflare.com/__down?bytes=2000000"></div>
+<div class="st-full"><label>配置备份 / 恢复</label>
 <button class="btn" onclick="backupCfg()">导出配置</button>
 <button class="btn" onclick="document.getElementById('restoreFile').click()">导入配置</button>
-<input type="file" id="restoreFile" accept=".json,application/json" hidden onchange="restoreCfg(this)">
-</div>
+<input type="file" id="restoreFile" accept=".json,application/json" style="display:none" onchange="restoreCfg(this)">
 </div>
 <div class="st-full st-ft">提示：修改端口 / 监听地址 / 代理模式后，代理会自动重启以应用新配置；若修改了 Web 端口，需重启系统服务后生效。</div>
 </div>
-<div class="row"><button class="btn btn-primary" onclick="saveSettings()">保存</button><button class="btn" onclick="closeModal('settingsModal')">取消</button></div>
+<div><button class="btn st" onclick="saveSettings()">保存</button><button class="btn" onclick="closeModal('settingsModal')">取消</button></div>
 </div>
 </div>
 
@@ -587,184 +285,89 @@ body{
 <div class="modal" id="editGroupModal">
 <div class="mp">
 <h3>编辑订阅分组</h3>
-<div class="fld"><label>名称</label><input id="egn"></div>
-<div class="fld"><label>订阅URL</label><input id="egu"></div>
-<div class="fld"><label>订阅代理（可选）</label><input id="egp" placeholder="http://127.0.0.1:7890"></div>
+<label>名称</label><input id="egn">
+<label>订阅URL</label><input id="egu">
+<label>订阅代理（可选）</label><input id="egp" placeholder="http://127.0.0.1:7890">
 <div class="st-ft">保存后将清空该分组现有节点，并立即用新订阅链接重新拉取。</div>
-<div class="row"><button class="btn btn-primary" onclick="updateGroup()">保存</button><button class="btn" onclick="closeModal('editGroupModal')">取消</button></div>
+<div><button class="btn st" onclick="updateGroup()">保存</button><button class="btn" onclick="closeModal('editGroupModal')">取消</button></div>
 </div>
 </div>
 
 <script>
-let active='', curGrp='', groups=[], running=false;
+let active='', curGrp='', groups=[];
 
 async function api(m,p,b){const o={method:m,headers:{'Content-Type':'application/json'}};if(b)o.body=JSON.stringify(b);return(await fetch(p,o)).json()}
 
 function closeModal(id){document.getElementById(id).classList.remove('show')}
 
-/* ---------- 主题切换 ---------- */
-const ICON_SUN='<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>';
-const ICON_MOON='<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>';
-function isDark(){return document.documentElement.getAttribute('data-theme')==='dark'}
-function renderThemeIcon(){
-  /* 图标显示的是「点击后会切到哪个主题」，而不是当前主题 */
-  document.getElementById('themeIcon').innerHTML=isDark()?ICON_SUN:ICON_MOON;
-  const m=document.querySelector('meta[name=theme-color]');
-  if(m)m.setAttribute('content',isDark()?'#0B0E14':'#F7F8FA');
+/* 主题切换。按钮上显示的是「点了会切到哪个主题」，不是当前主题，
+   否则用户看到「浅色」会以为已经处于浅色，点了没反应反而像坏了。 */
+function setTheme(t,save){
+  document.documentElement.setAttribute('data-theme',t);
+  if(save){try{localStorage.setItem('v2aynn-theme',t)}catch(e){}}
+  const b=document.getElementById('themeBtn');
+  if(b)b.textContent=(t==='dark'?'☀ 浅色':'☾ 深色');
 }
-function toggleTheme(){
-  const next=isDark()?'light':'dark';
-  document.documentElement.setAttribute('data-theme',next);
-  try{localStorage.setItem('v2aynn-theme',next)}catch(e){}
-  renderThemeIcon();
-}
+function toggleTheme(){setTheme(document.documentElement.getAttribute('data-theme')==='dark'?'light':'dark',true)}
 
-/* ---------- Toast（替代 alert） ---------- */
-function toast(msg,kind){
-  const w=document.getElementById('toasts');
-  const t=document.createElement('div');
-  t.className='toast'+(kind?' '+kind:'');
-  t.textContent=msg;
-  w.appendChild(t);
-  requestAnimationFrame(()=>t.classList.add('in'));
-  setTimeout(()=>{
-    t.classList.remove('in');
-    setTimeout(()=>t.remove(),260);
-  },2400);
-}
-
-/* ---------- 下拉菜单 ---------- */
-function toggleMenu(e){
-  e.stopPropagation();
-  document.getElementById('grpMenu').classList.toggle('show');
-}
-document.addEventListener('click',()=>document.getElementById('grpMenu').classList.remove('show'));
-
-/* ---------- 分组列表 ---------- */
+// 加载分组列表
 async function loadGroups(){
   const d=await api('GET','/api/groups');
   groups=d.groups||[];
   const el=document.getElementById('gl');
   el.innerHTML=groups.map(g=>{
     const isActive=g.id===curGrp;
-    return '<div class="gi'+(isActive?' ac':'')+'" onclick="selectGroup(\''+g.id+'\')">'
-      +'<div class="gn"><div class="gnm">'+esc(g.name)+'</div>'
-      +'<div class="gns">'+(g.url?esc(g.url):'无订阅')+'</div></div>'
-      +'<span class="gcnt">'+g.nodeCount+'</span></div>';
+    const isDefault=g.id==='__default__';
+    const editBtn=(!isDefault&&g.url)?'<span class="gact" onclick="event.stopPropagation();editGroup(\''+g.id+'\')">编辑</span>':'';
+    return '<div class="gi'+(isActive?' ac':'')+'" onclick="selectGroup(\''+g.id+'\')"><div class="gn"><div class="gnm">'+esc(g.name)+'</div><div class="gns">'+(g.url?esc(g.url).substring(0,30)+'...':'无订阅')+'</div></div><span class="gcnt">'+g.nodeCount+'</span>'+editBtn+'</div>'
   }).join('');
   if(!curGrp&&groups.length>0)selectGroup(groups[0].id);
 }
 
-/* ---------- 选择分组 ---------- */
+// 选择分组
 async function selectGroup(id){
   curGrp=id;
   loadGroups();
   const d=await api('GET','/api/group/'+id+'/nodes');
   const nodes=d.nodes||[];
   active=d.active||'';
+  const el=document.getElementById('nl');
   const grp=groups.find(g=>g.id===id);
   document.getElementById('grpName').textContent=grp?grp.name:'节点';
-  /* 只有带订阅 URL 的分组才可编辑 / 删除；手动节点分组是内置的 */
-  const hasUrl=!!(grp&&grp.url);
-  document.getElementById('miEdit').disabled=!hasUrl;
-  document.getElementById('miDel').disabled=!hasUrl;
-  const el=document.getElementById('nl');
+  document.getElementById('delGrpBtn').style.display=(grp&&grp.url)?'inline-block':'none';
   if(!nodes.length){el.innerHTML='<div class="empty">暂无节点</div>';return}
   el.innerHTML=nodes.map(n=>{
-    const isTo=n.ping<0;
-    const p=n.ping>0?n.ping+'ms':(isTo?'超时':'—');
-    const sp=n.speed>0?'<span class="sp">'+n.speed.toFixed(1)+'M</span>':'';
-    return '<div class="ni'+(n.id===active?' ac':'')+'" onclick="switchN(\''+n.id+'\')">'
-      +'<div class="c1"><div class="nn">'+esc(n.name)+'</div>'
-      +'<div class="nm"><span class="addr">'+esc(n.server)+':'+esc(String(n.port))+'</span>'
-      +'<span class="tag">'+esc(n.protocol)+'</span></div></div>'
-      +'<div class="c2"><span class="ms'+(isTo?' to':'')+'" id="p'+n.id+'">'+p+'</span>'+sp+'</div>'
-      +'<div class="c3"><div class="acts">'
-      +'<button onclick="event.stopPropagation();pingNode(\''+n.id+'\')">测速</button>'
-      +'<button class="del" onclick="event.stopPropagation();delNode(\''+n.id+'\')">删除</button>'
-      +'</div></div></div>';
+    const pc=n.ping<0?'var(--danger)':'var(--text-muted)';
+    const p=n.ping>0?n.ping+'ms':(n.ping<0?'超时':'');
+    return '<div class="ni '+(n.id===active?'ac':'')+'" onclick="switchN(\''+n.id+'\')"><div class="c1"><div class="nn">'+esc(n.name)+'</div><div class="nm">'+n.server+':'+n.port+' <span class="tag '+n.protocol+'">'+n.protocol+'</span></div></div><div class="c2"><span class="ping" id="p'+n.id+'" style="font-size:10px;color:'+pc+'">'+p+'</span>'+(n.speed>0?'<div style="font-size:9px;color:var(--success)">'+n.speed.toFixed(1)+'M</div>':'')+'</div><div class="c3"><button class="btn" onclick="event.stopPropagation();pingNode(\''+n.id+'\')">测速</button><button class="btn" style="margin-left:3px;color:var(--danger)" onclick="event.stopPropagation();delNode(\''+n.id+'\')">删除</button></div></div>'
   }).join('');
 }
 
-/* ---------- 运行状态 / 电源开关 ---------- */
 async function loadStatus(){
-  try{
-    const s=await api('GET','/api/status');
-    running=!!s.running;
-    document.getElementById('dot').className='dot'+(running?' on':'');
-    const btn=document.getElementById('powerBtn');
-    btn.textContent=running?'停止':'启动';
-    btn.className='btn '+(running?'btn-danger':'btn-primary');
-    document.getElementById('st').textContent=
-      (running?'运行中':'已停止')+(s.activeName?' · '+s.activeName:'');
-    active=s.activeNode;
-  }catch(e){
-    document.getElementById('st').textContent='连接失败';
-  }
-}
-/* 启停合并为单按钮：文案与语义都跟随 running 状态，
-   避免用户面对「启动/停止」两个按钮还要自己判断该点哪个。 */
-async function togglePower(){
-  const btn=document.getElementById('powerBtn');
-  const wasRunning=running;
-  btn.disabled=true;
-  btn.textContent=wasRunning?'停止中...':'启动中...';
-  try{
-    await api('POST','/api/proxy/'+(wasRunning?'stop':'start'));
-    await loadStatus();
-  }finally{
-    btn.disabled=false;
-  }
+  try{const s=await api('GET','/api/status');document.getElementById('dot').className='dot'+(s.running?' on':'');document.getElementById('st').textContent=(s.running?'运行中':'已停止')+(s.activeName?' - '+s.activeName:'');active=s.activeNode}catch(e){document.getElementById('st').textContent='连接失败'}
 }
 
-/* ---------- 添加 / 编辑 / 删除分组 ---------- */
+// 添加分组
 function showAddGroup(){document.getElementById('addGroupModal').classList.add('show')}
 async function addGroup(){
-  const name=document.getElementById('gn').value.trim();
-  const url=document.getElementById('gu').value.trim();
-  const proxy=document.getElementById('gp').value.trim();
-  if(!name||!url){toast('名称和订阅URL不能为空','err');return}
+  const name=document.getElementById('gn').value.trim(),url=document.getElementById('gu').value.trim(),proxy=document.getElementById('gp').value.trim();
+  if(!name||!url)return;
   await api('POST','/api/group/add',{name,url,subProxy:proxy});
-  document.getElementById('gn').value='';
-  document.getElementById('gu').value='';
-  document.getElementById('gp').value='';
+  document.getElementById('gn').value='';document.getElementById('gu').value='';document.getElementById('gp').value='';
   closeModal('addGroupModal');
   await loadGroups();
-  setTimeout(()=>selectGroup(curGrp),200);
+  setTimeout(()=>fetchGroup(curGrp),200);
 }
+
+// 删除分组
 async function delGroup(){
-  if(!curGrp)return;
-  if(!confirm('删除此分组及所有节点？'))return;
+  if(!curGrp||!confirm('删除此分组及所有节点？'))return;
   await api('POST','/api/group/'+curGrp+'/del');
   curGrp='';
   await loadGroups();
 }
-let editGID='';
-function editGroup(){
-  const g=groups.find(x=>x.id===curGrp);
-  if(!g||!g.url)return;
-  editGID=curGrp;
-  document.getElementById('egn').value=g.name||'';
-  document.getElementById('egu').value=g.url||'';
-  document.getElementById('egp').value=g.subProxy||'';
-  document.getElementById('editGroupModal').classList.add('show');
-}
-async function updateGroup(){
-  const name=document.getElementById('egn').value.trim();
-  const url=document.getElementById('egu').value.trim();
-  const proxy=document.getElementById('egp').value.trim();
-  if(!name||!url){toast('名称和订阅URL不能为空','err');return}
-  const r=await api('POST','/api/group/'+editGID+'/update',{name,url,subProxy:proxy});
-  if(r.error){toast('保存失败: '+r.error,'err');return}
-  document.getElementById('egn').value='';
-  document.getElementById('egu').value='';
-  document.getElementById('egp').value='';
-  closeModal('editGroupModal');
-  await loadGroups();
-  setTimeout(()=>selectGroup(editGID),300);
-}
 
-/* ---------- 更新全部 / 测速 ---------- */
+// 更新全部
 async function refreshAll(){
   for(const g of groups){
     if(g.url)await api('POST','/api/group/'+g.id+'/fetch');
@@ -772,109 +375,97 @@ async function refreshAll(){
   loadGroups();
   setTimeout(()=>selectGroup(curGrp),2000);
 }
+
+// 测速当前分组
 async function pingGroup(){
   if(!curGrp)return;
   const btn=document.querySelector('[onclick="pingGroup()"]');
-  const old=btn?btn.textContent:'';
   if(btn){btn.disabled=true;btn.textContent='测速中...'}
-  try{
-    await api('POST','/api/ping/group/'+curGrp);
-  }finally{
-    if(btn){btn.disabled=false;btn.textContent=old||'测速'}
-  }
+  const r=await api('POST','/api/ping/group/'+curGrp);
+  if(btn){btn.disabled=false;btn.textContent='测速'}
   selectGroup(curGrp);
 }
-async function pingNode(id){
-  const el=document.getElementById('p'+id);
-  if(!el)return;
-  el.textContent='...';
-  el.className='ms';
-  try{
-    const r=await api('POST','/api/ping/'+id);
-    el.textContent=r.ms>0?r.ms+'ms':(r.ms<0?'超时':'—');
-    el.className='ms'+(r.ms<0?' to':'');
-  }catch(e){
-    el.textContent='超时';
-    el.className='ms to';
-  }
-}
+
+// 切换节点
 async function switchN(id){await api('POST','/api/node/'+id);selectGroup(curGrp);loadStatus()}
+
+// 手动添加节点
+function toggleAddNode(){document.getElementById('addNodeModal').classList.add('show')}
+async function addManualNode(){
+  const d={name:document.getElementById('an').value.trim(),protocol:document.getElementById('ap').value,server:document.getElementById('as').value.trim(),port:document.getElementById('aop').value,uuid:document.getElementById('aid').value,reqHost:document.getElementById('ahost').value,path:document.getElementById('apath').value,network:document.getElementById('anet').value,tls:document.getElementById('atls').value,sni:document.getElementById('asni').value};
+  if(!d.name||!d.server||!d.port){alert('名称、服务器、端口必填');return}
+  const r=await api('POST','/api/node/add',d);
+  if(r.id){closeModal('addNodeModal');document.querySelectorAll('#addNodeModal input').forEach(e=>e.value='');loadGroups();setTimeout(()=>selectGroup('__default__'),100)}
+}
+
+// 导入
+function toggleImport(){document.getElementById('importModal').classList.add('show')}
+async function importNodes(){
+  const t=document.getElementById('imp').value.trim();
+  if(!t){alert('请粘贴节点链接');return}
+  const urls=t.split('\n').filter(l=>l.trim()!=='');
+  const r=await api('POST','/api/node/import',{urls});
+  if(r.ok){closeModal('importModal');document.getElementById('imp').value='';loadGroups();setTimeout(()=>selectGroup('__default__'),100)}
+}
+
+// 删除节点
 async function delNode(id){
   if(!confirm('删除此节点?'))return;
   await api('POST','/api/node/'+id+'/del');
   selectGroup(curGrp);
 }
+
+// 测速
+async function pingNode(id){
+  const el=document.getElementById('p'+id);
+  if(el)el.textContent='测速中...';
+  try{const r=await api('POST','/api/ping/'+id);if(el)el.textContent=r.ms>0?r.ms+'ms':(r.ms<0?'超时':'')}catch(e){if(el)el.textContent='超时'}
+}
+
 async function setSort(v){await api('POST','/api/sort',{order:v});selectGroup(curGrp)}
 
+async function doStart(){await api('POST','/api/proxy/start');loadStatus()}
+async function doStop(){await api('POST','/api/proxy/stop');loadStatus()}
+
 async function speedTest(){
-  const el=document.getElementById('spd');
-  el.className='spd';
-  el.textContent='测速中...';
-  try{
-    const r=await api('POST','/api/speed');
-    if(!r.ok){
-      el.className='spd err';
-      el.textContent=r.error||'失败';
-    }else{
-      el.className='spd '+(r.mbps>=1?'ok':(r.mbps>=0.1?'warn':'err'));
-      el.textContent=r.mbps.toFixed(2)+' Mbps';
-      selectGroup(curGrp);
-    }
-  }catch(e){
-    el.className='spd err';
-    el.textContent='失败';
-  }
+  const el=document.getElementById('spd');el.textContent='测速中...';el.style.color='var(--text-muted)';
+  try{const r=await api('POST','/api/speed');if(!r.ok){el.style.color='var(--danger)';el.textContent=r.error||'失败'}else{el.style.color=r.mbps>=1?'var(--success)':(r.mbps>=0.1?'var(--warning)':'var(--danger)');el.textContent=r.mbps.toFixed(2)+' Mbps';selectGroup(curGrp)}}catch(e){el.style.color='var(--danger)';el.textContent='失败'}
 }
 
-/* ---------- 手动添加 / 粘贴导入 ---------- */
-function toggleAddNode(){document.getElementById('addNodeModal').classList.add('show')}
-async function addManualNode(){
-  const d={
-    name:document.getElementById('an').value.trim(),
-    protocol:document.getElementById('ap').value,
-    server:document.getElementById('as').value.trim(),
-    port:document.getElementById('aop').value,
-    uuid:document.getElementById('aid').value,
-    reqHost:document.getElementById('ahost').value,
-    path:document.getElementById('apath').value,
-    network:document.getElementById('anet').value,
-    tls:document.getElementById('atls').value,
-    sni:document.getElementById('asni').value
-  };
-  if(!d.name||!d.server||!d.port){toast('名称、服务器、端口必填','err');return}
-  const r=await api('POST','/api/node/add',d);
-  if(r.id){
-    closeModal('addNodeModal');
-    document.querySelectorAll('#addNodeModal input').forEach(e=>e.value='');
-    loadGroups();
-    setTimeout(()=>selectGroup('__default__'),100);
-  }
+function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML}
+
+// 编辑订阅分组
+let editGID='';
+function editGroup(id){
+  editGID=id;
+  const g=groups.find(x=>x.id===id);
+  document.getElementById('egn').value=g?g.name||'':'';
+  document.getElementById('egu').value=g?g.url||'':'';
+  document.getElementById('egp').value=g?(g.subProxy||''):'';
+  document.getElementById('editGroupModal').classList.add('show');
 }
-function toggleImport(){document.getElementById('importModal').classList.add('show')}
-async function importNodes(){
-  const t=document.getElementById('imp').value.trim();
-  if(!t){toast('请粘贴节点链接','err');return}
-  const urls=t.split('\n').filter(l=>l.trim()!=='');
-  const r=await api('POST','/api/node/import',{urls});
-  if(r.ok){
-    closeModal('importModal');
-    document.getElementById('imp').value='';
-    loadGroups();
-    setTimeout(()=>selectGroup('__default__'),100);
-  }
+async function updateGroup(){
+  const name=document.getElementById('egn').value.trim();
+  const url=document.getElementById('egu').value.trim();
+  const proxy=document.getElementById('egp').value.trim();
+  if(!name||!url){alert('名称和订阅URL不能为空');return}
+  const r=await api('POST','/api/group/'+editGID+'/update',{name,url,subProxy:proxy});
+  if(r.error){alert('保存失败: '+r.error);return}
+  document.getElementById('egn').value='';document.getElementById('egu').value='';document.getElementById('egp').value='';
+  closeModal('editGroupModal');
+  await loadGroups();
+  setTimeout(()=>selectGroup(editGID),300);
 }
 
-function esc(s){const d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML}
-
-/* ---------- 设置面板 ---------- */
+// 设置面板
 async function showSettings(){
   try{
     const s=await api('GET','/api/settings');
     document.getElementById('setSocks').value=s.socksPort||'';
     document.getElementById('setHttp').value=s.httpPort||'';
     document.getElementById('setListen').value=s.listenAddr||'';
-    /* 注意：subRefresh 的 0 是合法值（禁用自动刷新），不能用 `||''` 兜底，
-       否则 0 会显示成空白，用户会误以为没设置成功。 */
+    // 注意：subRefresh 的 0 是合法值（禁用自动刷新），不能用 `||''` 兜底，
+    // 否则 0 会显示成空白，用户会误以为没设置成功。
     document.getElementById('setRefresh').value=(s.subRefresh===0||s.subRefresh)?String(s.subRefresh):'';
     document.getElementById('setMode').value=s.proxyMode||'smart';
     document.getElementById('setSubProxy').value=s.subProxy||'';
@@ -883,18 +474,19 @@ async function showSettings(){
   }catch(e){}
   document.getElementById('settingsModal').classList.add('show');
 }
+
 async function saveSettings(){
   const socks=parseInt(document.getElementById('setSocks').value);
   const http=parseInt(document.getElementById('setHttp').value);
-  /* 单独取原始文本：空串要判为"未填"，而 0 是合法值，两者不能混为一谈 */
+  // 单独取原始文本：空串要判为"未填"，而 0 是合法值，两者不能混为一谈
   const rawRefresh=document.getElementById('setRefresh').value.trim();
   const refresh=rawRefresh===''?NaN:parseInt(rawRefresh,10);
-  if(!socks||socks<=0||socks>65535){toast('SOCKS5 端口无效','err');return}
-  if(!http||http<=0||http>65535){toast('HTTP 端口无效','err');return}
-  /* 0 = 禁用自动刷新（合法）；其余需在 10-86400 秒之间。
-     原先的 `!refresh||refresh<10` 会把 0 一并拦下，导致"禁用"这个功能在界面上根本无法设置。 */
-  if(isNaN(refresh)){toast('订阅刷新间隔请填写数字（0 = 禁用自动刷新）','err');return}
-  if(refresh!==0&&(refresh<10||refresh>86400)){toast('订阅刷新间隔需为 0（禁用自动刷新）或 10-86400 秒','err');return}
+  if(!socks||socks<=0||socks>65535){alert('SOCKS5端口无效');return}
+  if(!http||http<=0||http>65535){alert('HTTP端口无效');return}
+  // 0 = 禁用自动刷新（合法）；其余需在 10-86400 秒之间。
+  // 原先的 `!refresh||refresh<10` 会把 0 一并拦下，导致"禁用"这个功能在界面上根本无法设置。
+  if(isNaN(refresh)){alert('订阅刷新间隔请填写数字（0 = 禁用自动刷新）');return}
+  if(refresh!==0&&(refresh<10||refresh>86400)){alert('订阅刷新间隔需为 0（禁用自动刷新）或 10-86400 秒');return}
   const b={
     socksPort:socks,
     httpPort:http,
@@ -907,12 +499,13 @@ async function saveSettings(){
   };
   const r=await api('POST','/api/settings',b);
   closeModal('settingsModal');
-  if(r.error){toast('保存失败: '+r.error,'err');return}
-  toast('设置已保存，代理配置已应用','ok');
+  if(r.error){alert('保存失败: '+r.error);return}
+  alert('设置已保存，代理配置已应用');
 }
 
-/* ---------- 配置备份 / 恢复 ---------- */
+// 配置备份 / 恢复
 function backupCfg(){location.href='/api/backup'}
+
 function restoreCfg(el){
   const f=el.files[0];
   el.value='';
@@ -923,21 +516,18 @@ function restoreCfg(el){
     try{
       const res=await fetch('/api/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:rd.result});
       const r=await res.json();
-      if(r.error){toast('恢复失败: '+r.error,'err');return}
+      if(r.error){alert('恢复失败: '+r.error);return}
       closeModal('settingsModal');
-      toast('配置已恢复（'+r.groups+' 个分组）','ok');
+      alert('配置已恢复（'+r.groups+' 个分组），列表即将刷新');
       curGrp='';
       await loadGroups();
       loadStatus();
-    }catch(e){
-      toast('恢复失败: 文件内容不是合法 JSON','err');
-    }
+    }catch(e){alert('恢复失败: 文件内容不是合法 JSON')}
   };
   rd.readAsText(f);
 }
 
-renderThemeIcon();
-loadGroups();
-loadStatus();
-setInterval(loadStatus,5000);
+// 按钮文案要在 DOM 就绪后同步（脚本在 body 末尾，此时按钮已存在）
+setTheme(document.documentElement.getAttribute('data-theme')==='dark'?'dark':'light',false);
+loadGroups();loadStatus();setInterval(loadStatus,5000);
 </script></body></html>
