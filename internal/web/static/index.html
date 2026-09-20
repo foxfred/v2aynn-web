@@ -275,7 +275,7 @@ body{font-family:system-ui,sans-serif;background:var(--bg-body);color:var(--text
 <button class="btn" onclick="document.getElementById('restoreFile').click()">导入配置</button>
 <input type="file" id="restoreFile" accept=".json,application/json" style="display:none" onchange="restoreCfg(this)">
 </div>
-<div class="st-full st-ft">提示：修改端口 / 监听地址 / 代理模式后，代理会自动重启以应用新配置；若修改了 Web 端口，需重启系统服务后生效。</div>
+<div class="st-full st-ft">提示：订阅刷新间隔修改后立即生效，设为 0 即禁用自动刷新（服务启动时仍会拉取一次订阅，用于校验节点有效性）。修改端口 / 监听地址 / 代理模式后，代理会自动重启以应用新配置；若修改了 Web 端口，需重启系统服务后生效。</div>
 </div>
 <div><button class="btn st" onclick="saveSettings()">保存</button><button class="btn" onclick="closeModal('settingsModal')">取消</button></div>
 </div>

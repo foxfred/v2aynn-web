@@ -26,17 +26,47 @@ const (
 	MaxSafeRefresh = 86400
 )
 
+// pollTick 是「复查配置」的周期，不是拉取间隔。
+// 为什么要复查而不是一次算好间隔，见 Poll 的说明。
+// 声明为变量而非常量，是为了让测试能把它缩短，否则每个用例都得干等 5 秒。
+var pollTick = 5 * time.Second
+
+// Poll 按配置的间隔自动拉取订阅，直到进程退出。
+//
+// 这里刻意**不用**「启动时按 SubRefresh 建一个固定 ticker」的写法：
+// 那样配置只在进程启动那一刻被读一次，用户之后在设置里把间隔改成 0（禁用）
+// 或改成别的值，已经在跑的 ticker 根本不会变，必须重启服务才生效 ——
+// 表现就是「界面明明写着已禁用，后台还在偷偷刷新订阅」。
+//
+// 现在改成每 pollTick 复查一次配置：禁用后立即停止拉取，改间隔或重新启用
+// 也都在 pollTick 之内生效，不需要重启服务。
 func Poll(cfg *config.Config) {
-	// 0 表示禁用；超过上限（含历史遗留的 MaxInt64 "禁用"标记）同样跳过，
-	// 既避免无意义轮询，也避免 time.Duration 溢出导致 NewTicker panic
-	if cfg.SubRefresh <= 0 || cfg.SubRefresh > MaxSafeRefresh {
-		if cfg.SubRefresh > MaxSafeRefresh {
-			log.Printf("Poll: 自动更新已禁用(SubRefresh=%d 超出上限%d秒)", cfg.SubRefresh, MaxSafeRefresh)
+	var elapsed time.Duration
+	overLimitLogged := false
+
+	for range time.Tick(pollTick) {
+		cfg.Lock()
+		n := cfg.SubRefresh
+		cfg.Unlock()
+
+		// 0 表示禁用；超过上限（含历史遗留的 MaxInt64 "禁用"标记）同样视为禁用，
+		// 既避免无意义轮询，也避免 time.Duration 溢出
+		if n <= 0 || n > MaxSafeRefresh {
+			// 只在状态发生变化时打一次日志，否则每 5 秒刷一条会淹掉日志
+			if n > MaxSafeRefresh && !overLimitLogged {
+				log.Printf("Poll: 自动更新已禁用(SubRefresh=%d 超出上限%d秒)", n, MaxSafeRefresh)
+				overLimitLogged = true
+			}
+			elapsed = 0
+			continue
 		}
-		return
-	}
-	ticker := time.NewTicker(time.Duration(cfg.SubRefresh) * time.Second)
-	for range ticker.C {
+		overLimitLogged = false
+
+		elapsed += pollTick
+		if elapsed < time.Duration(n)*time.Second {
+			continue
+		}
+		elapsed = 0
 		FetchAll(cfg)
 	}
 }
