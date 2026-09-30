@@ -74,6 +74,10 @@ func main() {
 		// 首次拉取订阅（同步），确保节点ID有效后再启动
 		subscription.FetchAll(cfg)
 		startWithRetry(v2m, "代理")
+		// 普通节点跑着的时候，把家宽测速探针也预热起来 ——
+		// 用户接下来最可能做的事就是测家宽，提前拉起能省掉十几秒等待。
+		// 内存不够时 WarmProbe 自己会跳过（见 ProberCanReside）。
+		srv.WarmProbe()
 	}()
 
 	sig := make(chan os.Signal, 1)
@@ -88,6 +92,8 @@ func main() {
 	<-sig
 	v2m.Stop()
 	mhm.Stop()
+	// 测速探针也是个独立进程，不显式收掉会变成孤儿一直占着内存
+	srv.StopProbe()
 }
 
 // kernelStarter 能被重试启动的内核

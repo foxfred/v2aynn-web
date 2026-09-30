@@ -64,6 +64,61 @@ type Group struct {
 	// 所以家宽分组的 Nodes 恒为空 —— 它的节点由 mihomo 管理，不放进这里，
 	// 免得混进 AllNodes() 被 xray 的故障转移当成候选节点。
 	Kind string `json:"kind,omitempty"`
+
+	// Probes 家宽节点的测速结果，按节点名索引。只对家宽分组有意义。
+	//
+	// 为什么要单独一张表：家宽分组的 Nodes 恒为空，Node.Ping / Node.Speed
+	// 没有地方安放。没有它的时候，「真实测速」测出来的数字只能写回
+	// cfg.ActiveNode —— 而那个字段在家宽模式下还停在上一个普通节点上，
+	// 于是家宽测出来的速度被记到了普通节点头上，家宽节点自己永远显示不出速度。
+	Probes map[string]ProbeInfo `json:"probes,omitempty"`
+}
+
+// ProbeInfo 一个家宽节点的测速结果。
+type ProbeInfo struct {
+	// MS 延迟毫秒。-1 表示测过但不通；0 表示从没测过（界面留空）。
+	MS int `json:"ms"`
+	// MBPS 真实测速的下载速度（Mbps）。0 表示没测过。
+	MBPS float64 `json:"mbps,omitempty"`
+	// TS 最后一次测速时间（Unix 秒）。0 表示没测过。
+	TS int64 `json:"ts,omitempty"`
+}
+
+// SetProbeMS 记下一个家宽节点的延迟。ms 传 -1 表示测过但不通。
+//
+// 注意必须「取出副本 → 改 → 写回」：map 里的 struct 是不可寻址的，
+// 直接 p.MS = ms 改的是副本，写不回去。
+func (g *Group) SetProbeMS(name string, ms int) {
+	if name == "" {
+		return
+	}
+	if g.Probes == nil {
+		g.Probes = map[string]ProbeInfo{}
+	}
+	p := g.Probes[name]
+	p.MS = ms
+	p.TS = time.Now().Unix()
+	g.Probes[name] = p
+}
+
+// SetProbeSpeed 记下一个家宽节点的真实下载速度（Mbps）。
+func (g *Group) SetProbeSpeed(name string, mbps float64) {
+	if name == "" || mbps <= 0 {
+		return
+	}
+	if g.Probes == nil {
+		g.Probes = map[string]ProbeInfo{}
+	}
+	p := g.Probes[name]
+	p.MBPS = mbps
+	p.TS = time.Now().Unix()
+	g.Probes[name] = p
+}
+
+// Probe 取某个家宽节点的测速结果，第二个返回值为 false 表示没测过。
+func (g *Group) Probe(name string) (ProbeInfo, bool) {
+	p, ok := g.Probes[name]
+	return p, ok
 }
 
 // 分组类型。空串等价 GroupKindNormal，保持老配置向后兼容。

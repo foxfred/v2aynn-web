@@ -591,22 +591,27 @@ func (m *Manager) LoadGroup(groupID, subURL, proxy string) error {
 	return nil
 }
 
-// readSub 读取某个分组的订阅原文。
+// readSub 读取某个分组的订阅原文（见 readSubFile）。
+func (m *Manager) readSub(groupID string) ([]byte, error) {
+	return readSubFile(m.dataDir, groupID)
+}
+
+// readSubFile 读取某个分组的订阅原文。
 //
 // 找不到分组自己的文件时会回落到升级前的那份全局文件（clash-sub.yaml）：
 // 老用户升级上来时磁盘上只有那一份，能读到就不用再联网拉一次 ——
 // 而盒子刚开机时代理还没起来，联网拉订阅大概率失败，那就成死锁了。
 // 读到之后顺手复制到新文件名，下次直接命中。
-func (m *Manager) readSub(groupID string) ([]byte, error) {
-	b, err := os.ReadFile(filepath.Join(m.dataDir, subFileNameFor(groupID)))
+func readSubFile(dataDir, groupID string) ([]byte, error) {
+	b, err := os.ReadFile(filepath.Join(dataDir, subFileNameFor(groupID)))
 	if err == nil {
 		return b, nil
 	}
-	legacy, lerr := os.ReadFile(filepath.Join(m.dataDir, legacySubFileName))
+	legacy, lerr := os.ReadFile(filepath.Join(dataDir, legacySubFileName))
 	if lerr != nil {
 		return nil, err
 	}
-	_ = os.WriteFile(filepath.Join(m.dataDir, subFileNameFor(groupID)), legacy, 0644)
+	_ = os.WriteFile(filepath.Join(dataDir, subFileNameFor(groupID)), legacy, 0644)
 	log.Printf("家宽订阅原文沿用升级前的 %s（已复制给分组 %s）", legacySubFileName, groupID)
 	return legacy, nil
 }
@@ -614,7 +619,10 @@ func (m *Manager) readSub(groupID string) ([]byte, error) {
 // writeConf 按订阅原文生成 mihomo 运行配置（只改顶层 7 个键，见 rewriteConfig）。
 func (m *Manager) writeConf(body []byte) error {
 	socksPort, httpPort := m.ports()
-	conf, err := rewriteConfig(string(body), socksPort, httpPort, ControlPort)
+	conf, err := rewriteConfig(string(body), confPorts{
+		socks: socksPort, http: httpPort,
+		redir: RedirPort, ctrl: ControlPort, allowLan: true,
+	})
 	if err != nil {
 		return err
 	}
@@ -622,6 +630,22 @@ func (m *Manager) writeConf(body []byte) error {
 		return err
 	}
 	return os.WriteFile(filepath.Join(m.dataDir, confFileName), []byte(conf), 0644)
+}
+
+// SubBody 读取某个家宽分组的订阅原文（不联网）。
+// 探针要用它生成自己那份配置，所以暴露出去。
+func (m *Manager) SubBody(groupID string) ([]byte, error) {
+	return readSubFile(m.dataDir, groupID)
+}
+
+// FrontGroup 家宽订阅里 openvpn 节点链式转发所依赖的前置组名。
+// 取不到时返回空串（订阅结构变了，或这个分组还没拉过订阅）。
+func (m *Manager) FrontGroup(groupID string) string {
+	body, err := readSubFile(m.dataDir, groupID)
+	if err != nil {
+		return ""
+	}
+	return FrontGroupOf(body)
 }
 
 // UnloadGroup 删除某个家宽分组留下的文件。
@@ -926,11 +950,16 @@ func (m *Manager) ProxyDelays() map[string]int {
 		known[n] = true
 	}
 	m.mu.Unlock()
+	return ctrlProxyDelays(m.controlAddr(), known)
+}
+
+// ctrlProxyDelays 读内核记录的各代理最近一次延迟。不触发测速，只读缓存。
+// 内核管理器与测速探针共用，区别只在控制口地址。
+func ctrlProxyDelays(addr string, known map[string]bool) map[string]int {
 	if len(known) == 0 {
 		return nil
 	}
-
-	resp, err := stateClient.Get("http://" + m.controlAddr() + "/proxies")
+	resp, err := stateClient.Get("http://" + addr + "/proxies")
 	if err != nil {
 		return nil
 	}
@@ -960,8 +989,15 @@ func (m *Manager) ProxyDelays() map[string]int {
 // 必须由内核测而不是本程序 TCP 探测：家宽节点的出口是一条 OpenVPN over
 // Cloudflare 的隧道，探测它自己的 IP:端口完全反映不出隧道是否可用。
 func (m *Manager) ProxyDelay(name string, timeoutMs int) (int, error) {
+	return ctrlProxyDelay(m.controlAddr(), name, timeoutMs)
+}
+
+// ctrlProxyDelay 走 external-controller 测单个代理（节点或策略组）的延迟。
+//
+// name 传策略组名也成立 —— 测前置通道时用的就是这条路。
+func ctrlProxyDelay(addr, name string, timeoutMs int) (int, error) {
 	u := fmt.Sprintf("http://%s/proxies/%s/delay?timeout=%d&url=%s",
-		m.controlAddr(), url.PathEscape(name), timeoutMs, url.QueryEscape(delayTestURL))
+		addr, url.PathEscape(name), timeoutMs, url.QueryEscape(delayTestURL))
 	resp, err := delayClient.Get(u)
 	if err != nil {
 		return 0, err
@@ -989,14 +1025,29 @@ func (m *Manager) ProxyDelay(name string, timeoutMs int) (int, error) {
 
 // GroupDelay 让内核并发测试整个策略组里所有节点的延迟。
 //
-// 比本程序逐个调用高效得多：并发调度在核心里做，不受本程序的连接数限制。
-// 返回 map[节点名]延迟毫秒，测不通的节点值为 0。
+// ⚠️ 整组并发测速会把组里所有节点一次性全打出去。家宽节点共用同一条前置
+// 通道，节点一多就互相踩踏：大部分超时、少数挤过去的延迟巨大且随机，
+// 每次结果都不一样。所以**家宽分组不要用这个方法**，走 sweepDelay（限并发）。
+// 现在只留给「测前置通道本身」用。
 func (m *Manager) GroupDelay(group string, timeoutMs int) (map[string]int, error) {
+	m.mu.Lock()
+	known := make(map[string]bool, len(m.nodes))
+	for _, n := range m.nodes {
+		known[n] = true
+	}
+	m.mu.Unlock()
+	return ctrlGroupDelay(m.controlAddr(), group, timeoutMs, known)
+}
+
+// ctrlGroupDelay 走 external-controller 测一个策略组里所有节点的延迟。
+// known 用于过滤掉不属于本分组的条目（组里万一混了别的节点，不要污染界面）；
+// 传 nil 表示不过滤。
+func ctrlGroupDelay(addr, group string, timeoutMs int, known map[string]bool) (map[string]int, error) {
 	if group == "" {
 		return nil, fmt.Errorf("未识别到家宽节点选择组")
 	}
 	u := fmt.Sprintf("http://%s/group/%s/delay?timeout=%d&url=%s",
-		m.controlAddr(), url.PathEscape(group), timeoutMs, url.QueryEscape(delayTestURL))
+		addr, url.PathEscape(group), timeoutMs, url.QueryEscape(delayTestURL))
 	resp, err := groupDelayClient.Get(u)
 	if err != nil {
 		return nil, err
@@ -1011,17 +1062,9 @@ func (m *Manager) GroupDelay(group string, timeoutMs int) (map[string]int, error
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, err
 	}
-	// 只保留确实是家宽节点的条目（组里万一混了别的节点，不要污染界面）
-	m.mu.Lock()
-	known := make(map[string]bool, len(m.nodes))
-	for _, n := range m.nodes {
-		known[n] = true
-	}
-	m.mu.Unlock()
-
 	out := make(map[string]int, len(raw))
 	for name, d := range raw {
-		if known[name] {
+		if known == nil || known[name] {
 			out[name] = d
 		}
 	}
@@ -1066,7 +1109,13 @@ func (m *Manager) waitControl(timeout time.Duration) error {
 }
 
 func (m *Manager) version() (string, error) {
-	resp, err := apiClient.Get("http://" + m.controlAddr() + "/version")
+	return ctrlVersion(m.controlAddr())
+}
+
+// ctrlVersion 读内核版本，用来判断控制接口是否已经就绪。
+// 内核管理器与测速探针共用，区别只在控制口地址。
+func ctrlVersion(addr string) (string, error) {
+	resp, err := apiClient.Get("http://" + addr + "/version")
 	if err != nil {
 		return "", err
 	}
@@ -1130,14 +1179,23 @@ type subInfo struct {
 	nodes     []string
 	nodeGroup string
 	topGroup  string
+	// frontGroup 前置通道组名 —— openvpn 节点靠 dialer-proxy 指向它做链式转发。
+	// 全部家宽节点的出口都挤在这一个组上，所以它不通时所有家宽节点都不通。
+	frontGroup string
+}
+
+// FrontGroupOf 从家宽订阅原文里取出前置通道组名。取不到返回空串。
+func FrontGroupOf(subBody []byte) string {
+	return parseSubscription(string(subBody)).frontGroup
 }
 
 // parseSubscription 从 Clash 订阅原文里提取家宽节点名与策略组结构。
 //
-// 只做行级扫描，不解析完整 YAML —— 原因见包注释。解析目标有三：
+// 只做行级扫描，不解析完整 YAML —— 原因见包注释。解析目标有四：
 //  1. 所有 type: openvpn 的节点名（这些就是家宽节点）；
 //  2. 成员全是家宽节点的 select 组 —— 手动切换节点就切它；
-//  3. 成员里包含上面那个组的 select 组 —— 顶层主组，规则 MATCH 指向它。
+//  3. 成员里包含上面那个组的 select 组 —— 顶层主组，规则 MATCH 指向它；
+//  4. 家宽节点 dialer-proxy 指向的组 —— 前置通道，测速前要先确认它通。
 //
 // 组名不硬编码，因为订阅结构随时可能变；识别不出来时返回空串，
 // 调用方据此提示用户「重新拉取订阅」而不是静默地切错组。
@@ -1146,9 +1204,10 @@ func parseSubscription(src string) subInfo {
 		info    subInfo
 		section string
 
-		pNames []string // 节点名，按出现顺序
-		pTypes []string // 与 pNames 一一对应
-		curP   = -1
+		pNames  []string // 节点名，按出现顺序
+		pTypes  []string // 与 pNames 一一对应
+		pDialer []string // 与 pNames 一一对应：dialer-proxy 指向的组名
+		curP    = -1
 
 		gNames      []string
 		gTypes      []string
@@ -1170,12 +1229,20 @@ func parseSubscription(src string) subInfo {
 			if m := reItemName.FindStringSubmatch(raw); m != nil {
 				pNames = append(pNames, unquote(m[2]))
 				pTypes = append(pTypes, "")
+				pDialer = append(pDialer, "")
 				curP = len(pNames) - 1
 				continue
 			}
 			if curP >= 0 {
-				if m := reSubKey.FindStringSubmatch(raw); m != nil && m[1] == "type" {
-					pTypes[curP] = unquote(m[2])
+				if m := reSubKey.FindStringSubmatch(raw); m != nil {
+					switch m[1] {
+					case "type":
+						pTypes[curP] = unquote(m[2])
+					case "dialer-proxy":
+						// type 与 dialer-proxy 的先后顺序在 YAML 里不固定，
+						// 所以两个都先记下来，等扫完再配对（见函数尾部）。
+						pDialer[curP] = unquote(m[2])
+					}
 				}
 			}
 
@@ -1216,16 +1283,30 @@ func parseSubscription(src string) subInfo {
 		}
 	}
 
-	// 1) 家宽节点
+	// 1) 家宽节点；顺带统计它们 dialer-proxy 指向的组
 	isOVPN := map[string]bool{}
+	dialerHits := map[string]int{}
 	for i, n := range pNames {
 		if strings.EqualFold(pTypes[i], "openvpn") {
 			info.nodes = append(info.nodes, n)
 			isOVPN[n] = true
+			if i < len(pDialer) && pDialer[i] != "" {
+				dialerHits[pDialer[i]]++
+			}
 		}
 	}
 	if len(info.nodes) == 0 {
 		return info
+	}
+
+	// 1b) 前置通道：取家宽节点引用最多的那个 dialer-proxy 目标。
+	//     理论上所有家宽节点指向同一个组，取最多只是为了订阅里混了
+	//     个别直连节点时不至于取错。
+	bestHit := 0
+	for name, hits := range dialerHits {
+		if hits > bestHit {
+			info.frontGroup, bestHit = name, hits
+		}
 	}
 
 	// 2) 手动选择组：成员「全部是家宽节点」的 select 组。
@@ -1278,6 +1359,18 @@ func parseSubscription(src string) subInfo {
 
 // --- 配置改写 ---
 
+// confPorts 交给内核的运行配置里要写死的顶层键。
+//
+// 抽成结构体是因为现在有两处要生成配置，端口取法不同：
+//   - 服务流量的家宽内核用 cfg 里的端口（与 xray 一致，用户端配置不用改）；
+//   - 只用来测速的探针用一组备用端口（不能和正在服务流量的内核抢）。
+type confPorts struct {
+	socks, http, redir, ctrl int
+	// allowLan 是否监听 0.0.0.0。服务流量的内核要开（透明代理/局域网共享），
+	// 只用来测速的探针要关 —— 它的端口不该被局域网里任何设备误连上。
+	allowLan bool
+}
+
 // rewriteConfig 把订阅原文改写成可以直接交给 mihomo 运行的配置。
 //
 // 只动顶层那几个简单键（都在文件头部），proxies / proxy-groups / rules
@@ -1286,16 +1379,16 @@ func parseSubscription(src string) subInfo {
 //
 // 端口取值与 xray 保持完全一致，这样切换内核时用户端配置（透明代理规则、
 // 浏览器代理设置）都不用改。
-func rewriteConfig(src string, socksPort, httpPort, ctrlPort int) (string, error) {
+func rewriteConfig(src string, p confPorts) (string, error) {
 	type kv struct{ k, v string }
 	want := []kv{
-		{"port", strconv.Itoa(httpPort)},        // HTTP 代理入口
-		{"socks-port", strconv.Itoa(socksPort)}, // SOCKS 代理入口
-		{"mixed-port", "0"},                     // 关掉订阅默认的混合端口，避免多监听一个口
-		{"allow-lan", "true"},                   // 透明代理/局域网共享需要
-		{"redir-port", strconv.Itoa(RedirPort)}, // 透明代理入口，与 transparent.sh 一致
-		{"log-level", "warning"},                // 盒子上少写日志
-		{"external-controller", fmt.Sprintf("127.0.0.1:%d", ctrlPort)},
+		{"port", strconv.Itoa(p.http)},                // HTTP 代理入口
+		{"socks-port", strconv.Itoa(p.socks)},         // SOCKS 代理入口
+		{"mixed-port", "0"},                           // 关掉订阅默认的混合端口，避免多监听一个口
+		{"allow-lan", strconv.FormatBool(p.allowLan)}, // 透明代理/局域网共享需要
+		{"redir-port", strconv.Itoa(p.redir)},         // 透明代理入口，与 transparent.sh 一致
+		{"log-level", "warning"},                      // 盒子上少写日志
+		{"external-controller", fmt.Sprintf("127.0.0.1:%d", p.ctrl)},
 	}
 
 	lines := strings.Split(src, "\n")

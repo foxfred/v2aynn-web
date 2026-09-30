@@ -150,7 +150,9 @@ proxy-groups:
 }
 
 func TestRewriteConfig(t *testing.T) {
-	out, err := rewriteConfig(sampleSub, 10808, 10810, 19090)
+	out, err := rewriteConfig(sampleSub, confPorts{
+		socks: 10808, http: 10810, redir: 12345, ctrl: 19090, allowLan: true,
+	})
 	if err != nil {
 		t.Fatalf("rewriteConfig 失败: %v", err)
 	}
@@ -199,11 +201,11 @@ func TestRewriteConfig(t *testing.T) {
 // 改写必须幂等：对已改写过的配置再跑一次，结果应当逐字节相同。
 // 这条能挡住「重复保存设置导致配置文件不断膨胀」这类问题。
 func TestRewriteConfigIdempotent(t *testing.T) {
-	once, err := rewriteConfig(sampleSub, 10808, 10810, 19090)
+	once, err := rewriteConfig(sampleSub, confPorts{socks: 10808, http: 10810, redir: 12345, ctrl: 19090, allowLan: true})
 	if err != nil {
 		t.Fatalf("第一次改写失败: %v", err)
 	}
-	twice, err := rewriteConfig(once, 10808, 10810, 19090)
+	twice, err := rewriteConfig(once, confPorts{socks: 10808, http: 10810, redir: 12345, ctrl: 19090, allowLan: true})
 	if err != nil {
 		t.Fatalf("第二次改写失败: %v", err)
 	}
@@ -214,7 +216,7 @@ func TestRewriteConfigIdempotent(t *testing.T) {
 }
 
 func TestRewriteConfigNoProxies(t *testing.T) {
-	if _, err := rewriteConfig("mode: rule\n", 10808, 10810, 19090); err == nil {
+	if _, err := rewriteConfig("mode: rule\n", confPorts{socks: 10808, http: 10810, redir: 12345, ctrl: 19090, allowLan: true}); err == nil {
 		t.Error("缺少 proxies: 段时应当报错")
 	}
 }
@@ -338,7 +340,7 @@ func TestParseRealSubscription(t *testing.T) {
 	t.Logf("真实订阅: %d 个家宽节点, 手动组=%q, 顶层组=%q",
 		len(info.nodes), info.nodeGroup, info.topGroup)
 
-	out, err := rewriteConfig(string(b), 10808, 10810, 19090)
+	out, err := rewriteConfig(string(b), confPorts{socks: 10808, http: 10810, redir: 12345, ctrl: 19090, allowLan: true})
 	if err != nil {
 		t.Fatalf("真实订阅改写失败: %v", err)
 	}

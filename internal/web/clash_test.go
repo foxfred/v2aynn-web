@@ -2,11 +2,14 @@ package web
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -80,7 +83,69 @@ func newClashTestServerWith(t *testing.T, payload string) (*WebServer, *config.C
 
 	v2m := v2ray.NewManager(dir)
 	mhm := mihomo.NewManager(dir)
-	return NewServer(cfg, v2m, mhm), cfg, mhm, fake.URL
+	s := NewServer(cfg, v2m, mhm)
+	// 真实探针要在备用端口上拉起一个 mihomo 进程，单元测试里跑不起来，
+	// 统一换成替身。探针本身的行为由 mihomo 包的用例覆盖。
+	s.prober = newFakeProber()
+	return s, cfg, mhm, fake.URL
+}
+
+// fakeProber 测速探针的替身：按节点名查一张预设的延迟表，
+// 表里没有的名字视为测不通（与真实内核的行为一致）。
+type fakeProber struct {
+	mu       sync.Mutex
+	group    string
+	running  bool
+	startErr error
+	delays   map[string]int
+}
+
+func newFakeProber() *fakeProber {
+	return &fakeProber{delays: map[string]int{
+		// 前置通道默认是通的 —— 真实场景里前置不通时所有家宽节点都不通，
+		// 那条路径由 TestPingClashGroupFailsFastWhenFrontDown 单独覆盖。
+		"⚡ CF前置":     120,
+		"🏠 JP-家宽-01": 480,
+		"🏠 KR-家宽-01": 620,
+	}}
+}
+
+func (f *fakeProber) Ensure(groupID string, resident bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.startErr != nil {
+		return f.startErr
+	}
+	f.group, f.running = groupID, true
+	return nil
+}
+
+func (f *fakeProber) Stop() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.running, f.group = false, ""
+}
+
+func (f *fakeProber) Group() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.group
+}
+
+func (f *fakeProber) IsRunning() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.running
+}
+
+func (f *fakeProber) ProxyDelay(name string, timeoutMs int) (int, error) {
+	f.mu.Lock()
+	ms, ok := f.delays[name]
+	f.mu.Unlock()
+	if !ok || ms <= 0 {
+		return 0, fmt.Errorf("节点无响应")
+	}
+	return ms, nil
 }
 
 func newClashTestServer(t *testing.T) (*WebServer, *config.Config, *mihomo.Manager, string) {
@@ -340,15 +405,25 @@ func TestClashNodesOfInactiveGroupStillListed(t *testing.T) {
 	}
 }
 
-// 家宽节点的测速由 mihomo 内核代劳（本程序的 TCP 探测对 OpenVPN 隧道没意义）。
-// 内核没跑起来时，接口必须如实报错并给出 ms=-1，让界面显示「超时」而不是假装成功。
-func TestPingClashNodeWithoutKernel(t *testing.T) {
+// 这是本次修复的核心：用户连着 xray 节点时也必须能测家宽节点，
+// 而且**不能**因此把当前连接切走。
+//
+// 修复前：家宽内核与 xray 抢同一组端口，同一时刻只能跑一个，所以
+// 「测家宽」被绑成了「先切到家宽」—— 节点要是不通，用户的连接当场就断，
+// 而且再也测不了别的节点。现在测速走探针（备用端口），与当前连接无关。
+func TestPingClashNodeWorksWhileXrayIsActive(t *testing.T) {
 	s, cfg, mhm, url := newClashTestServer(t)
 	seedClashGroup(t, cfg, mhm, "g1", "家宽", url)
+	// 内核侧压根没跑：bin 指向不存在的文件，模拟「用户正在用 xray」
+	mhm.SetMihomoBin(filepath.Join(t.TempDir(), "no-such-mihomo"))
 
-	id := config.ClashNodeID("g1", "🏠 JP-家宽-01")
+	cfg.Lock()
+	cfg.Kernel = config.KernelXray
+	cfg.ActiveNode = "普通节点ID"
+	cfg.Unlock()
+
 	req := httptest.NewRequest("POST", "/api/ping/x", nil)
-	req.SetPathValue("id", id)
+	req.SetPathValue("id", config.ClashNodeID("g1", "🏠 JP-家宽-01"))
 	rec := httptest.NewRecorder()
 	s.apiPing(rec, req)
 
@@ -360,22 +435,27 @@ func TestPingClashNodeWithoutKernel(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("解析响应失败: %v", err)
 	}
-	if resp.MS != -1 {
-		t.Errorf("内核不可用时 ms 应为 -1, 得到 %d", resp.MS)
+	if resp.Error != "" {
+		t.Fatalf("连着 xray 时测家宽不该报错: %s", resp.Error)
 	}
-	// 关键：不能把 `dial tcp 127.0.0.1:19090: connect: connection refused`
-	// 这种底层错误直接甩给用户，他看不懂也不知道该做什么。
-	if resp.Error != clashKernelOffMsg {
-		t.Errorf("应当给出可操作的提示，实际是: %q", resp.Error)
+	if resp.MS != 480 {
+		t.Errorf("ms = %d, 期望探针返回的 480", resp.MS)
 	}
-	if resp.ID != id {
+	if resp.ID != config.ClashNodeID("g1", "🏠 JP-家宽-01") {
 		t.Errorf("返回的 id 必须原样带回（界面靠它定位行）: %q", resp.ID)
+	}
+	// 关键：当前连接必须原封不动
+	cfg.Lock()
+	kernel, active := cfg.Kernel, cfg.ActiveNode
+	cfg.Unlock()
+	if kernel != config.KernelXray || active != "普通节点ID" {
+		t.Errorf("测速不该动当前连接: kernel=%q activeNode=%q", kernel, active)
 	}
 }
 
-// 想测的分组不是内核当前加载的那份时，必须明确拒绝 ——
-// 硬测只会拿到「找不到这个节点」，用户完全无从理解。
-func TestPingClashNodeOfInactiveGroup(t *testing.T) {
+// 内核里装的是 A 分组，测 B 分组的节点也要能测 ——
+// 探针里换一份配置就行，正在服务流量的那份一点都不用动。
+func TestPingClashNodeOfInactiveGroupUsesProber(t *testing.T) {
 	s, cfg, mhm, url := newClashTestServer(t)
 	seedClashGroup(t, cfg, mhm, "g1", "家宽A", url)
 
@@ -390,7 +470,7 @@ func TestPingClashNodeOfInactiveGroup(t *testing.T) {
 	}
 
 	req := httptest.NewRequest("POST", "/api/ping/x", nil)
-	req.SetPathValue("id", config.ClashNodeID("g2", "🏠 JP-家宽-01"))
+	req.SetPathValue("id", config.ClashNodeID("g2", "🏠 KR-家宽-01"))
 	rec := httptest.NewRecorder()
 	s.apiPing(rec, req)
 
@@ -399,30 +479,169 @@ func TestPingClashNodeOfInactiveGroup(t *testing.T) {
 		Error string `json:"error"`
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
-	if resp.Error != clashGroupOffMsg {
-		t.Errorf("提示 = %q, 期望 %q", resp.Error, clashGroupOffMsg)
+	if resp.Error != "" || resp.MS != 620 {
+		t.Errorf("ms=%d error=%q, 期望 ms=620 无错误", resp.MS, resp.Error)
+	}
+	// 内核里那份配置不能被换掉：它可能正在服务用户的流量
+	if got := mhm.LoadedGroup(); got != "g1" {
+		t.Errorf("LoadedGroup = %q, 期望仍是 g1", got)
 	}
 }
 
-// 整组测速走的是另一条路径：内核不可用时不能 panic，也不能返回 200 空结果，
-// 必须让界面能区分「全都不通」和「内核没起来」。
-func TestPingClashGroupWithoutKernel(t *testing.T) {
+// 探针起不来时必须如实报错并给出 ms=-1，让界面显示「超时」而不是假装成功；
+// 而且错误信息要能看懂，不能是 `dial tcp ...: connection refused`。
+func TestPingClashNodeReportsProberFailure(t *testing.T) {
 	s, cfg, mhm, url := newClashTestServer(t)
 	seedClashGroup(t, cfg, mhm, "g1", "家宽", url)
+	const want = "找不到 mihomo 内核(/usr/local/bin/mihomo)，请先把内核文件部署到该路径"
+	s.prober.(*fakeProber).startErr = errors.New(want)
+
+	req := httptest.NewRequest("POST", "/api/ping/x", nil)
+	req.SetPathValue("id", config.ClashNodeID("g1", "🏠 JP-家宽-01"))
+	rec := httptest.NewRecorder()
+	s.apiPing(rec, req)
+
+	var resp struct {
+		MS    int    `json:"ms"`
+		Error string `json:"error"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.MS != -1 {
+		t.Errorf("探针不可用时 ms 应为 -1, 得到 %d", resp.MS)
+	}
+	if resp.Error != want {
+		t.Errorf("应当把探针起不来的原因原样告诉用户, 实际: %q", resp.Error)
+	}
+}
+
+// 整组测速也走探针，内核没跑照样能测；结果要落到分组的探针表里 ——
+// 落盘之后，重启、或这个分组没被内核加载时，界面上仍能看到上次的数字。
+func TestPingClashGroupUsesProberAndPersists(t *testing.T) {
+	s, cfg, mhm, url := newClashTestServer(t)
+	seedClashGroup(t, cfg, mhm, "g1", "家宽", url)
+	mhm.SetMihomoBin(filepath.Join(t.TempDir(), "no-such-mihomo"))
 
 	req := httptest.NewRequest("POST", "/api/ping/group/g1", nil)
 	req.SetPathValue("id", "g1")
 	rec := httptest.NewRecorder()
 	s.apiPingGroup(rec, req)
 
+	var res []map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatalf("解析响应失败: %v (body=%s)", err, rec.Body.String())
+	}
+	if len(res) != 2 {
+		t.Fatalf("应当返回 2 个节点的结果, 得到 %d", len(res))
+	}
+
+	cfg.Lock()
+	g := cfg.FindClashGroup("g1")
+	p, ok := g.Probe("🏠 JP-家宽-01")
+	cfg.Unlock()
+	if !ok || p.MS != 480 {
+		t.Errorf("测速结果没落盘: %+v ok=%v", p, ok)
+	}
+}
+
+// 前置通道不通时，所有家宽节点都不可能通。必须直接说清楚，
+// 别让用户对着 70 多个超时发呆 —— 那正是「数字乱」的一部分。
+func TestPingClashGroupFailsFastWhenFrontDown(t *testing.T) {
+	s, cfg, mhm, url := newClashTestServer(t)
+	seedClashGroup(t, cfg, mhm, "g1", "家宽", url)
+	f := s.prober.(*fakeProber)
+	f.mu.Lock()
+	delete(f.delays, "⚡ CF前置")
+	f.mu.Unlock()
+
+	req := httptest.NewRequest("POST", "/api/ping/group/g1", nil)
+	req.SetPathValue("id", "g1")
+	rec := httptest.NewRecorder()
+	s.apiPingGroup(rec, req)
+
+	var resp map[string]string
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if !strings.Contains(resp["error"], "前置通道") {
+		t.Errorf("应当明确指出前置通道不通, 实际: %q", resp["error"])
+	}
+	// 前置不通时不该白测一轮：节点表里不应留下任何结果
+	cfg.Lock()
+	g := cfg.FindClashGroup("g1")
+	_, has := g.Probe("🏠 JP-家宽-01")
+	cfg.Unlock()
+	if has {
+		t.Error("前置不通时不该产出节点结果")
+	}
+}
+
+// 家宽节点的延迟与速度存在分组的探针表里，列表必须把它读出来 ——
+// 内核没加载这个分组时也要能显示（重启后同理）。
+func TestClashNodesShowStoredProbes(t *testing.T) {
+	s, cfg, mhm, url := newClashTestServer(t)
+	seedClashGroup(t, cfg, mhm, "g1", "家宽", url)
+
+	cfg.Lock()
+	g := cfg.FindClashGroup("g1")
+	g.SetProbeMS("🏠 JP-家宽-01", 480)
+	g.SetProbeSpeed("🏠 JP-家宽-01", 12.5)
+	g.SetProbeMS("🏠 KR-家宽-01", -1)
+	cfg.Unlock()
+
+	req := httptest.NewRequest("GET", "/api/group/g1/nodes", nil)
+	req.SetPathValue("id", "g1")
+	rec := httptest.NewRecorder()
+	s.apiGroupNodes(rec, req)
+
 	var resp struct {
-		Error string `json:"error"`
+		Nodes []config.Node `json:"nodes"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("解析响应失败: %v", err)
 	}
-	if resp.Error != clashKernelOffMsg {
-		t.Errorf("整组测速也应给出可操作的提示，实际是: %q", resp.Error)
+	byName := map[string]config.Node{}
+	for _, n := range resp.Nodes {
+		byName[n.Name] = n
+	}
+	if got := byName["🏠 JP-家宽-01"]; got.Ping != 480 || got.Speed != 12.5 {
+		t.Errorf("JP 节点 ping/speed = %d/%v, 期望 480/12.5", got.Ping, got.Speed)
+	}
+	if got := byName["🏠 KR-家宽-01"]; got.Ping != -1 {
+		t.Errorf("KR 节点应显示为超时(-1), 得到 %d", got.Ping)
+	}
+}
+
+// 「真实测速」在家宽模式下必须把数字记到**家宽节点**上。
+//
+// 修复前它写的是 cfg.ActiveNode —— 而那个字段在家宽模式下还停在上一个普通
+// 节点上，于是家宽测出来的速度被记到了普通节点头上，两个节点的数字同时失真。
+func TestSpeedInClashModeSavedToClashNode(t *testing.T) {
+	s, cfg, mhm, url := newClashTestServer(t)
+	seedClashGroup(t, cfg, mhm, "g1", "家宽", url)
+
+	cfg.Lock()
+	cfg.Groups[0].Nodes = []config.Node{{ID: "plain1", Name: "普通节点"}}
+	cfg.ActiveNode = "plain1" // 上一个普通节点，家宽模式下依然停在这里
+	cfg.Kernel = config.KernelMihomo
+	cfg.ActiveGrp = "g1"
+	cfg.ClashNode = "🏠 JP-家宽-01"
+	cfg.Unlock()
+
+	s.saveSpeed(12.5)
+
+	cfg.Lock()
+	var plainSpeed float64
+	for _, n := range cfg.Groups[0].Nodes {
+		if n.ID == "plain1" {
+			plainSpeed = n.Speed
+		}
+	}
+	p, ok := cfg.FindClashGroup("g1").Probe("🏠 JP-家宽-01")
+	cfg.Unlock()
+
+	if !ok || p.MBPS != 12.5 {
+		t.Errorf("家宽节点没记上速度: %+v ok=%v", p, ok)
+	}
+	if plainSpeed != 0 {
+		t.Errorf("普通节点被写入了家宽测出来的速度 %v —— 这正是要修的那个 bug", plainSpeed)
 	}
 }
 
@@ -640,13 +859,13 @@ func TestClashRoutes(t *testing.T) {
 		t.Errorf("家宽节点列表异常: %s", rec.Body.String())
 	}
 
-	// 整组测速：内核没跑，要给出可操作的提示而不是底层连接错误
+	// 整组测速：走探针，内核没跑也能测（这正是本次修复的核心行为）
 	rec = do("POST", "/api/ping/group/g1", "")
-	var pg map[string]string
+	var pg []map[string]interface{}
 	if err := json.Unmarshal(rec.Body.Bytes(), &pg); err != nil {
-		t.Fatalf("整组测速解析失败: %v", err)
+		t.Fatalf("整组测速解析失败: %v (body=%s)", err, rec.Body.String())
 	}
-	if pg["error"] != clashKernelOffMsg {
-		t.Errorf("整组测速提示 = %q", pg["error"])
+	if len(pg) != 2 {
+		t.Errorf("整组测速应返回 2 个节点的结果, 得到 %d: %s", len(pg), rec.Body.String())
 	}
 }

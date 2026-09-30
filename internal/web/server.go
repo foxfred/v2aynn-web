@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -46,20 +47,36 @@ type kernel interface {
 	Status() map[string]interface{}
 }
 
+// clashProber 家宽测速探针（跑在备用端口上的独立 mihomo 实例）。
+//
+// 抽成接口只为一件事：真实实现要在备用端口上拉起一个 mihomo 进程，
+// 单元测试里跑不起来，得能塞替身进去。
+type clashProber interface {
+	mihomo.DelayTester
+	Ensure(groupID string, resident bool) error
+	Stop()
+	Group() string
+	IsRunning() bool
+}
+
 type WebServer struct {
 	cfg *config.Config
 	v2m *v2ray.Manager
 	// mhm 家宽（mihomo）内核管理器。为 nil 表示本次运行没启用家宽通道
 	// （单元测试场景），所有家宽相关入口都要先判空。
 	mhm *mihomo.Manager
+	// prober 家宽测速探针。家宽通道未启用时为 nil。
+	prober clashProber
 }
 
 func NewServer(cfg *config.Config, v2m *v2ray.Manager, mhm *mihomo.Manager) *WebServer {
 	v2m.SetConfig(cfg)
+	w := &WebServer{cfg: cfg, v2m: v2m, mhm: mhm}
 	if mhm != nil {
 		mhm.SetConfig(cfg)
+		w.prober = mihomo.NewProber(mhm.DataDir())
 	}
-	return &WebServer{cfg: cfg, v2m: v2m, mhm: mhm}
+	return w
 }
 
 // clashReady 家宽通道是否可用
@@ -80,13 +97,91 @@ func (w *WebServer) activeKernel() kernel {
 	return w.v2m
 }
 
-// stopAllKernels 停掉两个内核。切换内核、改端口、恢复配置时使用 ——
-// 两个内核抢同一组端口，不先停干净就会启动失败。
+// stopAllKernels 停掉两个内核与测速探针。切换内核、改端口、恢复配置时使用 ——
+// 两个内核抢同一组端口，不先停干净就会启动失败；探针虽然用备用端口，
+// 但留着它会白占一份内存，用户点了「停止代理」就该一并收掉。
 func (w *WebServer) stopAllKernels() {
 	w.v2m.Stop()
 	if w.clashReady() {
 		w.mhm.Stop()
 	}
+	if w.prober != nil {
+		w.prober.Stop()
+	}
+}
+
+// StopProbe 停掉测速探针。进程退出时必须调用，否则会留下一个孤儿 mihomo。
+func (w *WebServer) StopProbe() {
+	if w.prober != nil {
+		w.prober.Stop()
+	}
+}
+
+// proberResident 测速探针是否常驻。
+//
+// 常驻省下每次测速十几秒的启动等待，代价是一份常驻内存。两种情况不常驻：
+//   - 内存紧张（盒子上只有 1 GB 且没有 swap）：探针用完就收，把内存还回去；
+//   - 家宽内核正在服务流量：再养一个 mihomo 纯属浪费，测完就收。
+func (w *WebServer) proberResident() bool {
+	if w.kernelName() == config.KernelMihomo {
+		return false
+	}
+	return mihomo.ProberCanReside()
+}
+
+// releaseProbe 非常驻的探针用完就收，把内存还回去。
+func (w *WebServer) releaseProbe() {
+	if w.prober != nil && w.prober.IsRunning() && !w.proberResident() {
+		w.prober.Stop()
+	}
+}
+
+// WarmProbe 后台把测速探针预热起来。
+//
+// 用户接下来最可能做的事就是测家宽，提前把探针拉起来能省掉那十几秒等待。
+// 必须在后台跑：起一个内核要十几秒，不能拖住调用方（启动流程或切换请求）。
+func (w *WebServer) WarmProbe() {
+	if w.prober == nil || !w.clashReady() || !w.proberResident() {
+		return
+	}
+	w.cfg.Lock()
+	g := w.cfg.ActiveClashGroup()
+	groupID := ""
+	if g != nil {
+		groupID = g.ID
+	}
+	w.cfg.Unlock()
+	if groupID == "" {
+		return
+	}
+	go func() {
+		if err := w.prober.Ensure(groupID, true); err != nil {
+			log.Printf("预热家宽测速探针失败: %v", err)
+		}
+	}()
+}
+
+// clashTester 挑一个能测家宽节点的后端。
+//
+// 优先用正在服务流量的那个家宽内核 —— 内核里跑的正是这个分组时，它既是
+// 最真实的被测对象，又不额外花一份内存。
+//
+// 其余情况一律用探针：探针跑在备用端口上，不动用户当前的连接，
+// 「连着普通节点时也能测家宽」这件事才成立。
+func (w *WebServer) clashTester(groupID string) (mihomo.DelayTester, error) {
+	if !w.clashReady() {
+		return nil, errors.New("家宽通道未启用")
+	}
+	if w.mhm.IsRunning() && w.mhm.LoadedGroup() == groupID {
+		return w.mhm, nil
+	}
+	if w.prober == nil {
+		return nil, errors.New("测速探针不可用")
+	}
+	if err := w.prober.Ensure(groupID, w.proberResident()); err != nil {
+		return nil, err
+	}
+	return w.prober, nil
 }
 
 func (w *WebServer) Run(addr string) error {
@@ -281,23 +376,34 @@ func (w *WebServer) writeClashNodes(rw http.ResponseWriter, groupID string) {
 	clashNode := w.cfg.ClashNode
 	activeGrp := w.cfg.ActiveGrp
 	kernel := w.cfg.CurrentKernel()
+	// 上次测速存下来的结果。家宽节点没有 Node 结构，延迟与速度都存在分组的
+	// Probes 表里 —— 存下来才能在重启之后、以及没被内核加载的分组上显示出来。
+	stored := map[string]config.ProbeInfo{}
+	if g := w.cfg.FindClashGroup(groupID); g != nil {
+		for k, v := range g.Probes {
+			stored[k] = v
+		}
+	}
 	w.cfg.Unlock()
 
 	names := w.mhm.GroupNodes(groupID)
 
-	// 历史延迟只有当前生效的那个分组才有 —— 内核只加载了它。
-	// 别的分组一律留空，免得把 A 分组的延迟显示到 B 分组的节点上。
+	// 内核的实时记录比存下来的更可信，但它只有「当前生效」那个分组才有 ——
+	// 内核一次只加载一份配置。别的分组一律用存下来的那份。
 	// 这个调用只读内核缓存、不触发测速，所以每次加载列表都可以放心调用。
-	var delays map[string]int
+	var live map[string]int
 	if w.mhm.LoadedGroup() == groupID {
-		delays = w.mhm.ProxyDelays()
+		live = w.mhm.ProxyDelays()
 	}
 
 	nodes := make([]config.Node, 0, len(names))
 	for _, n := range names {
-		// 0 = 内核从没测过（界面留空）；-1 = 测过但不通（界面显示超时）
-		ping := 0
-		if d, ok := delays[n]; ok {
+		// 0 = 从没测过（界面留空）；-1 = 测过但不通（界面显示超时）
+		ping, speed := 0, 0.0
+		if p, ok := stored[n]; ok {
+			ping, speed = p.MS, p.MBPS
+		}
+		if d, ok := live[n]; ok {
 			if d > 0 {
 				ping = d
 			} else {
@@ -309,6 +415,7 @@ func (w *WebServer) writeClashNodes(rw http.ResponseWriter, groupID string) {
 			Name:     n,
 			Protocol: "openvpn",
 			Ping:     ping,
+			Speed:    speed,
 		})
 	}
 	// 只有内核确实在家宽模式、且选中的节点属于这个分组时才标「当前使用中」，
@@ -327,84 +434,101 @@ func (w *WebServer) writeClashNodes(rw http.ResponseWriter, groupID string) {
 // 比普通节点宽松得多：每个节点都要现场建立一条 OpenVPN over Cloudflare 隧道。
 const clashDelayTimeout = 8000
 
-// clashKernelOffMsg 家宽内核没跑时给出的提示。
-//
-// 为什么不能直接把底层错误抛给用户：内核没启动时 external-controller 端口是空的，
-// 硬测只会拿到 `dial tcp 127.0.0.1:19090: connect: connection refused`。
-// 这话对用户毫无意义，他只会觉得「又坏了」。直接告诉他下一步该点什么。
-const clashKernelOffMsg = "家宽内核还没启动。请先点一个家宽节点把它启用（首次约十几秒），再回来测速。"
+// clashFrontTimeout 测前置通道的超时（毫秒）。
+// 前置通道只有一跳、比节点本身快，给同样的上限足够。
+const clashFrontTimeout = 8000
 
-// clashGroupOffMsg 想测的分组不是当前生效的那份配置
-const clashGroupOffMsg = "这个家宽分组还没启用。请先点它的任意一个节点启用，再回来测速。"
-
-// pingClashNode 让内核测单个家宽节点的延迟。
+// pingClashNode 测单个家宽节点的延迟。
 //
 // 家宽节点的出口是一条 OpenVPN 隧道，本程序那套 TCP/TLS 握手探测对它没有意义
 // —— 探到的只是 CF 前置节点，和隧道能不能用是两回事。所以必须交给内核来测。
+//
+// 注意这里**不再要求「家宽内核正在跑」**：测速走探针实例，跑在备用端口上，
+// 所以用户连着普通节点时也能测家宽，且不会断掉当前连接。
 func (w *WebServer) pingClashNode(rw http.ResponseWriter, id string) {
-	if !w.clashReady() {
-		w.writeJSON(rw, map[string]interface{}{"id": id, "ms": -1, "error": "家宽通道未启用"})
-		return
-	}
 	groupID, name, ok := config.ParseClashNodeID(id)
 	if !ok {
 		w.writeJSON(rw, map[string]interface{}{"id": id, "ms": -1, "error": "家宽节点 ID 格式不对"})
 		return
 	}
-	// 先判分组、再判内核：用户当前看的就是这个分组，直接告诉他「点这个分组的
-	// 节点来启用」比笼统说「内核没启动」更贴合他眼前的状态。
-	// 内核里跑的必须是这个分组的配置，否则测的是别人的节点。
-	if w.mhm.LoadedGroup() != groupID {
-		w.writeJSON(rw, map[string]interface{}{"id": id, "ms": -1, "error": clashGroupOffMsg})
-		return
-	}
-	if !w.mhm.IsRunning() {
-		w.writeJSON(rw, map[string]interface{}{"id": id, "ms": -1, "error": clashKernelOffMsg})
-		return
-	}
-	ms, err := w.mhm.ProxyDelay(name, clashDelayTimeout)
+	tester, err := w.clashTester(groupID)
 	if err != nil {
 		w.writeJSON(rw, map[string]interface{}{"id": id, "ms": -1, "error": err.Error()})
 		return
 	}
+	ms := mihomo.MeasureDelay(tester, name, clashDelayTimeout)
+	w.saveProbeMS(groupID, name, ms)
+	w.releaseProbe()
 	w.writeJSON(rw, map[string]interface{}{"id": id, "ms": ms})
 }
 
-// pingClashGroup 让内核并发测整个家宽分组的延迟。
+// pingClashGroup 测整个家宽分组的延迟。
 //
-// 并发调度在内核里做，比本程序逐个调用高效得多。但 71 个节点每个都要现场建隧道，
-// 整体耗时可能一两分钟，所以前端要给出「较慢」的等待提示。
+// 分组里可能有 70 多个节点、每个都要现场建隧道，整体耗时可能一两分钟，
+// 所以前端要给出「较慢」的等待提示。
 func (w *WebServer) pingClashGroup(rw http.ResponseWriter, groupID string) {
-	if !w.clashReady() {
-		// 返回 error 而不是空数组：空数组会被界面当成「全都不通」，
-		// 掩盖掉「家宽根本没启用」这个真实原因。
-		w.writeJSON(rw, map[string]string{"error": "家宽通道未启用"})
-		return
-	}
-	if w.mhm.LoadedGroup() != groupID {
-		w.writeJSON(rw, map[string]string{"error": clashGroupOffMsg})
-		return
-	}
-	if !w.mhm.IsRunning() {
-		w.writeJSON(rw, map[string]string{"error": clashKernelOffMsg})
-		return
-	}
-	delays, err := w.mhm.GroupDelay(w.mhm.NodeGroup(), clashDelayTimeout)
+	delays, err := w.probeClashGroup(groupID)
 	if err != nil {
+		// 返回 error 而不是空数组：空数组会被界面当成「全都不通」，
+		// 掩盖掉「前置通道不通」这类真实原因。
 		w.writeJSON(rw, map[string]string{"error": err.Error()})
 		return
 	}
+	w.saveProbeMSAll(groupID, delays)
 	results := make([]map[string]interface{}, 0, len(delays))
-	for name, d := range delays {
-		ms := d
-		if ms <= 0 {
-			ms = -1 // 内核把测不通记为 0，界面统一用 -1 表示超时
-		}
+	for name, ms := range delays {
 		results = append(results, map[string]interface{}{
 			"id": config.ClashNodeID(groupID, name), "ms": ms,
 		})
 	}
+	w.releaseProbe()
 	w.writeJSON(rw, results)
+}
+
+// probeClashGroup 测一个家宽分组里所有节点的延迟，返回 节点名→毫秒（-1 表示不通）。
+//
+// 顺序是刻意的：先确认前置通道通不通，再逐个测节点。
+// 所有家宽节点的出口都挤在那一条通道上，前置不通时 70 多个节点全都会超时，
+// 白等两分钟还看不出所以然 —— 直接告诉用户「前置不通」有用得多。
+func (w *WebServer) probeClashGroup(groupID string) (map[string]int, error) {
+	names := w.mhm.GroupNodes(groupID)
+	if len(names) == 0 {
+		return nil, fmt.Errorf("这个分组还没有节点，请先点「更新」拉取订阅")
+	}
+	tester, err := w.clashTester(groupID)
+	if err != nil {
+		return nil, err
+	}
+	if front := w.mhm.FrontGroup(groupID); front != "" {
+		if _, err := tester.ProxyDelay(front, clashFrontTimeout); err != nil {
+			return nil, fmt.Errorf("前置通道[%s]测不通。家宽节点全部要经过它，先把它修好再测", front)
+		}
+	}
+	return mihomo.SweepDelay(tester, names, clashDelayTimeout, mihomo.ClashSweepConcurrency), nil
+}
+
+// saveProbeMS 记下一个家宽节点的延迟
+func (w *WebServer) saveProbeMS(groupID, name string, ms int) {
+	w.cfg.Lock()
+	defer w.cfg.Unlock()
+	if g := w.cfg.FindClashGroup(groupID); g != nil {
+		g.SetProbeMS(name, ms)
+		_ = w.cfg.Save()
+	}
+}
+
+// saveProbeMSAll 记下一批家宽节点的延迟。一次落盘 —— 70 多个节点逐个存太浪费。
+func (w *WebServer) saveProbeMSAll(groupID string, res map[string]int) {
+	w.cfg.Lock()
+	defer w.cfg.Unlock()
+	g := w.cfg.FindClashGroup(groupID)
+	if g == nil {
+		return
+	}
+	for name, ms := range res {
+		g.SetProbeMS(name, ms)
+	}
+	_ = w.cfg.Save()
 }
 
 // apiAddGroup 添加订阅分组
@@ -507,9 +631,14 @@ func (w *WebServer) apiDelGroup(rw http.ResponseWriter, r *http.Request) {
 	if isClash && w.clashReady() {
 		// 清掉订阅原文与运行配置；若删的正是当前生效那份，内核会被一起停掉
 		w.mhm.UnloadGroup(id)
+		// 探针里装的可能正是这个分组，而它的订阅原文已经删了，留着没意义
+		if w.prober != nil && w.prober.Group() == id {
+			w.prober.Stop()
+		}
 		if fallbackToXray && hasNormalNode {
 			time.Sleep(300 * time.Millisecond)
 			_ = w.v2m.Start()
+			w.WarmProbe()
 		}
 	}
 	w.writeJSON(rw, map[string]string{"ok": "true"})
@@ -766,6 +895,9 @@ func (w *WebServer) apiSwitch(rw http.ResponseWriter, r *http.Request) {
 		w.writeJSON(rw, map[string]string{"error": err.Error()})
 		return
 	}
+	// 接下来用户最可能做的事就是测家宽，趁现在把探针预热起来。
+	// 后台跑，不拖住这次切换请求。
+	w.WarmProbe()
 	w.writeJSON(rw, map[string]string{"ok": "true"})
 }
 
@@ -792,6 +924,11 @@ func (w *WebServer) switchClashNode(rw http.ResponseWriter, groupID, name string
 
 	// 两个内核抢同一组端口，先把 xray 停干净
 	w.v2m.Stop()
+	// 家宽内核马上要起来服务流量了，测速探针就得让位 ——
+	// 再养一个 mihomo 纯属白占内存，而且它那份配置也不是当前在用的。
+	if w.prober != nil {
+		w.prober.Stop()
+	}
 
 	if w.mhm.LoadedGroup() == groupID {
 		// 这个分组的配置已经就位。内核在跑就只拨一下策略组，不重启 ——
@@ -958,16 +1095,32 @@ func (w *WebServer) apiSpeed(rw http.ResponseWriter, r *http.Request) {
 	}
 	mbps := float64(n) * 8.0 / 1e6 / elapsed.Seconds()
 
-	w.cfg.Lock()
-	if n, _ := w.cfg.FindNode(w.cfg.ActiveNode); n != nil {
-		n.Speed = mbps
-		_ = w.cfg.Save()
-	}
-	w.cfg.Unlock()
+	w.saveSpeed(mbps)
 
 	w.writeJSON(rw, map[string]interface{}{
 		"ok": true, "mbps": mbps, "bytes": n, "ms": elapsed.Milliseconds(),
 	})
+}
+
+// saveSpeed 把真实测速的结果记到「当前真正在用的那个节点」上。
+//
+// 家宽模式下绝不能写 cfg.ActiveNode —— 那个字段在家宽模式下还停在上一个普通
+// 节点上（切家宽节点时不会改它），写进去等于把家宽测出来的速度记到普通节点
+// 头上，两个节点的数字同时变得不可信。这正是用户报的「测速不准」。
+func (w *WebServer) saveSpeed(mbps float64) {
+	w.cfg.Lock()
+	defer w.cfg.Unlock()
+	if w.cfg.CurrentKernel() == config.KernelMihomo {
+		if g := w.cfg.FindClashGroup(w.cfg.ActiveGrp); g != nil {
+			g.SetProbeSpeed(w.cfg.ClashNode, mbps)
+			_ = w.cfg.Save()
+		}
+		return
+	}
+	if n, _ := w.cfg.FindNode(w.cfg.ActiveNode); n != nil {
+		n.Speed = mbps
+		_ = w.cfg.Save()
+	}
 }
 
 func (w *WebServer) apiStart(rw http.ResponseWriter, r *http.Request) {
@@ -975,6 +1128,7 @@ func (w *WebServer) apiStart(rw http.ResponseWriter, r *http.Request) {
 		w.writeJSON(rw, map[string]string{"error": err.Error()})
 		return
 	}
+	w.WarmProbe()
 	w.writeJSON(rw, map[string]string{"ok": "true"})
 }
 
@@ -1040,6 +1194,8 @@ func (w *WebServer) apiSettings(rw http.ResponseWriter, r *http.Request) {
 		time.Sleep(300 * time.Millisecond)
 		_ = k.Start()
 	}
+	// stopAllKernels 把测速探针也收了，这里补回来
+	w.WarmProbe()
 	w.writeJSON(rw, map[string]interface{}{"ok": "true"})
 }
 
