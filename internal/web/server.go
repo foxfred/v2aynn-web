@@ -363,10 +363,16 @@ func (w *WebServer) apiGroupNodes(rw http.ResponseWriter, r *http.Request) {
 //
 // 未生效的分组也要能列出节点 —— 列表里没有节点，用户就没法点任何一个来
 // 启用它，这个分组就永远启用不了。节点名由内核管理器现场解析订阅原文得到。
+//
+// 排序也在这里做：前端是纯服务端排序（下拉框只发 /api/sort 再重拉列表），
+// 所以家宽分组必须自己按 SortOrder 排一遍，否则「延迟↑/↓」点了没有任何反应。
 func (w *WebServer) writeClashNodes(rw http.ResponseWriter, groupID string) {
 	if !w.clashReady() {
+		w.cfg.Lock()
+		sortOrder := w.cfg.SortOrder
+		w.cfg.Unlock()
 		w.writeJSON(rw, map[string]interface{}{
-			"nodes": []config.Node{}, "active": "", "sort": "",
+			"nodes": []config.Node{}, "active": "", "sort": sortOrder,
 			"groupId": groupID, "clash": true,
 		})
 		return
@@ -376,6 +382,7 @@ func (w *WebServer) writeClashNodes(rw http.ResponseWriter, groupID string) {
 	clashNode := w.cfg.ClashNode
 	activeGrp := w.cfg.ActiveGrp
 	kernel := w.cfg.CurrentKernel()
+	sortOrder := w.cfg.SortOrder
 	// 上次测速存下来的结果。家宽节点没有 Node 结构，延迟与速度都存在分组的
 	// Probes 表里 —— 存下来才能在重启之后、以及没被内核加载的分组上显示出来。
 	stored := map[string]config.ProbeInfo{}
@@ -424,8 +431,18 @@ func (w *WebServer) writeClashNodes(rw http.ResponseWriter, groupID string) {
 	if kernel == config.KernelMihomo && clashNode != "" && activeGrp == groupID {
 		active = config.ClashNodeID(groupID, clashNode)
 	}
+
+	// 与普通节点走同一个比较器：Ping > 0 才算「测到了」，0（没测过）与
+	// -1（测过但不通）一律沉底。家宽节点的 ping 语义与此完全一致。
+	switch sortOrder {
+	case "ping_asc":
+		sortNodes(nodes, true)
+	case "ping_desc":
+		sortNodes(nodes, false)
+	}
+
 	w.writeJSON(rw, map[string]interface{}{
-		"nodes": nodes, "active": active, "sort": "",
+		"nodes": nodes, "active": active, "sort": sortOrder,
 		"groupId": groupID, "clash": true,
 	})
 }

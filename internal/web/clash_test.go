@@ -609,6 +609,87 @@ func TestClashNodesShowStoredProbes(t *testing.T) {
 	}
 }
 
+// 家宽分组的「延迟↑ / 延迟↓」排序必须生效。
+//
+// 前端是**纯服务端排序**（下拉框只发一次 /api/sort，然后重拉列表），而
+// apiGroupNodes 对家宽分组会直接短路到 writeClashNodes —— 修复前那里压根没读
+// SortOrder，还把响应里的 sort 写死成空串，于是家宽分组点排序没有任何反应。
+func TestClashNodesRespectSortOrder(t *testing.T) {
+	s, cfg, mhm, url := newClashTestServer(t)
+	seedClashGroup(t, cfg, mhm, "g1", "家宽", url)
+
+	// 故意让「延迟顺序」与「订阅顺序」相反，排序生效与否一眼可辨。
+	cfg.Lock()
+	g := cfg.FindClashGroup("g1")
+	g.SetProbeMS("🏠 JP-家宽-01", 620)
+	g.SetProbeMS("🏠 KR-家宽-01", 480)
+	cfg.Unlock()
+
+	fetch := func(t *testing.T) (names []string, sortField string) {
+		t.Helper()
+		req := httptest.NewRequest("GET", "/api/group/g1/nodes", nil)
+		req.SetPathValue("id", "g1")
+		rec := httptest.NewRecorder()
+		s.apiGroupNodes(rec, req)
+		var resp struct {
+			Nodes []config.Node `json:"nodes"`
+			Sort  string        `json:"sort"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("解析响应失败: %v", err)
+		}
+		for _, n := range resp.Nodes {
+			names = append(names, n.Name)
+		}
+		return names, resp.Sort
+	}
+	setOrder := func(o string) {
+		cfg.Lock()
+		cfg.SortOrder = o
+		cfg.Unlock()
+	}
+
+	// 默认（不排序）：原样保持订阅顺序，sort 如实回显空串
+	def, sortField := fetch(t)
+	if sortField != "" {
+		t.Errorf("默认排序时响应里的 sort 应为空串, 得到 %q", sortField)
+	}
+	if len(def) != 2 {
+		t.Fatalf("家宽节点数 = %d, 期望 2", len(def))
+	}
+	if def[0] != "🏠 JP-家宽-01" || def[1] != "🏠 KR-家宽-01" {
+		t.Fatalf("不排序时应原样返回订阅顺序, 得到 %v", def)
+	}
+
+	// 延迟↑：480ms 的 KR 必须排到 620ms 的 JP 前面（与订阅顺序相反）
+	setOrder("ping_asc")
+	asc, sortField := fetch(t)
+	if sortField != "ping_asc" {
+		t.Errorf("响应里的 sort = %q, 期望 ping_asc", sortField)
+	}
+	if len(asc) != 2 || asc[0] != "🏠 KR-家宽-01" {
+		t.Errorf("延迟↑ 没生效, 得到 %v（期望 KR 在前）", asc)
+	}
+
+	// 延迟↓：反过来
+	setOrder("ping_desc")
+	desc, _ := fetch(t)
+	if len(desc) != 2 || desc[0] != "🏠 JP-家宽-01" {
+		t.Errorf("延迟↓ 没生效, 得到 %v（期望 JP 在前）", desc)
+	}
+
+	// 测过但不通(-1) 必须沉底；从没测过(0) 同理，由同一个比较器保证
+	cfg.Lock()
+	g = cfg.FindClashGroup("g1")
+	g.SetProbeMS("🏠 KR-家宽-01", -1)
+	cfg.Unlock()
+	setOrder("ping_asc")
+	asc, _ = fetch(t)
+	if len(asc) != 2 || asc[0] != "🏠 JP-家宽-01" || asc[1] != "🏠 KR-家宽-01" {
+		t.Errorf("超时节点应沉底, 得到 %v", asc)
+	}
+}
+
 // 「真实测速」在家宽模式下必须把数字记到**家宽节点**上。
 //
 // 修复前它写的是 cfg.ActiveNode —— 而那个字段在家宽模式下还停在上一个普通
