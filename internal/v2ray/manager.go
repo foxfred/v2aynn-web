@@ -2,6 +2,7 @@ package v2ray
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -12,6 +13,12 @@ import (
 
 	"v2aynn-web/internal/config"
 )
+
+// ErrNoUsableNode 表示当前配置里根本挑不出可用节点。
+//
+// 这是**确定性**失败：重试多少次结果都一样。开机自动启动的重试循环靠它
+// 提前收手，不再白等 5 轮（原实现遇到这类错误也会硬重试 5 次，浪费 15 秒）。
+var ErrNoUsableNode = errors.New("没有可用节点")
 
 type Manager struct {
 	mu      sync.Mutex
@@ -70,8 +77,31 @@ func (m *Manager) Start() error {
 		node = n
 	}
 	m.cfg.Unlock()
+
 	if node == nil {
-		return fmt.Errorf("激活节点(%s)不在节点列表中", m.cfg.ActiveNode)
+		// 原节点不见了。最常见的原因：订阅刷新后节点内容变了，而节点 ID 是按
+		// 内容派生的 —— 源站一改，ID 就全变，cfg.ActiveNode 指向的旧 ID 自然失效。
+		//
+		// 这里不能直接放弃：盒子重启后代理起不来，用户的网就断了，还得手动点节点。
+		// 复用已有的「自动故障转移」挑一个替补顶上（可达优先 → 延迟升序）。
+		//
+		// 注意不能调 tryFailover()：它会走 SwitchNode → Stop/Start，而此处已经
+		// 持有 m.mu，必然死锁（同 watch 里那段注释说的坑）。所以这里只做
+		// 「挑一个 + 落盘」，进程照常往下启动。
+		picked, ok := m.pickFailoverNodeLocked()
+		if !ok {
+			return fmt.Errorf("%w: 激活节点(%s)不在节点列表中，且没有其他节点可替补",
+				ErrNoUsableNode, m.cfg.ActiveNode)
+		}
+		log.Printf("激活节点(%s)已不在节点列表中，自动改用[%s]", m.cfg.ActiveNode, picked.node.Name)
+		m.cfg.Lock()
+		m.cfg.ActiveNode = picked.node.ID
+		if picked.groupID != "" {
+			m.cfg.ActiveGrp = picked.groupID
+		}
+		_ = m.cfg.Save()
+		m.cfg.Unlock()
+		node = &picked.node
 	}
 	// 缓存实际启动节点信息，供 Status 状态栏显示，避免受 Fetch 后台刷新影响
 	m.activeName = node.Name
@@ -174,26 +204,25 @@ func (m *Manager) watch(cmd *exec.Cmd) {
 	_ = m.Start()
 }
 
-// tryFailover 当前节点连续失败后，自动切换到其他可用节点。
-// 优先选择已测速可达（ping>0）且延迟最低的节点，最多尝试 3 个。
-// 返回 true 表示已成功切换到新节点。
-func (m *Manager) tryFailover() bool {
-	if !m.cfg.FailoverEnabled() {
-		return false
-	}
+// nodePick 一个替补节点，附带它所属的分组 ID（切过去时要一起更新 ActiveGrp）
+type nodePick struct {
+	node    config.Node
+	groupID string
+}
 
-	m.cfg.Lock()
-	cur := m.cfg.ActiveNode
-	var cands []config.Node
-	for _, n := range m.cfg.AllNodes() {
-		if n.ID != cur {
+// failoverOrder 按「可达优先 → 延迟升序」排出候选节点，排除 exclude。
+//
+// 抽出来是因为有两个调用方：tryFailover（节点反复崩溃时换人）和
+// Start（开机时发现原节点已消失）。两处的挑选标准必须一致，否则会出现
+// 「开机挑的和故障转移挑的不是同一个」这种莫名其妙的行为。
+//
+// 调用方需自行持有 cfg 锁。
+func failoverOrder(all []config.Node, exclude string) []config.Node {
+	cands := make([]config.Node, 0, len(all))
+	for _, n := range all {
+		if n.ID != exclude {
 			cands = append(cands, n)
 		}
-	}
-	m.cfg.Unlock()
-
-	if len(cands) == 0 {
-		return false
 	}
 	// 可达节点优先，其次按延迟升序
 	sort.SliceStable(cands, func(i, j int) bool {
@@ -207,6 +236,46 @@ func (m *Manager) tryFailover() bool {
 		}
 		return pi < pj
 	})
+	return cands
+}
+
+// pickFailoverNodeLocked 挑一个替补节点。与 tryFailover 的区别是它只读配置、
+// 不启动任何进程，因此可以在 Start() 持 m.mu 时安全调用。
+func (m *Manager) pickFailoverNodeLocked() (nodePick, bool) {
+	if !m.cfg.FailoverEnabled() {
+		return nodePick{}, false
+	}
+	m.cfg.Lock()
+	cands := failoverOrder(m.cfg.AllNodes(), m.cfg.ActiveNode)
+	// 顺手把分组 ID 查出来（同一个锁里做完，避免二次加锁）
+	grpID := ""
+	if len(cands) > 0 {
+		_, grpID = m.cfg.FindNode(cands[0].ID)
+	}
+	m.cfg.Unlock()
+
+	if len(cands) == 0 {
+		return nodePick{}, false
+	}
+	return nodePick{node: cands[0], groupID: grpID}, true
+}
+
+// tryFailover 当前节点连续失败后，自动切换到其他可用节点。
+// 优先选择已测速可达（ping>0）且延迟最低的节点，最多尝试 3 个。
+// 返回 true 表示已成功切换到新节点。
+func (m *Manager) tryFailover() bool {
+	if !m.cfg.FailoverEnabled() {
+		return false
+	}
+
+	m.cfg.Lock()
+	cur := m.cfg.ActiveNode
+	cands := failoverOrder(m.cfg.AllNodes(), cur)
+	m.cfg.Unlock()
+
+	if len(cands) == 0 {
+		return false
+	}
 
 	const maxTry = 3
 	tried := 0

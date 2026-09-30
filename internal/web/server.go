@@ -301,9 +301,20 @@ const clashDelayTimeout = 8000
 //
 // 家宽节点的出口是一条 OpenVPN 隧道，本程序那套 TCP/TLS 握手探测对它没有意义
 // —— 探到的只是 CF 前置节点，和隧道能不能用是两回事。所以必须交给内核来测。
+// clashKernelOffMsg 家宽内核没跑时给出的提示。
+//
+// 为什么不能直接把底层错误抛给用户：内核没启动时 external-controller 端口是空的，
+// 硬测只会拿到 `dial tcp 127.0.0.1:19090: connect: connection refused`。
+// 这话对用户毫无意义，他只会觉得「又坏了」。直接告诉他下一步该点什么。
+const clashKernelOffMsg = "家宽内核还没启动。请先点一个家宽节点把它启用（首次约十几秒），再回来测速。"
+
 func (w *WebServer) pingClashNode(rw http.ResponseWriter, id string) {
 	if !w.clashReady() {
 		w.writeJSON(rw, map[string]interface{}{"id": id, "ms": -1, "error": "家宽通道未启用"})
+		return
+	}
+	if !w.mhm.IsRunning() {
+		w.writeJSON(rw, map[string]interface{}{"id": id, "ms": -1, "error": clashKernelOffMsg})
 		return
 	}
 	name := strings.TrimPrefix(id, config.ClashNodeIDPrefix)
@@ -324,6 +335,10 @@ func (w *WebServer) pingClashGroup(rw http.ResponseWriter) {
 		// 返回 error 而不是空数组：空数组会被界面当成「全都不通」，
 		// 掩盖掉「家宽根本没启用」这个真实原因。
 		w.writeJSON(rw, map[string]string{"error": "家宽通道未启用"})
+		return
+	}
+	if !w.mhm.IsRunning() {
+		w.writeJSON(rw, map[string]string{"error": clashKernelOffMsg})
 		return
 	}
 	delays, err := w.mhm.GroupDelay(w.mhm.NodeGroup(), clashDelayTimeout)

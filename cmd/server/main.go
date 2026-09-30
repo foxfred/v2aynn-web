@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -94,15 +95,26 @@ type kernelStarter interface{ Start() error }
 
 // startWithRetry 带重试地启动内核。
 // 低配盒子上启动偶发失败（端口还没释放、上游 DNS 未就绪），重试几次比直接放弃实用。
+//
+// 但只对**可能自愈**的错误重试。像「配置里根本挑不出可用节点」这种确定性失败，
+// 重试 5 次只是白等 15 秒 —— 期间代理一直是停的，用户会觉得程序卡住了。
 func startWithRetry(k kernelStarter, label string) {
-	for attempt := 1; attempt <= 5; attempt++ {
-		if err := k.Start(); err == nil {
+	const maxAttempt = 5
+	for attempt := 1; attempt <= maxAttempt; attempt++ {
+		err := k.Start()
+		if err == nil {
 			log.Printf("自动启动%s成功", label)
 			return
-		} else {
-			log.Printf("自动启动%s失败(第%d次): %v", label, attempt, err)
 		}
-		time.Sleep(3 * time.Second)
+		log.Printf("自动启动%s失败(第%d次): %v", label, attempt, err)
+
+		if errors.Is(err, v2ray.ErrNoUsableNode) {
+			log.Printf("自动启动%s放弃: 这是配置问题，重试不会改变结果", label)
+			return
+		}
+		if attempt < maxAttempt {
+			time.Sleep(3 * time.Second)
+		}
 	}
-	log.Printf("自动启动%s失败: 重试5次均未成功", label)
+	log.Printf("自动启动%s失败: 重试%d次均未成功", label, maxAttempt)
 }

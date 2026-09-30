@@ -232,6 +232,11 @@ func TestPingClashNodeWithoutKernel(t *testing.T) {
 	if resp.Error == "" {
 		t.Error("内核不可用时应当返回 error，方便用户排查")
 	}
+	// 关键：不能把 `dial tcp 127.0.0.1:19090: connect: connection refused`
+	// 这种底层错误直接甩给用户，他看不懂也不知道该做什么。
+	if resp.Error != clashKernelOffMsg {
+		t.Errorf("应当给出可操作的提示，实际是: %q", resp.Error)
+	}
 	if resp.ID != config.ClashNodeIDPrefix+"🏠 JP-家宽-01" {
 		t.Errorf("返回的 id 必须原样带回（界面靠它定位行）: %q", resp.ID)
 	}
@@ -254,6 +259,9 @@ func TestPingClashGroupWithoutKernel(t *testing.T) {
 	}
 	if resp.Error == "" {
 		t.Error("内核不可用时整组测速应当返回 error")
+	}
+	if resp.Error != clashKernelOffMsg {
+		t.Errorf("整组测速也应给出可操作的提示，实际是: %q", resp.Error)
 	}
 }
 

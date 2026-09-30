@@ -214,6 +214,7 @@ func (m *Manager) Start() error {
 		m.activeName = m.cfg.ClashNode
 		m.cfg.Unlock()
 	}
+	m.ensureActiveNodeLocked()
 
 	m.cmd = exec.Command(m.bin, "-d", m.dataDir, "-f", confPath)
 	if err := m.cmd.Start(); err != nil {
@@ -518,6 +519,39 @@ func (m *Manager) controlAddr() string {
 		return addr
 	}
 	return fmt.Sprintf("127.0.0.1:%d", ControlPort)
+}
+
+// hasNodeLocked 判断某个家宽节点名是否在当前订阅里。调用方需持有 m.mu。
+func (m *Manager) hasNodeLocked(name string) bool {
+	for _, n := range m.nodes {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+// ensureActiveNodeLocked 修正「上次选中的家宽节点已消失」的情况。
+//
+// 家宽订阅源换节点很频繁，上次选的节点下次刷新就没了。不处理的话，
+// 启动后异步恢复那步会一直失败，界面还挂着一个不存在的「当前使用中」。
+// 这里改用订阅里的第一个节点顶上，并把结果落盘，免得每次重启都重复一遍。
+//
+// 调用方需持有 m.mu，且 m.nodes 非空。
+func (m *Manager) ensureActiveNodeLocked() {
+	if m.activeName == "" || m.hasNodeLocked(m.activeName) {
+		return
+	}
+	old := m.activeName
+	m.activeName = m.nodes[0]
+	log.Printf("上次选中的家宽节点[%s]已不在订阅中，改用[%s]", old, m.activeName)
+	if m.cfg == nil {
+		return
+	}
+	m.cfg.Lock()
+	m.cfg.ClashNode = m.activeName
+	_ = m.cfg.Save()
+	m.cfg.Unlock()
 }
 
 // NodeGroup 返回家宽节点所属的手动选择组名（内核测速时用）
