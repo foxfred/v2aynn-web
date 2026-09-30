@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"v2aynn-web/internal/config"
 	"v2aynn-web/internal/mihomo"
@@ -54,9 +55,17 @@ rules:
   - MATCH,🚀 节点选择
 `
 
-// newClashTestServer 造一个带家宽通道的 WebServer。
-// 订阅源用本地假服务，既避免测试依赖外网，也能顺带校验 UA 伪装。
-func newClashTestServer(t *testing.T) (*WebServer, *config.Config, *mihomo.Manager) {
+// newClashTestServerWith 造一个带家宽通道的 WebServer。
+//
+// payload 是假订阅源返回的内容，测「识别失败」的用例可以换成普通文本。
+// 订阅源用本地假服务，测试不依赖外网。
+//
+// 假服务刻意「不看 UA、一律返回 payload」：这是照 cfnew 的真实行为写的 ——
+// 2026-09-30 实测 target=vg 链接在 Go 默认 UA 与 clash-verge UA 下返回的是
+// 同一份 Clash YAML（节点数 76 vs 73 只是采样不同，格式一致），也就是说
+// 返回什么格式由 URL 上的 target 参数决定，与 UA 无关。
+// 别把它改成「UA 不对就返回别的」—— 那样测的就不是真实行为了。
+func newClashTestServerWith(t *testing.T, payload string) (*WebServer, *config.Config, *mihomo.Manager, string) {
 	t.Helper()
 	dir := t.TempDir()
 	cfg, err := config.Load(filepath.Join(dir, "config.json"))
@@ -65,74 +74,129 @@ func newClashTestServer(t *testing.T) (*WebServer, *config.Config, *mihomo.Manag
 	}
 
 	fake := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		// 订阅服务端按 UA 决定返回 Clash 配置还是普通文本，UA 不对就拿不到家宽节点
-		if !strings.Contains(strings.ToLower(r.Header.Get("User-Agent")), "clash") {
-			_, _ = rw.Write([]byte("plain text, not a clash config"))
-			return
-		}
-		_, _ = rw.Write([]byte(clashSubSample))
+		_, _ = rw.Write([]byte(payload))
 	}))
 	t.Cleanup(fake.Close)
-
-	cfg.Lock()
-	cfg.ClashSubURL = fake.URL
-	cfg.Unlock()
 
 	v2m := v2ray.NewManager(dir)
 	mhm := mihomo.NewManager(dir)
-	return NewServer(cfg, v2m, mhm), cfg, mhm
+	return NewServer(cfg, v2m, mhm), cfg, mhm, fake.URL
 }
 
-func TestFetchClashSub(t *testing.T) {
-	s, cfg, mhm := newClashTestServer(t)
+func newClashTestServer(t *testing.T) (*WebServer, *config.Config, *mihomo.Manager, string) {
+	t.Helper()
+	return newClashTestServerWith(t, clashSubSample)
+}
 
-	if err := s.fetchClashSub(); err != nil {
-		t.Fatalf("拉取家宽订阅失败: %v", err)
-	}
-
-	if n := len(mhm.Nodes()); n != 2 {
-		t.Fatalf("家宽节点数 = %d, 期望 2", n)
-	}
+// seedClashGroup 往配置里塞一个家宽分组，并把它加载成当前生效的配置。
+//
+// 这等价于用户「添加订阅分组」之后再点其中一个节点之后的状态 ——
+// 只有被点过的那份配置才会生成可运行的 mihomo 配置。
+func seedClashGroup(t *testing.T, cfg *config.Config, mhm *mihomo.Manager, id, name, url string) {
+	t.Helper()
 	cfg.Lock()
-	cached := len(cfg.ClashNodes)
+	cfg.Groups = append(cfg.Groups, config.Group{
+		ID: id, Name: name, URL: url,
+		Kind: config.GroupKindClash, Nodes: []config.Node{},
+	})
 	cfg.Unlock()
-	if cached != 2 {
-		t.Errorf("config.ClashNodes = %d, 期望 2", cached)
+	if err := mhm.LoadGroup(id, url, ""); err != nil {
+		t.Fatalf("加载家宽分组失败: %v", err)
 	}
-	// 配置文件必须真的落盘，否则内核启动时会找不到配置
-	if !mhm.HasConfig() {
-		t.Error("家宽配置未落盘")
+}
+
+// waitFor 轮询等待条件成立。新增分组的拉取在后台 goroutine 里跑，
+// 测试必须等它跑完再断言，否则会随机失败。
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	if mhm.SubLastFetch() == "" {
+	return false
+}
+
+// 「添加订阅分组」这一个入口要能同时吃下普通订阅与家宽订阅：
+// 拉回来的内容像 cfnew 家宽配置时，自动把分组标记成家宽类型并交给 mihomo 内核。
+func TestAddGroupDetectsClashSub(t *testing.T) {
+	s, cfg, mhm, url := newClashTestServer(t)
+
+	req := httptest.NewRequest("POST", "/api/group/add",
+		strings.NewReader(`{"name":"家宽","url":"`+url+`"}`))
+	rec := httptest.NewRecorder()
+	s.apiAddGroup(rec, req)
+
+	var resp map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	id := resp["id"]
+	if id == "" {
+		t.Fatalf("添加分组未返回 id: %s", rec.Body.String())
+	}
+
+	if !waitFor(t, 5*time.Second, func() bool {
+		cfg.Lock()
+		defer cfg.Unlock()
+		return cfg.FindClashGroup(id) != nil
+	}) {
+		t.Fatal("分组没有被识别为家宽订阅")
+	}
+	// 内核那边也要把订阅原文落下来，否则侧栏会一直显示 0 个节点
+	if !waitFor(t, 5*time.Second, func() bool { return mhm.GroupNodeCount(id) == 2 }) {
+		t.Fatalf("家宽节点数 = %d, 期望 2", mhm.GroupNodeCount(id))
+	}
+	if mhm.SubLastFetch(id) == "" {
 		t.Error("订阅时间未记录")
 	}
+	// 还没点过任何节点，所以运行配置不该生成 —— 生成它是「启用」那一步的事
+	if mhm.HasConfig() {
+		t.Error("尚未启用任何家宽节点，不该生成运行配置")
+	}
+
+	// 家宽分组的 Nodes 必须留空：混进 AllNodes() 会被 xray 的故障转移
+	// 当成候选节点，那是另一套协议，切过去必然连不上。
+	cfg.Lock()
+	g := cfg.FindClashGroup(id)
+	nodes := len(g.Nodes)
+	cfg.Unlock()
+	if nodes != 0 {
+		t.Errorf("家宽分组的 Nodes = %d, 期望 0", nodes)
+	}
 }
 
-func TestFetchClashSubRejectsNonClashResponse(t *testing.T) {
-	dir := t.TempDir()
-	cfg, err := config.Load(filepath.Join(dir, "config.json"))
-	if err != nil {
-		t.Fatalf("加载测试配置失败: %v", err)
-	}
-	fake := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		_, _ = rw.Write([]byte("not yaml at all"))
-	}))
-	t.Cleanup(fake.Close)
-	cfg.Lock()
-	cfg.ClashSubURL = fake.URL
-	cfg.Unlock()
+// 拉回来的不是 Clash 配置时，分组要保持普通类型，不能被误标成家宽
+func TestAddGroupKeepsNormalSubNormal(t *testing.T) {
+	s, cfg, mhm, url := newClashTestServerWith(t, "this is not a subscription at all")
 
-	s := NewServer(cfg, v2ray.NewManager(dir), mihomo.NewManager(dir))
-	if err := s.fetchClashSub(); err == nil {
-		t.Error("订阅内容里没有 openvpn 节点时应当报错")
+	req := httptest.NewRequest("POST", "/api/group/add",
+		strings.NewReader(`{"name":"普通","url":"`+url+`"}`))
+	rec := httptest.NewRecorder()
+	s.apiAddGroup(rec, req)
+
+	var resp map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	time.Sleep(400 * time.Millisecond) // 等后台拉取跑完
+
+	cfg.Lock()
+	isClash := cfg.FindClashGroup(resp["id"]) != nil
+	cfg.Unlock()
+	if isClash {
+		t.Error("普通订阅被误标成了家宽分组")
+	}
+	if n := mhm.GroupNodeCount(resp["id"]); n != 0 {
+		t.Errorf("普通订阅不该进 mihomo，节点数 = %d", n)
 	}
 }
 
 func TestClashGroupAppearsInGroups(t *testing.T) {
-	s, _, _ := newClashTestServer(t)
-	if err := s.fetchClashSub(); err != nil {
-		t.Fatalf("拉取家宽订阅失败: %v", err)
-	}
+	s, cfg, mhm, url := newClashTestServer(t)
+	seedClashGroup(t, cfg, mhm, "g1", "家宽", url)
 
 	rec := httptest.NewRecorder()
 	s.apiGroups(rec, httptest.NewRequest("GET", "/api/groups", nil))
@@ -145,19 +209,26 @@ func TestClashGroupAppearsInGroups(t *testing.T) {
 	}
 	var clash *groupSummary
 	for i := range resp.Groups {
-		if resp.Groups[i].ID == config.ClashGroupID {
+		if resp.Groups[i].ID == "g1" {
 			clash = &resp.Groups[i]
 		}
 	}
 	if clash == nil {
 		t.Fatal("分组列表里没有家宽分组")
 	}
-	if !clash.Clash || clash.NodeCount != 2 {
-		t.Errorf("家宽分组属性不对: %+v", *clash)
+	if !clash.Clash {
+		t.Error("家宽分组没被标成 clash，前端会按普通分组渲染")
+	}
+	// 节点数必须来自内核侧，不能是 g.Nodes —— 家宽分组的 Nodes 恒为空
+	if clash.NodeCount != 2 {
+		t.Errorf("节点数 = %d, 期望 2", clash.NodeCount)
+	}
+	if clash.LastFetch == "" {
+		t.Error("拉取时间应来自内核侧的订阅文件")
 	}
 }
 
-// 没配家宽订阅时，界面上不应出现家宽分组
+// 没配家宽订阅时，界面上不应凭空出现家宽分组
 func TestNoClashGroupWithoutSubscription(t *testing.T) {
 	dir := t.TempDir()
 	cfg, err := config.Load(filepath.Join(dir, "config.json"))
@@ -169,19 +240,25 @@ func TestNoClashGroupWithoutSubscription(t *testing.T) {
 	rec := httptest.NewRecorder()
 	s.apiGroups(rec, httptest.NewRequest("GET", "/api/groups", nil))
 
-	if strings.Contains(rec.Body.String(), config.ClashGroupID) {
-		t.Errorf("未配置家宽时不应出现家宽分组: %s", rec.Body.String())
+	var resp struct {
+		Groups []groupSummary `json:"groups"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	for _, g := range resp.Groups {
+		if g.Clash {
+			t.Errorf("未配置家宽时不应出现家宽分组: %+v", g)
+		}
 	}
 }
 
 func TestClashNodesList(t *testing.T) {
-	s, _, _ := newClashTestServer(t)
-	if err := s.fetchClashSub(); err != nil {
-		t.Fatalf("拉取家宽订阅失败: %v", err)
-	}
+	s, cfg, mhm, url := newClashTestServer(t)
+	seedClashGroup(t, cfg, mhm, "g1", "家宽", url)
 
-	req := httptest.NewRequest("GET", "/api/group/x/nodes", nil)
-	req.SetPathValue("id", config.ClashGroupID)
+	req := httptest.NewRequest("GET", "/api/group/g1/nodes", nil)
+	req.SetPathValue("id", "g1")
 	rec := httptest.NewRecorder()
 	s.apiGroupNodes(rec, req)
 
@@ -196,9 +273,13 @@ func TestClashNodesList(t *testing.T) {
 	if !resp.Clash || len(resp.Nodes) != 2 {
 		t.Fatalf("家宽节点列表异常: %+v", resp)
 	}
-	// ID 必须带前缀，服务端与前端都靠它分流
-	if resp.Nodes[0].ID != config.ClashNodeIDPrefix+resp.Nodes[0].Name {
-		t.Errorf("节点 ID 未带前缀: %q", resp.Nodes[0].ID)
+	// ID 必须同时带分组与节点名：点节点时要知道该加载哪一份配置
+	want := config.ClashNodeID("g1", resp.Nodes[0].Name)
+	if resp.Nodes[0].ID != want {
+		t.Errorf("节点 ID = %q, 期望 %q", resp.Nodes[0].ID, want)
+	}
+	if !strings.HasPrefix(resp.Nodes[0].ID, config.ClashNodeIDPrefix+"g1:") {
+		t.Errorf("节点 ID 里没带分组: %q", resp.Nodes[0].ID)
 	}
 	if resp.Nodes[0].Protocol != "openvpn" {
 		t.Errorf("节点协议 = %q, 期望 openvpn", resp.Nodes[0].Protocol)
@@ -209,12 +290,65 @@ func TestClashNodesList(t *testing.T) {
 	}
 }
 
+// 未生效的家宽分组也必须能列出节点。列表里没有节点，用户就没法点任何一个
+// 来启用它 —— 这个分组就永远启用不了。节点名现场从订阅原文里解析。
+func TestClashNodesOfInactiveGroupStillListed(t *testing.T) {
+	s, cfg, mhm, url := newClashTestServer(t)
+	seedClashGroup(t, cfg, mhm, "g1", "家宽A", url)
+
+	cfg.Lock()
+	cfg.Groups = append(cfg.Groups, config.Group{
+		ID: "g2", Name: "家宽B", URL: url,
+		Kind: config.GroupKindClash, Nodes: []config.Node{},
+	})
+	cfg.Unlock()
+	// 只把订阅存下来备用，不切过去
+	if _, err := mhm.FetchSubscription("g2", url, ""); err != nil {
+		t.Fatalf("拉取第二个家宽分组失败: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/api/group/g2/nodes", nil)
+	req.SetPathValue("id", "g2")
+	rec := httptest.NewRecorder()
+	s.apiGroupNodes(rec, req)
+
+	var resp struct {
+		Nodes  []config.Node `json:"nodes"`
+		Active string        `json:"active"`
+		Clash  bool          `json:"clash"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if !resp.Clash {
+		t.Error("g2 应当是家宽分组")
+	}
+	if len(resp.Nodes) != 2 {
+		t.Fatalf("未生效的家宽分组也应当列出节点, 得到 %d 个", len(resp.Nodes))
+	}
+	// ID 里的分组必须是 g2，不能串成内核当前加载的 g1
+	if !strings.HasPrefix(resp.Nodes[0].ID, config.ClashNodeIDPrefix+"g2:") {
+		t.Errorf("节点 ID 里的分组串了: %q", resp.Nodes[0].ID)
+	}
+	// 但「当前使用中」不能标 —— 内核跑的是 g1，标出来就是假的
+	if resp.Active != "" {
+		t.Errorf("未生效的分组不该有激活项, 得到 %q", resp.Active)
+	}
+	// 侧栏的节点数也照常
+	if n := mhm.GroupNodeCount("g2"); n != 2 {
+		t.Errorf("g2 节点数 = %d, 期望 2", n)
+	}
+}
+
 // 家宽节点的测速由 mihomo 内核代劳（本程序的 TCP 探测对 OpenVPN 隧道没意义）。
 // 内核没跑起来时，接口必须如实报错并给出 ms=-1，让界面显示「超时」而不是假装成功。
 func TestPingClashNodeWithoutKernel(t *testing.T) {
-	s, _, _ := newClashTestServer(t)
+	s, cfg, mhm, url := newClashTestServer(t)
+	seedClashGroup(t, cfg, mhm, "g1", "家宽", url)
+
+	id := config.ClashNodeID("g1", "🏠 JP-家宽-01")
 	req := httptest.NewRequest("POST", "/api/ping/x", nil)
-	req.SetPathValue("id", config.ClashNodeIDPrefix+"🏠 JP-家宽-01")
+	req.SetPathValue("id", id)
 	rec := httptest.NewRecorder()
 	s.apiPing(rec, req)
 
@@ -229,25 +363,55 @@ func TestPingClashNodeWithoutKernel(t *testing.T) {
 	if resp.MS != -1 {
 		t.Errorf("内核不可用时 ms 应为 -1, 得到 %d", resp.MS)
 	}
-	if resp.Error == "" {
-		t.Error("内核不可用时应当返回 error，方便用户排查")
-	}
 	// 关键：不能把 `dial tcp 127.0.0.1:19090: connect: connection refused`
 	// 这种底层错误直接甩给用户，他看不懂也不知道该做什么。
 	if resp.Error != clashKernelOffMsg {
 		t.Errorf("应当给出可操作的提示，实际是: %q", resp.Error)
 	}
-	if resp.ID != config.ClashNodeIDPrefix+"🏠 JP-家宽-01" {
+	if resp.ID != id {
 		t.Errorf("返回的 id 必须原样带回（界面靠它定位行）: %q", resp.ID)
+	}
+}
+
+// 想测的分组不是内核当前加载的那份时，必须明确拒绝 ——
+// 硬测只会拿到「找不到这个节点」，用户完全无从理解。
+func TestPingClashNodeOfInactiveGroup(t *testing.T) {
+	s, cfg, mhm, url := newClashTestServer(t)
+	seedClashGroup(t, cfg, mhm, "g1", "家宽A", url)
+
+	cfg.Lock()
+	cfg.Groups = append(cfg.Groups, config.Group{
+		ID: "g2", Name: "家宽B", URL: url,
+		Kind: config.GroupKindClash, Nodes: []config.Node{},
+	})
+	cfg.Unlock()
+	if _, err := mhm.FetchSubscription("g2", url, ""); err != nil {
+		t.Fatalf("拉取第二个家宽分组失败: %v", err)
+	}
+
+	req := httptest.NewRequest("POST", "/api/ping/x", nil)
+	req.SetPathValue("id", config.ClashNodeID("g2", "🏠 JP-家宽-01"))
+	rec := httptest.NewRecorder()
+	s.apiPing(rec, req)
+
+	var resp struct {
+		MS    int    `json:"ms"`
+		Error string `json:"error"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error != clashGroupOffMsg {
+		t.Errorf("提示 = %q, 期望 %q", resp.Error, clashGroupOffMsg)
 	}
 }
 
 // 整组测速走的是另一条路径：内核不可用时不能 panic，也不能返回 200 空结果，
 // 必须让界面能区分「全都不通」和「内核没起来」。
 func TestPingClashGroupWithoutKernel(t *testing.T) {
-	s, _, _ := newClashTestServer(t)
-	req := httptest.NewRequest("POST", "/api/ping/group/"+config.ClashGroupID, nil)
-	req.SetPathValue("id", config.ClashGroupID)
+	s, cfg, mhm, url := newClashTestServer(t)
+	seedClashGroup(t, cfg, mhm, "g1", "家宽", url)
+
+	req := httptest.NewRequest("POST", "/api/ping/group/g1", nil)
+	req.SetPathValue("id", "g1")
 	rec := httptest.NewRecorder()
 	s.apiPingGroup(rec, req)
 
@@ -257,25 +421,20 @@ func TestPingClashGroupWithoutKernel(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("解析响应失败: %v", err)
 	}
-	if resp.Error == "" {
-		t.Error("内核不可用时整组测速应当返回 error")
-	}
 	if resp.Error != clashKernelOffMsg {
 		t.Errorf("整组测速也应给出可操作的提示，实际是: %q", resp.Error)
 	}
 }
 
-// 点家宽节点要把内核标记切到 mihomo，并把选中的节点名落盘。
+// 点家宽节点要把内核标记切到 mihomo，并把生效分组与节点名一起落盘。
 // 这里故意把内核路径指向不存在的文件，避免测试真的拉起进程。
 func TestSwitchToClashNodeSetsMihomoKernel(t *testing.T) {
-	s, cfg, mhm := newClashTestServer(t)
-	if err := s.fetchClashSub(); err != nil {
-		t.Fatalf("拉取家宽订阅失败: %v", err)
-	}
+	s, cfg, mhm, url := newClashTestServer(t)
+	seedClashGroup(t, cfg, mhm, "g1", "家宽", url)
 	mhm.SetMihomoBin(filepath.Join(t.TempDir(), "no-such-mihomo"))
 
 	req := httptest.NewRequest("POST", "/api/node/x", nil)
-	req.SetPathValue("id", config.ClashNodeIDPrefix+"🏠 JP-家宽-01")
+	req.SetPathValue("id", config.ClashNodeID("g1", "🏠 JP-家宽-01"))
 	rec := httptest.NewRecorder()
 	s.apiSwitch(rec, req)
 
@@ -286,7 +445,7 @@ func TestSwitchToClashNodeSetsMihomoKernel(t *testing.T) {
 	}
 
 	cfg.Lock()
-	kernel, node := cfg.Kernel, cfg.ClashNode
+	kernel, node, grp := cfg.Kernel, cfg.ClashNode, cfg.ActiveGrp
 	cfg.Unlock()
 	if kernel != config.KernelMihomo {
 		t.Errorf("内核 = %q, 期望 mihomo", kernel)
@@ -294,11 +453,51 @@ func TestSwitchToClashNodeSetsMihomoKernel(t *testing.T) {
 	if node != "🏠 JP-家宽-01" {
 		t.Errorf("ClashNode = %q", node)
 	}
+	// ActiveGrp 必须一起记下来，否则重启后无从知道该加载哪个家宽分组的配置
+	if grp != "g1" {
+		t.Errorf("ActiveGrp = %q, 期望 g1", grp)
+	}
+}
+
+// 跨分组点节点时必须换配置：mihomo 一次只加载一份，
+// 不换的话会拿 B 的节点名去 A 的策略组里找，必然失败。
+func TestSwitchClashNodeAcrossGroupsLoadsNewConfig(t *testing.T) {
+	s, cfg, mhm, url := newClashTestServer(t)
+	seedClashGroup(t, cfg, mhm, "g1", "家宽A", url)
+
+	cfg.Lock()
+	cfg.Groups = append(cfg.Groups, config.Group{
+		ID: "g2", Name: "家宽B", URL: url,
+		Kind: config.GroupKindClash, Nodes: []config.Node{},
+	})
+	cfg.Unlock()
+	if _, err := mhm.FetchSubscription("g2", url, ""); err != nil {
+		t.Fatalf("拉取 g2 失败: %v", err)
+	}
+	mhm.SetMihomoBin(filepath.Join(t.TempDir(), "no-such-mihomo"))
+
+	req := httptest.NewRequest("POST", "/api/node/x", nil)
+	req.SetPathValue("id", config.ClashNodeID("g2", "🏠 KR-家宽-01"))
+	rec := httptest.NewRecorder()
+	s.apiSwitch(rec, req)
+
+	if got := mhm.LoadedGroup(); got != "g2" {
+		t.Errorf("LoadedGroup = %q, 期望切到 g2", got)
+	}
+	if !mhm.HasConfig() {
+		t.Error("切换分组后必须重新生成运行配置")
+	}
+	cfg.Lock()
+	grp, node := cfg.ActiveGrp, cfg.ClashNode
+	cfg.Unlock()
+	if grp != "g2" || node != "🏠 KR-家宽-01" {
+		t.Errorf("生效分组/节点 = %q/%q, 期望 g2/🏠 KR-家宽-01", grp, node)
+	}
 }
 
 // 点普通节点要把内核标记切回 xray（节点不存在导致启动失败也不影响这个标记）
 func TestSwitchToPlainNodeSetsXrayKernel(t *testing.T) {
-	s, cfg, _ := newClashTestServer(t)
+	s, cfg, _, _ := newClashTestServer(t)
 	cfg.Lock()
 	cfg.Kernel = config.KernelMihomo
 	cfg.Unlock()
@@ -316,43 +515,79 @@ func TestSwitchToPlainNodeSetsXrayKernel(t *testing.T) {
 	}
 }
 
-func TestApplySettingsClashSubURL(t *testing.T) {
-	s, cfg, _ := newClashTestServer(t)
+// 删掉正在生效的家宽分组时，必须把内核切回 xray 并清干净内核侧的文件。
+// 否则 mihomo 会继续跑一份已经不存在的分组的配置，而界面上已经看不到它了。
+func TestDelClashGroupCleansUp(t *testing.T) {
+	s, cfg, mhm, url := newClashTestServer(t)
+	seedClashGroup(t, cfg, mhm, "g1", "家宽", url)
 
-	if err := s.applySettings(map[string]interface{}{"clashSubUrl": "  http://a/b  "}); err != nil {
-		t.Fatalf("设置家宽地址失败: %v", err)
-	}
 	cfg.Lock()
-	got := cfg.ClashSubURL
+	cfg.Kernel = config.KernelMihomo
+	cfg.ActiveGrp = "g1"
+	cfg.ClashNode = "🏠 JP-家宽-01"
 	cfg.Unlock()
-	if got != "http://a/b" {
-		t.Errorf("clashSubUrl = %q, 期望去掉首尾空格", got)
-	}
 
-	// 空串必须能清空，否则用户永远关不掉家宽
-	if err := s.applySettings(map[string]interface{}{"clashSubUrl": ""}); err != nil {
-		t.Fatalf("清空家宽地址失败: %v", err)
-	}
+	req := httptest.NewRequest("POST", "/api/group/g1/del", nil)
+	req.SetPathValue("id", "g1")
+	rec := httptest.NewRecorder()
+	s.apiDelGroup(rec, req)
+
 	cfg.Lock()
-	got = cfg.ClashSubURL
+	kernel, node, grp := cfg.Kernel, cfg.ClashNode, cfg.ActiveGrp
+	hasGroup := cfg.FindClashGroup("g1") != nil
 	cfg.Unlock()
-	if got != "" {
-		t.Errorf("clashSubUrl = %q, 期望被清空", got)
-	}
 
-	// 类型不符要报错而不是 panic（历史死锁缺陷的同类场景）
-	if err := s.applySettings(map[string]interface{}{"clashSubUrl": 123}); err == nil {
-		t.Error("数字冒充字符串时应当报错")
+	if hasGroup {
+		t.Error("分组没被删掉")
+	}
+	if kernel != config.KernelXray {
+		t.Errorf("内核 = %q, 删掉生效的家宽分组后必须切回 xray", kernel)
+	}
+	if node != "" || grp != "" {
+		t.Errorf("残留 ClashNode=%q ActiveGrp=%q", node, grp)
+	}
+	if n := mhm.GroupNodeCount("g1"); n != 0 {
+		t.Errorf("内核侧节点数没清零: %d", n)
+	}
+	if got := mhm.LoadedGroup(); got != "" {
+		t.Errorf("LoadedGroup = %q, 期望清空", got)
+	}
+	if mhm.HasConfig() {
+		t.Error("运行配置没清掉，会残留成一个看不见的幽灵分组")
 	}
 }
 
-// TestClashRoutes 走真实路由表，验证家宽端点确实注册成功、路径没写错。
+// 家宽订阅已经改从「添加订阅分组」进，设置接口不再接收 clashSubUrl。
+// 老前端可能还在发这个字段，必须忽略而不是报错 —— 否则用户点保存会莫名失败。
+func TestSettingsIgnoresClashSubUrl(t *testing.T) {
+	s, cfg, _, _ := newClashTestServer(t)
+
+	if err := s.applySettings(map[string]interface{}{
+		"clashSubUrl": "http://a/b",
+		"socksPort":   float64(10809),
+	}); err != nil {
+		t.Fatalf("带 clashSubUrl 的设置请求不该报错: %v", err)
+	}
+
+	cfg.Lock()
+	sub, port, groups := cfg.ClashSubURL, cfg.SocksPort, len(cfg.ClashGroups())
+	cfg.Unlock()
+	if sub != "" {
+		t.Errorf("clashSubUrl = %q, 期望被忽略", sub)
+	}
+	if port != 10809 {
+		t.Errorf("SOCKS5 端口 = %d, 同一请求里的其它字段仍应生效", port)
+	}
+	if groups != 0 {
+		t.Error("设置接口不该凭空造出家宽分组")
+	}
+}
+
+// TestClashRoutes 走真实路由表，验证端点确实注册成功、路径没写错。
 // 用 ServeHTTP + ResponseRecorder 而不是起真实端口，测试不依赖网络。
 func TestClashRoutes(t *testing.T) {
-	s, _, _ := newClashTestServer(t)
-	if err := s.fetchClashSub(); err != nil {
-		t.Fatalf("拉取家宽订阅失败: %v", err)
-	}
+	s, cfg, mhm, url := newClashTestServer(t)
+	seedClashGroup(t, cfg, mhm, "g1", "家宽", url)
 	mux := s.newMux()
 
 	do := func(method, path, body string) *httptest.ResponseRecorder {
@@ -383,32 +618,35 @@ func TestClashRoutes(t *testing.T) {
 		t.Errorf("clashEnabled = %v, 期望 true", st["clashEnabled"])
 	}
 
-	// 设置接口要回显家宽地址
+	// 设置接口要报告家宽分组数量（家宽订阅本身已不在这里配置）
 	rec = do("GET", "/api/settings", "")
 	var set map[string]interface{}
 	if err := json.Unmarshal(rec.Body.Bytes(), &set); err != nil {
 		t.Fatalf("settings 解析失败: %v", err)
 	}
-	if sub, _ := set["clashSubUrl"].(string); sub == "" {
-		t.Errorf("settings 未回显 clashSubUrl: %v", set)
-	}
-	if set["clashNodeCount"] != float64(2) {
-		t.Errorf("clashNodeCount = %v, 期望 2", set["clashNodeCount"])
+	if set["clashGroupCount"] != float64(1) {
+		t.Errorf("clashGroupCount = %v, 期望 1", set["clashGroupCount"])
 	}
 
-	// 家宽节点列表
-	rec = do("GET", "/api/group/"+config.ClashGroupID+"/nodes", "")
-	if !strings.Contains(rec.Body.String(), config.ClashNodeIDPrefix) {
+	// 分组列表要把家宽分组标出来
+	rec = do("GET", "/api/groups", "")
+	if !strings.Contains(rec.Body.String(), `"clash":true`) {
+		t.Errorf("分组列表没标出家宽分组: %s", rec.Body.String())
+	}
+
+	// 家宽节点列表：ID 里必须带分组
+	rec = do("GET", "/api/group/g1/nodes", "")
+	if !strings.Contains(rec.Body.String(), config.ClashNodeIDPrefix+"g1:") {
 		t.Errorf("家宽节点列表异常: %s", rec.Body.String())
 	}
 
-	// 手动刷新端点
-	rec = do("POST", "/api/clash/fetch", "")
-	var fr map[string]interface{}
-	if err := json.Unmarshal(rec.Body.Bytes(), &fr); err != nil {
-		t.Fatalf("clash/fetch 解析失败: %v", err)
+	// 整组测速：内核没跑，要给出可操作的提示而不是底层连接错误
+	rec = do("POST", "/api/ping/group/g1", "")
+	var pg map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &pg); err != nil {
+		t.Fatalf("整组测速解析失败: %v", err)
 	}
-	if fr["ok"] != "true" || fr["count"] != float64(2) {
-		t.Errorf("刷新家宽订阅异常: %s", rec.Body.String())
+	if pg["error"] != clashKernelOffMsg {
+		t.Errorf("整组测速提示 = %q", pg["error"])
 	}
 }

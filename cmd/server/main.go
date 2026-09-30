@@ -49,21 +49,21 @@ func main() {
 	// 开机自动启动代理：按上次使用的内核决定启哪个（两个内核抢同一组端口，
 	// 只能起一个）。普通节点走 xray，家宽节点走 mihomo。
 	go func() {
+		// 补齐本地还没有订阅原文的家宽分组（从旧版升级上来时会有这种：
+		// 家宽地址是从老配置里迁移出来的，订阅原文得真拉过一次才有）。
+		// 放后台跑：它要联网，不该拖住代理启动。
+		go mhm.EnsureGroupSubs()
+
 		cfg.Lock()
 		kernel := cfg.CurrentKernel()
 		activeNode := cfg.ActiveNode
-		subURL := cfg.ClashSubURL
-		subProxy := cfg.SubProxy
+		hasClashGroup := cfg.ClashEnabled()
 		cfg.Unlock()
 
-		if kernel == config.KernelMihomo && subURL != "" {
-			// 本地还没有家宽配置时先拉一次；已有就直接启动，
-			// 免得每次开机都白等一次网络请求。
-			if !mhm.HasConfig() {
-				if _, err := mhm.FetchSubscription(subURL, subProxy); err != nil {
-					log.Printf("开机拉取家宽订阅失败: %v", err)
-				}
-			}
+		if kernel == config.KernelMihomo && hasClashGroup {
+			// 配置由 mihomo 内核自己准备：优先用磁盘上已有的订阅原文，
+			// 本地没有才联网拉一次（见 Manager.ensureActiveConfig）。
+			// 这里不重复判断「有没有配置」，免得两处逻辑各说各话。
 			startWithRetry(mhm, "家宽内核")
 			return
 		}

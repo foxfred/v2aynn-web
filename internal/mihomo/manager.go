@@ -57,9 +57,27 @@ const (
 	// GeoFile mihomo 的 geosite 数据文件名（与 xray 的 geosite.dat 同名但格式不同）。
 	GeoFile = "geosite.dat"
 
-	subFileName  = "clash-sub.yaml"    // 订阅原文，留着排查用
-	confFileName = "clash-config.yaml" // 改写后交给 mihomo 实际运行的配置
+	// confFileName 改写后交给 mihomo 实际运行的配置。
+	//
+	// 只有一份：mihomo 一次只能加载一份配置（-f 只接一个文件），
+	// 所以家宽分组可以有多个，但同一时刻只有「当前生效」的那份会写到这里。
+	confFileName = "clash-config.yaml"
+
+	// legacySubFileName 早期只有「一个家宽订阅」时用的订阅原文文件名。
+	// 保留它是为了升级后不必重新联网拉一次订阅 —— 盒子开机时代理还没起来，
+	// 拉订阅大概率失败，那就成死锁了。
+	legacySubFileName = "clash-sub.yaml"
+
+	// subFilePrefix / subFileSuffix 每个家宽分组各存一份订阅原文，便于排查与离线重载。
+	subFilePrefix = "clash-sub-"
+	subFileSuffix = ".yaml"
 )
+
+// subFileNameFor 某个家宽分组的订阅原文文件名。
+// 分组 ID 是纯数字（UnixNano），直接拼进文件名是安全的。
+func subFileNameFor(groupID string) string {
+	return subFilePrefix + groupID + subFileSuffix
+}
 
 // Manager mihomo 内核管理器。
 // 并发约定与 v2ray.Manager 一致：m.mu 保护本结构体字段，
@@ -77,10 +95,18 @@ type Manager struct {
 
 	// 以下几项由订阅解析得到，属于「配置派生数据」，不写进 config.json ——
 	// 进程重启后可以从 dataDir 下的订阅原文重新解析出来。
-	nodes      []string // 家宽（openvpn）节点名，按订阅里的顺序
-	nodeGroup  string   // 家宽节点所属的 select 组名，手动切换节点时用
-	topGroup   string   // 顶层主 select 组名，成员包含 nodeGroup
-	activeName string   // 当前选中的家宽节点名
+	//
+	// 注意它们是**当前生效的那份配置**的派生结果，不是所有家宽分组的。
+	// 家宽分组可以有好几个，但 mihomo 一次只加载一份（见 loadedGroup）。
+	loadedGroup string   // 当前已加载的家宽分组 ID
+	nodes       []string // 家宽（openvpn）节点名，按订阅里的顺序
+	nodeGroup   string   // 家宽节点所属的 select 组名，手动切换节点时用
+	topGroup    string   // 顶层主 select 组名，成员包含 nodeGroup
+	activeName  string   // 当前选中的家宽节点名
+
+	// nodeCounts 各分组解析出的节点数。侧栏每个家宽分组都要显示节点数，
+	// 但只有「当前生效」那个的节点真在内存里，所以这里单独记一份。
+	nodeCounts map[string]int
 
 	restartCount int
 	lastRestart  time.Time
@@ -100,7 +126,12 @@ func NewManager(dataDir string) *Manager {
 // SetMihomoBin 覆盖 mihomo 二进制路径（测试或非标准部署环境使用）
 func (m *Manager) SetMihomoBin(p string) { m.bin = p }
 
-func (m *Manager) SetConfig(cfg *config.Config) { m.cfg = cfg }
+func (m *Manager) SetConfig(cfg *config.Config) {
+	m.cfg = cfg
+	// 配置就位后立刻从磁盘恢复一次家宽解析结果。放在这里而不是 NewManager：
+	// NewManager 时还不知道哪个分组是当前生效的。
+	m.restoreFromDisk()
+}
 
 // DataDir 返回数据目录（web 层展示用）
 func (m *Manager) DataDir() string { return m.dataDir }
@@ -113,13 +144,24 @@ func (m *Manager) HasConfig() bool {
 	return err == nil
 }
 
-// SubLastFetch 返回家宽订阅的最后更新时间（界面展示用），从未拉取过时返回空串。
-func (m *Manager) SubLastFetch() string {
-	fi, err := os.Stat(filepath.Join(m.dataDir, subFileName))
+// SubLastFetch 返回某个家宽分组订阅的最后更新时间（界面展示用），
+// 从未拉取过时返回空串。
+func (m *Manager) SubLastFetch(groupID string) string {
+	fi, err := os.Stat(filepath.Join(m.dataDir, subFileNameFor(groupID)))
 	if err != nil {
-		return ""
+		// 升级前的老配置只有一份全局订阅原文，也算这个分组拉过
+		if fi, err = os.Stat(filepath.Join(m.dataDir, legacySubFileName)); err != nil {
+			return ""
+		}
 	}
 	return fi.ModTime().Format("2006-01-02 15:04:05")
+}
+
+// LoadedGroup 返回当前已加载的家宽分组 ID（未加载任何分组时为空）
+func (m *Manager) LoadedGroup() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.loadedGroup
 }
 
 func (m *Manager) IsRunning() bool {
@@ -185,27 +227,35 @@ func (m *Manager) usesGeosite() bool {
 // 放在 dataDir 下的 geo 数据就找不到了（实测踩过这个坑）。
 func (m *Manager) Start() error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.running {
+		m.mu.Unlock()
 		return nil
 	}
 	// 这是一次显式启动，清除「已要求停止」标记，允许后续崩溃重新自愈
 	m.stopRequested = false
+	m.mu.Unlock()
 
 	if err := m.CheckEnv(); err != nil {
 		return err
 	}
-
-	confPath := filepath.Join(m.dataDir, confFileName)
-	if _, err := os.Stat(confPath); err != nil {
-		return fmt.Errorf("家宽配置尚未生成，请先在设置里保存家宽订阅地址")
+	// 先把配置准备好再进临界区。这一步可能要联网拉订阅，耗时不可控，
+	// 持着 m.mu 做网络 IO 会把 Status()/Nodes() 这些读接口一起卡住。
+	if err := m.ensureActiveConfig(); err != nil {
+		return err
 	}
-	// 进程刚起来时内存里没有解析结果，从已存订阅原文恢复
-	if len(m.nodes) == 0 {
-		m.loadParsedLocked()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// 准备配置期间可能已被别的 goroutine 启动，复查一次
+	if m.running {
+		return nil
 	}
 	if len(m.nodes) == 0 {
 		return fmt.Errorf("家宽节点列表为空，请重新拉取订阅")
+	}
+	confPath := filepath.Join(m.dataDir, confFileName)
+	if _, err := os.Stat(confPath); err != nil {
+		return fmt.Errorf("家宽配置尚未生成，请先在左侧用「添加订阅分组」添加家宽订阅")
 	}
 
 	// 恢复上次选中的节点名（内存态，进程重启后靠 config 里的 ClashNode 还原）
@@ -361,7 +411,8 @@ func (m *Manager) applyNode(name string) error {
 	return nil
 }
 
-// Nodes 返回家宽节点名列表（副本，调用方可安全持有）
+// Nodes 返回家宽节点名列表（副本，调用方可安全持有）。
+// 返回的是「当前生效分组」的节点。
 func (m *Manager) Nodes() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -370,27 +421,69 @@ func (m *Manager) Nodes() []string {
 	return out
 }
 
+// GroupNodes 返回某个家宽分组的节点名列表。
+//
+// 当前生效那个分组直接用内存里的解析结果；别的分组现场读订阅原文解析。
+//
+// 为什么不能只认内存：新增的家宽分组还没被「启用」，内存里没有它的节点，
+// 界面上就会显示空列表 —— 而列表里没有节点，用户就没法点任何一个来启用它，
+// 这个分组于是永远启用不了（先有鸡还是先有蛋）。
+//
+// 只读文件、不联网，可以放心在每次加载列表时调用。
+func (m *Manager) GroupNodes(groupID string) []string {
+	m.mu.Lock()
+	if m.loadedGroup == groupID && len(m.nodes) > 0 {
+		out := make([]string, len(m.nodes))
+		copy(out, m.nodes)
+		m.mu.Unlock()
+		return out
+	}
+	m.mu.Unlock()
+
+	body, err := m.readSub(groupID)
+	if err != nil {
+		return nil
+	}
+	return parseSubscription(string(body)).nodes
+}
+
+// GroupNodeCount 返回某个家宽分组的节点数（界面列表展示用）。
+// 只读内存缓存；缓存由 restoreFromDisk 与 FetchSubscription 填充。
+func (m *Manager) GroupNodeCount(groupID string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.nodeCounts[groupID]
+}
+
 // Status 返回状态，字段名与 v2ray.Manager.Status 对齐，web 层可直接透传。
 func (m *Manager) Status() map[string]interface{} {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	activeNode := ""
 	if m.activeName != "" {
-		activeNode = config.ClashNodeIDPrefix + m.activeName
+		activeNode = config.ClashNodeID(m.loadedGroup, m.activeName)
 	}
 	return map[string]interface{}{
-		"running":    m.running,
-		"kernel":     config.KernelMihomo,
-		"activeNode": activeNode,
-		"activeName": m.activeName,
+		"running":     m.running,
+		"kernel":      config.KernelMihomo,
+		"activeNode":  activeNode,
+		"activeName":  m.activeName,
+		"loadedGroup": m.loadedGroup,
 	}
 }
 
 // --- 订阅拉取与配置生成 ---
 
-// FetchSubscription 拉取家宽订阅，改写成可运行的 mihomo 配置并落盘，
-// 同时解析出节点名与策略组结构。返回家宽节点名列表。
-func (m *Manager) FetchSubscription(subURL, proxy string) ([]string, error) {
+// FetchSubscription 拉取指定家宽分组的订阅，落盘订阅原文；
+// 若这个分组正是当前生效的那份，顺手把可运行的 mihomo 配置一起重写。
+// 返回家宽节点名列表。
+//
+// groupID 必须非空：订阅原文按分组各存一份，才能在家宽分组之间来回切换
+// 而不用每次重新联网拉取。
+func (m *Manager) FetchSubscription(groupID, subURL, proxy string) ([]string, error) {
+	if strings.TrimSpace(groupID) == "" {
+		return nil, fmt.Errorf("缺少家宽分组 ID")
+	}
 	if strings.TrimSpace(subURL) == "" {
 		return nil, fmt.Errorf("家宽订阅地址为空")
 	}
@@ -407,39 +500,212 @@ func (m *Manager) FetchSubscription(subURL, proxy string) ([]string, error) {
 		return nil, fmt.Errorf("订阅里没有 openvpn 节点（cfnew 的链接需要带 target=vg 参数）")
 	}
 
-	socksPort, httpPort := m.ports()
-	conf, err := rewriteConfig(string(body), socksPort, httpPort, ControlPort)
-	if err != nil {
-		return nil, err
-	}
-
 	if err := os.MkdirAll(m.dataDir, 0755); err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(filepath.Join(m.dataDir, subFileName), body, 0644); err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(filepath.Join(m.dataDir, confFileName), []byte(conf), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(m.dataDir, subFileNameFor(groupID)), body, 0644); err != nil {
 		return nil, err
 	}
 
 	m.mu.Lock()
-	m.nodes = info.nodes
-	m.nodeGroup = info.nodeGroup
-	m.topGroup = info.topGroup
+	// 只有「当前生效」那个分组的解析结果与运行配置需要跟着更新；
+	// 别的分组只是把订阅存下来备用，等真正切过去时再生成配置。
+	//
+	// 注意判定必须是 loadedGroup == groupID，不能放宽成「还没加载过任何分组」——
+	// 那样新增第二个家宽分组时会把它误认成当前生效的那份，于是运行配置被悄悄
+	// 换成新分组，而 cfg 里记录的生效分组还是旧的，两边对不上。
+	isActive := m.loadedGroup == groupID
+	if m.nodeCounts == nil {
+		m.nodeCounts = map[string]int{}
+	}
+	m.nodeCounts[groupID] = len(info.nodes)
+	if isActive {
+		m.nodes = info.nodes
+		m.nodeGroup = info.nodeGroup
+		m.topGroup = info.topGroup
+	}
 	m.mu.Unlock()
 
-	log.Printf("家宽订阅已更新: %d 个节点, 手动选择组=%q, 顶层主组=%q",
-		len(info.nodes), info.nodeGroup, info.topGroup)
+	if isActive {
+		if err := m.writeConf(body); err != nil {
+			return nil, err
+		}
+	}
+
+	log.Printf("家宽订阅已更新[分组 %s]: %d 个节点, 手动选择组=%q, 顶层主组=%q",
+		groupID, len(info.nodes), info.nodeGroup, info.topGroup)
 	return info.nodes, nil
 }
 
-// Reload 重新拉取订阅，并在内核正在运行时重启它以加载新配置。
-func (m *Manager) Reload(subURL, proxy string) error {
-	if _, err := m.FetchSubscription(subURL, proxy); err != nil {
+// LoadGroup 把指定家宽分组加载为「当前生效」的配置：
+// 优先用本地已存的订阅原文，没有再联网拉一次。
+//
+// 已经有别的分组生效时会切换过去（重写 clash-config.yaml）。调用方负责
+// 在需要时重启内核 —— 本方法只管文件，不动进程。
+func (m *Manager) LoadGroup(groupID, subURL, proxy string) error {
+	if strings.TrimSpace(groupID) == "" {
+		return fmt.Errorf("缺少家宽分组 ID")
+	}
+
+	m.mu.Lock()
+	already := m.loadedGroup == groupID && len(m.nodes) > 0
+	m.mu.Unlock()
+	// 解析结果在内存里还不够，运行配置也得真的在磁盘上 ——
+	// restoreFromDisk 只恢复内存，不会重写 clash-config.yaml。
+	if already && m.HasConfig() {
+		return nil
+	}
+
+	body, err := m.readSub(groupID)
+	if err != nil {
+		// 本地没有缓存，联网拉一次（顺带把订阅原文落盘）。
+		// 注意拉完必须重新读一遍再往下走：FetchSubscription 只负责存文件，
+		// 生成运行配置是下面这段的事，直接 return 会留下「有订阅原文但没有
+		// 可运行配置」的状态，接着 Start 就会失败。
+		if _, ferr := m.FetchSubscription(groupID, subURL, proxy); ferr != nil {
+			return ferr
+		}
+		if body, err = m.readSub(groupID); err != nil {
+			return err
+		}
+	}
+
+	info := parseSubscription(string(body))
+	if len(info.nodes) == 0 {
+		return fmt.Errorf("订阅里没有 openvpn 节点（cfnew 的链接需要带 target=vg 参数）")
+	}
+	if err := m.writeConf(body); err != nil {
 		return err
 	}
-	if !m.IsRunning() {
+	m.mu.Lock()
+	m.loadedGroup = groupID
+	m.nodes = info.nodes
+	m.nodeGroup = info.nodeGroup
+	m.topGroup = info.topGroup
+	if m.nodeCounts == nil {
+		m.nodeCounts = map[string]int{}
+	}
+	m.nodeCounts[groupID] = len(info.nodes)
+	m.mu.Unlock()
+	log.Printf("家宽分组 %s 已加载 (%d 个节点)", groupID, len(info.nodes))
+	return nil
+}
+
+// readSub 读取某个分组的订阅原文。
+//
+// 找不到分组自己的文件时会回落到升级前的那份全局文件（clash-sub.yaml）：
+// 老用户升级上来时磁盘上只有那一份，能读到就不用再联网拉一次 ——
+// 而盒子刚开机时代理还没起来，联网拉订阅大概率失败，那就成死锁了。
+// 读到之后顺手复制到新文件名，下次直接命中。
+func (m *Manager) readSub(groupID string) ([]byte, error) {
+	b, err := os.ReadFile(filepath.Join(m.dataDir, subFileNameFor(groupID)))
+	if err == nil {
+		return b, nil
+	}
+	legacy, lerr := os.ReadFile(filepath.Join(m.dataDir, legacySubFileName))
+	if lerr != nil {
+		return nil, err
+	}
+	_ = os.WriteFile(filepath.Join(m.dataDir, subFileNameFor(groupID)), legacy, 0644)
+	log.Printf("家宽订阅原文沿用升级前的 %s（已复制给分组 %s）", legacySubFileName, groupID)
+	return legacy, nil
+}
+
+// writeConf 按订阅原文生成 mihomo 运行配置（只改顶层 7 个键，见 rewriteConfig）。
+func (m *Manager) writeConf(body []byte) error {
+	socksPort, httpPort := m.ports()
+	conf, err := rewriteConfig(string(body), socksPort, httpPort, ControlPort)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(m.dataDir, 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(m.dataDir, confFileName), []byte(conf), 0644)
+}
+
+// UnloadGroup 删除某个家宽分组留下的文件。
+//
+// 如果删掉的正是当前生效的那份，运行配置会一起清掉，并且必须让内核停下来 ——
+// 否则 mihomo 还在跑一份已经不存在的分组的配置，用户会一头雾水。
+func (m *Manager) UnloadGroup(groupID string) {
+	_ = os.Remove(filepath.Join(m.dataDir, subFileNameFor(groupID)))
+
+	m.mu.Lock()
+	wasActive := m.loadedGroup == groupID
+	if wasActive {
+		m.loadedGroup = ""
+		m.nodes = nil
+		m.nodeGroup = ""
+		m.topGroup = ""
+		m.activeName = ""
+	}
+	delete(m.nodeCounts, groupID)
+	m.mu.Unlock()
+
+	if !wasActive {
+		return
+	}
+	_ = os.Remove(filepath.Join(m.dataDir, confFileName))
+	if m.IsRunning() {
+		m.Stop()
+	}
+	log.Printf("家宽分组 %s 已删除，相关配置已清理", groupID)
+}
+
+// EnsureGroupSubs 为「本地还没有订阅原文」的家宽分组补拉一次。
+//
+// 什么时候会缺：从旧版本升级上来时，家宽地址是从配置里的 ClashSubURL 迁移
+// 出来的，而订阅原文（clash-sub-<分组ID>.yaml）要真拉过一次才有。不补的话，
+// 用户在侧栏点进这个分组会看到空列表 —— 而列表里没有节点就没法点任何一个来
+// 启用它，这个分组就永远启用不了。
+//
+// 已有原文的分组一律跳过：开机不该为每个分组都发一次网络请求。
+// 失败只记日志、不返回错误：用户随时可以点「更新全部」重来，没必要因此
+// 让启动流程报错。
+//
+// 会联网，调用方应放在后台 goroutine 里，别拖住代理启动。
+func (m *Manager) EnsureGroupSubs() {
+	if m.cfg == nil {
+		return
+	}
+	m.cfg.Lock()
+	type job struct{ id, name, url, proxy string }
+	jobs := make([]job, 0)
+	globalProxy := m.cfg.SubProxy
+	for _, g := range m.cfg.ClashGroups() {
+		if g.URL == "" {
+			continue
+		}
+		proxy := globalProxy
+		if g.SubProxy != "" {
+			proxy = g.SubProxy
+		}
+		jobs = append(jobs, job{id: g.ID, name: g.Name, url: g.URL, proxy: proxy})
+	}
+	m.cfg.Unlock()
+
+	for _, j := range jobs {
+		if _, err := os.Stat(filepath.Join(m.dataDir, subFileNameFor(j.id))); err == nil {
+			continue // 本地已有原文，交给「更新全部」按需刷新即可
+		}
+		if _, err := m.FetchSubscription(j.id, j.url, j.proxy); err != nil {
+			log.Printf("家宽分组[%s]订阅补拉失败: %v", j.name, err)
+			continue
+		}
+		log.Printf("家宽分组[%s]订阅已补齐", j.name)
+	}
+}
+
+// Reload 重新拉取指定分组的订阅，并在内核正在跑这个分组时重启它以加载新配置。
+//
+// 只刷新「当前生效」那个分组才会重启内核：mihomo 一次只加载一份配置，
+// 刷新别的分组只是把订阅原文存下来备用，重启一次要十几秒且毫无意义。
+func (m *Manager) Reload(groupID, subURL, proxy string) error {
+	if _, err := m.FetchSubscription(groupID, subURL, proxy); err != nil {
+		return err
+	}
+	if !m.IsRunning() || m.LoadedGroup() != groupID {
 		return nil
 	}
 	m.Stop()
@@ -447,16 +713,89 @@ func (m *Manager) Reload(subURL, proxy string) error {
 	return m.Start()
 }
 
-// loadParsedLocked 从磁盘上的订阅原文恢复解析结果。调用方必须持有 m.mu。
-func (m *Manager) loadParsedLocked() {
-	b, err := os.ReadFile(filepath.Join(m.dataDir, subFileName))
-	if err != nil {
+// ensureActiveConfig 确保「当前应当生效的家宽分组」的配置已就绪。
+func (m *Manager) ensureActiveConfig() error {
+	groupID, subURL, proxy := m.activeGroupInfo()
+	if groupID == "" {
+		return fmt.Errorf("还没有家宽订阅分组，请在左侧用「添加订阅分组」添加")
+	}
+	return m.LoadGroup(groupID, subURL, proxy)
+}
+
+// activeGroupInfo 读出当前应当生效的家宽分组的 ID / 订阅地址 / 订阅代理。
+// 三者都为空表示一个家宽分组都没有。
+func (m *Manager) activeGroupInfo() (groupID, subURL, proxy string) {
+	if m.cfg == nil {
+		return "", "", ""
+	}
+	m.cfg.Lock()
+	defer m.cfg.Unlock()
+	proxy = m.cfg.SubProxy
+	if g := m.cfg.ActiveClashGroup(); g != nil {
+		groupID, subURL = g.ID, g.URL
+		if g.SubProxy != "" {
+			proxy = g.SubProxy
+		}
+	}
+	return
+}
+
+// restoreFromDisk 从磁盘上的订阅原文恢复解析结果（只读文件，不联网）。
+//
+// 为什么需要它：进程刚起来时内存里没有任何解析结果，而界面每次刷新都会问
+// 「这个家宽分组有哪些节点」。不在这里恢复的话，重启后家宽分组会显示成空的，
+// 用户得手动点一次「更新」才出来 —— 这正是修掉的那个 bug。
+//
+// 顺带把所有家宽分组的节点数都统计出来：侧栏每个分组都要显示节点数，
+// 而只有「当前生效」那个的节点是加载在内存里的。
+//
+// 刻意不联网：本方法在启动时调用，不能因为上游不可达就把启动挂住。
+func (m *Manager) restoreFromDisk() {
+	m.mu.Lock()
+	if m.cfg == nil {
+		m.mu.Unlock()
 		return
 	}
-	info := parseSubscription(string(b))
-	m.nodes = info.nodes
-	m.nodeGroup = info.nodeGroup
-	m.topGroup = info.topGroup
+	m.mu.Unlock()
+
+	m.cfg.Lock()
+	groups := m.cfg.ClashGroups()
+	activeID := ""
+	if g := m.cfg.ActiveClashGroup(); g != nil {
+		activeID = g.ID
+	}
+	m.cfg.Unlock()
+	if len(groups) == 0 {
+		return
+	}
+
+	counts := make(map[string]int, len(groups))
+	var activeInfo subInfo
+	activeOK := false
+	for _, g := range groups {
+		body, err := m.readSub(g.ID)
+		if err != nil {
+			continue
+		}
+		info := parseSubscription(string(body))
+		counts[g.ID] = len(info.nodes)
+		if g.ID == activeID && len(info.nodes) > 0 {
+			activeInfo, activeOK = info, true
+		}
+	}
+
+	m.mu.Lock()
+	m.nodeCounts = counts
+	if activeOK && len(m.nodes) == 0 {
+		m.loadedGroup = activeID
+		m.nodes = activeInfo.nodes
+		m.nodeGroup = activeInfo.nodeGroup
+		m.topGroup = activeInfo.topGroup
+	}
+	m.mu.Unlock()
+	if activeOK {
+		log.Printf("已从磁盘恢复家宽分组 %s 的解析结果 (%d 个节点)", activeID, len(activeInfo.nodes))
+	}
 }
 
 // httpGet 拉取订阅。UA 伪装成 Clash 客户端 —— 部分订阅服务端按 UA 决定

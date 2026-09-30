@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
+	"time"
 )
 
 // 旧格式字段（仅用于迁移，不持久化）
@@ -54,7 +56,24 @@ type Group struct {
 	SubProxy  string `json:"subProxy"`  // 该分组的订阅代理（可选覆盖全局）
 	LastFetch string `json:"lastFetch"` // 上次拉取时间
 	Nodes     []Node `json:"nodes"`     // 该分组下的节点列表
+	// Kind 分组类型，见 GroupKind* 常量。
+	//
+	// 家宽订阅（Clash 格式）与普通订阅（vless/vmess 链接列表）是两种东西：
+	// 前者是一份完整配置（节点 + 策略组 + 分流规则），必须整个交给 mihomo 内核；
+	// 后者只是一串节点，解析后并入 xray 的节点池。
+	// 所以家宽分组的 Nodes 恒为空 —— 它的节点由 mihomo 管理，不放进这里，
+	// 免得混进 AllNodes() 被 xray 的故障转移当成候选节点。
+	Kind string `json:"kind,omitempty"`
 }
+
+// 分组类型。空串等价 GroupKindNormal，保持老配置向后兼容。
+const (
+	GroupKindNormal = ""      // 普通订阅：解析出 xray 节点
+	GroupKindClash  = "clash" // 家宽订阅：整份 Clash 配置交给 mihomo 内核
+)
+
+// IsClash 该分组是否为家宽订阅
+func (g *Group) IsClash() bool { return g.Kind == GroupKindClash }
 
 // Node 代理节点
 type Node struct {
@@ -105,17 +124,15 @@ type Config struct {
 	// 并靠 mihomo 的 dialer-proxy 做链式转发。xray 内核既没有 openvpn 出站、
 	// 也没有 dialer-proxy 的等价能力，所以这部分必须交给 mihomo 内核跑。
 	//
-	// 四个字段的分工：
-	//   ClashSubURL —— 订阅地址。为空表示完全未启用家宽功能，此时行为与旧版一致。
-	//   ClashNodes  —— 从订阅里扫出来的家宽节点名，缓存下来供界面展示与切换。
-	//                  家宽节点不由本程序管理，所以只存名字，不建 Node 结构。
+	//   ClashSubURL —— 【已废弃，仅用于读取老配置】早期家宽地址只能填在设置面板里，
+	//                  现在改成普通订阅分组（Group.Kind = clash）承载。
+	//                  Load() 会把老值迁移成分组，之后这个字段恒为空。
 	//   Kernel      —— 当前实际在跑的内核。"xray"（空值等价）或 "mihomo"。
 	//                  两个内核监听同样的端口，因此同一时刻只能跑一个。
-	//   ClashNode   —— 家宽模式下当前选中的节点名。
-	ClashSubURL string   `json:"clashSubUrl,omitempty"`
-	ClashNodes  []string `json:"clashNodes,omitempty"`
-	Kernel      string   `json:"kernel,omitempty"`
-	ClashNode   string   `json:"clashNode,omitempty"`
+	//   ClashNode   —— 家宽模式下当前选中的节点名（配合 ActiveGrp 定位到具体分组）。
+	ClashSubURL string `json:"clashSubUrl,omitempty"`
+	Kernel      string `json:"kernel,omitempty"`
+	ClashNode   string `json:"clashNode,omitempty"`
 	path        string
 	dirty       bool // 存在未落盘的高频改动（如测速结果），由后台 Flush 合并写入
 }
@@ -261,7 +278,47 @@ func Load(path string) (*Config, error) {
 	}
 
 	c.EnsureDefaultGroup()
+	// 家宽地址迁移：早期家宽订阅只能填在设置面板里（ClashSubURL），
+	// 现在改成普通订阅分组承载。老配置在第一次加载时自动转过去。
+	if c.ClashSubURL != "" {
+		c.MigrateClashSubURL()
+	}
 	return c, nil
+}
+
+// MigrateClashSubURL 把废弃的 ClashSubURL 转成家宽分组，并清空该字段。
+//
+// 为什么要单独做迁移：用户已经填过的地址不能让他重填一遍。
+// 如果他还手动建过一个同地址的普通分组（很常见 —— 填进设置面板之前
+// 都会先在「添加订阅分组」里试一下），就把那个分组直接转正，
+// 免得侧栏里出现两个地址一模一样的条目。
+//
+// 调用方需持有 c 的锁。
+func (c *Config) MigrateClashSubURL() {
+	url := c.ClashSubURL
+	c.ClashSubURL = ""
+	if url == "" {
+		return
+	}
+	for i := range c.Groups {
+		if c.Groups[i].URL != url {
+			continue
+		}
+		// 同地址的已有分组直接转正。清掉 Nodes：家宽分组的节点由 mihomo 管，
+		// 之前误解析出来的空列表留着只会让人困惑。
+		c.Groups[i].Kind = GroupKindClash
+		c.Groups[i].Nodes = nil
+		fmt.Printf("家宽订阅已迁移到已有分组[%s]\n", c.Groups[i].Name)
+		_ = c.Save()
+		return
+	}
+	c.Groups = append(c.Groups, Group{
+		ID:   fmt.Sprintf("%d", time.Now().UnixNano()),
+		Name: "家宽", URL: url, Kind: GroupKindClash,
+		Nodes: []Node{},
+	})
+	fmt.Printf("家宽订阅已迁移为新分组[家宽]\n")
+	_ = c.Save()
 }
 
 func (c *Config) Save() error {
@@ -335,22 +392,66 @@ func (c *Config) Restore(other *Config) {
 	c.AutoFailover = other.AutoFailover
 	c.Groups = other.Groups
 
-	// 家宽字段同样整体拷贝：ClashSubURL 为空即"未启用家宽"，
+	// 家宽字段同样整体拷贝：Kernel / ClashNode 为空都是合法状态，
 	// 不能套用 pickS 之类的"空值回落默认"，否则导入一份不含家宽的备份
-	// 会被静默改回某个默认订阅地址。
+	// 会被静默改回某个默认值。
 	c.ClashSubURL = other.ClashSubURL
-	c.ClashNodes = other.ClashNodes
 	c.Kernel = other.Kernel
 	c.ClashNode = other.ClashNode
 
 	c.EnsureDefaultGroup()
+	// 导入的可能是旧版备份（家宽地址还在 ClashSubURL 里），一并迁移
+	if c.ClashSubURL != "" {
+		c.MigrateClashSubURL()
+	}
 }
 
 // --- 家宽相关辅助 ---
 
-// ClashEnabled 是否配置了家宽订阅。调用方需持有 c 的锁。
+// ClashEnabled 是否配置了家宽订阅（存在任意一个家宽分组）。
+// 调用方需持有 c 的锁。
 func (c *Config) ClashEnabled() bool {
-	return c.ClashSubURL != ""
+	return len(c.ClashGroups()) > 0
+}
+
+// ClashGroups 返回所有家宽分组（副本，调用方可安全持有）。
+// 调用方需持有 c 的锁。
+func (c *Config) ClashGroups() []Group {
+	var out []Group
+	for _, g := range c.Groups {
+		if g.IsClash() {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+// FindClashGroup 按 ID 找家宽分组，找不到返回 nil。
+// 返回的是切片内元素的指针，调用方需持有 c 的锁。
+func (c *Config) FindClashGroup(id string) *Group {
+	for i := range c.Groups {
+		if c.Groups[i].ID == id && c.Groups[i].IsClash() {
+			return &c.Groups[i]
+		}
+	}
+	return nil
+}
+
+// ActiveClashGroup 返回当前应当生效的家宽分组。
+//
+// 优先用 ActiveGrp 定位 —— 用户点了哪个分组里的节点，就该用哪份配置；
+// 该分组已被删除或还没选过时，回落到第一个家宽分组。
+// 一个都没有时返回 nil。调用方需持有 c 的锁。
+func (c *Config) ActiveClashGroup() *Group {
+	if g := c.FindClashGroup(c.ActiveGrp); g != nil {
+		return g
+	}
+	for i := range c.Groups {
+		if c.Groups[i].IsClash() {
+			return &c.Groups[i]
+		}
+	}
+	return nil
 }
 
 // CurrentKernel 返回当前应当运行的内核，只可能是 "xray" 或 "mihomo"。
@@ -372,9 +473,33 @@ const (
 // ClashNodeIDPrefix 家宽节点在界面上的 ID 前缀。
 //
 // 家宽节点由 mihomo 管理，本程序没有它们的 Node 结构，但界面切换节点
-// 走的是统一的 /api/node/{id} 接口。给家宽节点造一个 "clash:<节点名>" 形式的
-// ID，服务端按前缀分流即可，前端无需为家宽单独写一套切换逻辑。
+// 走的是统一的 /api/node/{id} 接口。给家宽节点造一个
+// "clash:<分组ID>:<节点名>" 形式的 ID，服务端按前缀分流即可，
+// 前端无需为家宽单独写一套切换逻辑。
+//
+// 为什么要把分组 ID 编进 ID 里：家宽分组可以有好几个，而 mihomo 同一时刻
+// 只加载其中一份配置。点节点时必须知道它属于哪个分组，才能先把对应配置加载好。
+// 分组 ID 是纯数字（UnixNano），不含冒号，所以按第一个冒号切分即可还原。
 const ClashNodeIDPrefix = "clash:"
 
-// ClashGroupID 家宽分组的虚拟 ID，用于在分组列表里展示家宽节点。
-const ClashGroupID = "__clash__"
+// ClashNodeID 拼一个家宽节点的界面 ID
+func ClashNodeID(groupID, name string) string {
+	return ClashNodeIDPrefix + groupID + ":" + name
+}
+
+// ParseClashNodeID 拆解家宽节点 ID，返回分组 ID 与节点名。
+// 不是家宽 ID 时 ok 为 false。
+func ParseClashNodeID(id string) (groupID, name string, ok bool) {
+	if len(id) <= len(ClashNodeIDPrefix) || id[:len(ClashNodeIDPrefix)] != ClashNodeIDPrefix {
+		return "", "", false
+	}
+	rest := id[len(ClashNodeIDPrefix):]
+	i := strings.IndexByte(rest, ':')
+	// 分组 ID 不能为空。空 ID 会让调用方静默回落到「默认家宽分组」，
+	// 于是用户点的是 B 分组的节点，实际加载的却是 A 分组的配置 ——
+	// 界面显示与真实出口对不上，且没有任何报错可查。
+	if i <= 0 {
+		return "", "", false
+	}
+	return rest[:i], rest[i+1:], true
+}

@@ -3,6 +3,7 @@ package subscription
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -83,6 +84,9 @@ func FetchAll(cfg *config.Config) {
 		if g.URL == "" {
 			continue // 手动节点分组跳过
 		}
+		if g.IsClash() {
+			continue // 家宽分组的刷新由 mihomo 内核那条路负责，不走这里
+		}
 		proxy := cfg.SubProxy
 		if g.SubProxy != "" {
 			proxy = g.SubProxy
@@ -144,6 +148,23 @@ func FetchGroup(cfg *config.Config, groupID string) {
 		proxy = g.SubProxy
 	}
 	nodes, err := fetchOne(*g, proxy)
+	if errors.Is(err, ErrIsClashSub) {
+		// 这是家宽订阅。把它标记成家宽分组，节点交给 mihomo 内核 ——
+		// 本程序没有这些节点的 Node 结构，硬塞进来还会被 xray 的故障转移
+		// 当成候选节点（那是另一套协议，切过去必然连不上）。
+		cfg.Lock()
+		for i := range cfg.Groups {
+			if cfg.Groups[i].ID == groupID {
+				cfg.Groups[i].Kind = config.GroupKindClash
+				cfg.Groups[i].Nodes = nil
+				break
+			}
+		}
+		_ = cfg.Save()
+		cfg.Unlock()
+		log.Printf("FetchGroup: 分组[%s]识别为家宽(Clash)订阅，已交给 mihomo 内核", g.Name)
+		return
+	}
 	if err != nil {
 		log.Printf("FetchGroup: 分组[%s]拉取失败: %v", g.Name, err)
 		return
@@ -181,6 +202,27 @@ func FetchGroup(cfg *config.Config, groupID string) {
 	log.Printf("FetchGroup: 分组[%s]拉取到%d个节点", g.Name, len(nodes))
 }
 
+// ErrIsClashSub 表示拉回来的不是节点列表，而是一份 Clash 家宽配置。
+//
+// 家宽订阅（cfnew 的 target=vg 链接）是一份完整 Clash 配置，节点类型是 openvpn，
+// 必须整份交给 mihomo 内核跑，普通解析器对它无能为力。识别出来后由 FetchGroup
+// 把分组标记成家宽类型，后续刷新就只走内核那条路了。
+var ErrIsClashSub = errors.New("这是 Clash 家宽订阅，已交给 mihomo 内核")
+
+// looksLikeClashVPN 判断订阅原文是不是 cfnew 那种「家宽」Clash 配置。
+//
+// 判据取两条同时成立：顶层有 proxies: 段，且里面出现了 type: openvpn。
+// 只看 proxies: 不够 —— 普通 Clash 机场订阅也有这一段，但它们的节点是
+// vless/vmess，本程序解析不了，得给用户一句明确的说明而不是静默 0 个节点。
+func looksLikeClashVPN(raw string) bool {
+	return strings.Contains(raw, "proxies:") && strings.Contains(raw, "type: openvpn")
+}
+
+// looksLikeClash 判断订阅原文是不是任意 Clash 配置（用于给出更准确的错误提示）
+func looksLikeClash(raw string) bool {
+	return strings.Contains(raw, "proxies:") && strings.Contains(raw, "proxy-groups:")
+}
+
 func fetchOne(g config.Group, proxyURL string) ([]config.Node, error) {
 	transport := &http.Transport{}
 	if proxyURL != "" {
@@ -205,6 +247,14 @@ func fetchOne(g config.Group, proxyURL string) ([]config.Node, error) {
 		previewLen = 100
 	}
 	log.Printf("fetchOne[%s]: 原始响应前%d字节: %q", g.Name, previewLen, raw[:previewLen])
+
+	// 家宽订阅：整份 Clash 配置，交给 mihomo 内核，不走下面的节点解析
+	if looksLikeClashVPN(raw) {
+		return nil, ErrIsClashSub
+	}
+	if looksLikeClash(raw) {
+		return nil, fmt.Errorf("这是 Clash 格式订阅，但里面没有家宽(openvpn)节点；本程序只支持 cfnew 的家宽订阅（链接需带 target=vg）")
+	}
 
 	// 支持 Xray JSON 订阅
 	if jnodes, ok := parseXrayJSON(raw); ok {

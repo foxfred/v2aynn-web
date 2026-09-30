@@ -270,17 +270,19 @@ body{font-family:system-ui,sans-serif;background:var(--bg-body);color:var(--text
 <div class="st-full"><label class="ck"><input type="checkbox" id="setFailover">节点连续失败时，自动切换到其他可用节点</label></div>
 <div class="st-full"><label>全局订阅代理（HTTP代理，可选）</label><input id="setSubProxy" placeholder="http://127.0.0.1:7890"></div>
 <div class="st-full"><label>测速URL（用于真实测速）</label><input id="setSpeedURL" placeholder="https://speed.cloudflare.com/__down?bytes=2000000"></div>
-<div class="st-full"><label>家宽订阅地址（Clash 格式，留空即关闭家宽功能）</label><input id="setClashSub" placeholder="https://.../sub?target=vg"></div>
-<div class="st-full" id="clashRow" style="display:none;font-size:12px;color:var(--text-muted)">
-<span id="clashInfo"></span>
-<button class="btn" onclick="refreshClash(this)">刷新家宽订阅</button>
+<div class="st-full" style="font-size:12px;color:var(--text-muted);line-height:1.85;border-top:1px solid var(--border-subtle);padding-top:8px;margin-bottom:9px">
+<b>家宽订阅不在这里配置。</b>请用左侧「订阅分组」栏的 <b>+</b> 按钮添加，填法和普通订阅一样：名称 + 链接。<br>
+· cfnew 的家宽链接要带 <code>target=vg</code> 参数，程序会自己认出它是家宽订阅。<br>
+· 家宽走 mihomo 内核，与普通节点的 xray 内核不是同一个，两者不会同时运行；点任意普通节点会自动切回 xray。<br>
+· 家宽分组可以加多个，但同一时刻只有一份配置生效；切换分组时内核会重启一次（十几秒）。<br>
+· 点分组里任意一个节点即可启用，首次启用要十几秒。<span id="clashNoteCount"></span>
 </div>
 <div class="st-full"><label>配置备份 / 恢复</label>
 <button class="btn" onclick="backupCfg()">导出配置</button>
 <button class="btn" onclick="document.getElementById('restoreFile').click()">导入配置</button>
 <input type="file" id="restoreFile" accept=".json,application/json" style="display:none" onchange="restoreCfg(this)">
 </div>
-<div class="st-full st-ft">提示：订阅刷新间隔修改后立即生效，设为 0 即禁用自动刷新（服务启动时仍会拉取一次订阅，用于校验节点有效性）。修改端口 / 监听地址 / 代理模式后，代理会自动重启以应用新配置；若修改了 Web 端口，需重启系统服务后生效。<br>家宽订阅是 Clash 格式，需要 mihomo 内核（与普通节点用的 xray 内核不是同一个，两个内核不会同时运行）。填好地址保存后，左侧会出现「家宽节点」分组，点其中一个即可启用，首次启用要十几秒。之后点任意普通节点会自动切回 xray。</div>
+<div class="st-full st-ft">提示：订阅刷新间隔修改后立即生效，设为 0 即禁用自动刷新（服务启动时仍会拉取一次订阅，用于校验节点有效性）。修改端口 / 监听地址 / 代理模式后，代理会自动重启以应用新配置；若修改了 Web 端口，需重启系统服务后生效。</div>
 </div>
 <div><button class="btn st" onclick="saveSettings()">保存</button><button class="btn" onclick="closeModal('settingsModal')">取消</button></div>
 </div>
@@ -323,10 +325,11 @@ async function loadGroups(){
   el.innerHTML=groups.map(g=>{
     const isActive=g.id===curGrp;
     const isDefault=g.id==='__default__';
-    // 家宽分组的节点由 mihomo 内核管理，没有订阅 URL，也不支持编辑
+    // 家宽分组的节点由 mihomo 内核管理，但订阅地址、改名、删除都和普通分组一样，
+    // 所以「编辑」按钮照常给 —— 它就是一个带 url 的普通分组。
     const isClash=g.clash===true;
-    const editBtn=(!isDefault&&!isClash&&g.url)?'<span class="gact" onclick="event.stopPropagation();editGroup(\''+g.id+'\')">编辑</span>':'';
-    const subText=isClash?'mihomo 内核':(g.url?esc(g.url).substring(0,30)+'...':'无订阅');
+    const editBtn=(!isDefault&&g.url)?'<span class="gact" onclick="event.stopPropagation();editGroup(\''+g.id+'\')">编辑</span>':'';
+    const subText=isClash?('家宽 · '+esc(g.url||'').substring(0,22)):(g.url?esc(g.url).substring(0,30)+'...':'无订阅');
     return '<div class="gi'+(isActive?' ac':'')+'" onclick="selectGroup(\''+g.id+'\')"><div class="gn"><div class="gnm">'+esc(g.name)+'</div><div class="gns">'+subText+'</div></div><span class="gcnt">'+g.nodeCount+'</span>'+editBtn+'</div>'
   }).join('');
   if(!curGrp&&groups.length>0)selectGroup(groups[0].id);
@@ -348,7 +351,7 @@ async function selectGroup(id){
   // 它们来自订阅，不是本程序管理的节点
   const pgBtn=document.getElementById('pingGrpBtn');
   if(pgBtn){pgBtn.disabled=false;pgBtn.title=isClashGrp?'家宽节点测速较慢：每个节点都要现场建立隧道，整组可能一两分钟':''}
-  if(!nodes.length){el.innerHTML='<div class="empty">'+(isClashGrp?'还没有家宽节点，请在设置里填写家宽订阅地址':'暂无节点')+'</div>';return}
+  if(!nodes.length){el.innerHTML='<div class="empty">'+(isClashGrp?'还没有家宽节点。请点右上角「更新全部」重新拉取；若仍为空，检查链接是否带 target=vg':'暂无节点')+'</div>';return}
   el.innerHTML=nodes.map(n=>{
     const isClash=n.id.indexOf('clash:')===0;
     const pc=n.ping<0?'var(--danger)':'var(--text-muted)';
@@ -375,11 +378,16 @@ function showAddGroup(){document.getElementById('addGroupModal').classList.add('
 async function addGroup(){
   const name=document.getElementById('gn').value.trim(),url=document.getElementById('gu').value.trim(),proxy=document.getElementById('gp').value.trim();
   if(!name||!url)return;
-  await api('POST','/api/group/add',{name,url,subProxy:proxy});
+  const r=await api('POST','/api/group/add',{name,url,subProxy:proxy});
   document.getElementById('gn').value='';document.getElementById('gu').value='';document.getElementById('gp').value='';
   closeModal('addGroupModal');
   await loadGroups();
-  setTimeout(()=>fetchGroup(curGrp),200);
+  if(!r||!r.id)return;
+  curGrp=r.id;
+  await selectGroup(r.id);
+  // 拉取在后台跑：普通订阅解析节点；家宽订阅还要交给 mihomo 内核再拉一遍
+  // （订阅原文要落到内核目录里，节点数才算得出来）。稍后再刷一次让它显示出来。
+  setTimeout(async()=>{await loadGroups();if(curGrp===r.id)selectGroup(r.id)},4000);
 }
 
 // 删除分组
@@ -402,7 +410,9 @@ async function refreshAll(){
 // 测速当前分组
 async function pingGroup(){
   if(!curGrp)return;
-  const isClash=curGrp==='__clash__';
+  // 家宽分组的测速由内核并发做，比普通节点慢得多，按钮文案要区分开
+  const grp=groups.find(g=>g.id===curGrp);
+  const isClash=!!(grp&&grp.clash);
   const btn=document.getElementById('pingGrpBtn');
   if(btn){btn.disabled=true;btn.textContent=isClash?'测速中(较慢)…':'测速中...'}
   const r=await api('POST','/api/ping/group/'+curGrp);
@@ -512,22 +522,12 @@ async function showSettings(){
     document.getElementById('setSubProxy').value=s.subProxy||'';
     document.getElementById('setSpeedURL').value=s.speedURL||'';
     document.getElementById('setFailover').checked=(s.autoFailover!==false);
-    document.getElementById('setClashSub').value=s.clashSubUrl||'';
-    const hasClash=!!s.clashSubUrl;
-    document.getElementById('clashRow').style.display=hasClash?'block':'none';
-    if(hasClash)document.getElementById('clashInfo').textContent='已缓存 '+(s.clashNodeCount||0)+' 个家宽节点　';
+    // 家宽订阅已经改从「添加订阅分组」进，这里只报一下当前有几个家宽分组，
+    // 免得用户在设置里找不到家宽入口时以为是程序坏了
+    const n=s.clashGroupCount||0;
+    document.getElementById('clashNoteCount').textContent=n?'（当前已有 '+n+' 个家宽分组）':'';
   }catch(e){}
   document.getElementById('settingsModal').classList.add('show');
-}
-
-// 手动刷新家宽订阅（不改任何设置，只重新拉一次）
-async function refreshClash(btn){
-  if(btn){btn.disabled=true;btn.textContent='刷新中...'}
-  const r=await api('POST','/api/clash/fetch');
-  if(btn){btn.disabled=false;btn.textContent='刷新家宽订阅'}
-  if(r.error){alert('刷新失败: '+r.error);return}
-  document.getElementById('clashInfo').textContent='已缓存 '+r.count+' 个家宽节点　';
-  loadGroups();
 }
 
 async function saveSettings(){
@@ -550,23 +550,12 @@ async function saveSettings(){
     proxyMode:document.getElementById('setMode').value,
     subProxy:document.getElementById('setSubProxy').value.trim(),
     speedURL:document.getElementById('setSpeedURL').value.trim()||'https://speed.cloudflare.com/__down?bytes=2000000',
-    autoFailover:document.getElementById('setFailover').checked,
-    clashSubUrl:document.getElementById('setClashSub').value.trim()
+    autoFailover:document.getElementById('setFailover').checked
   };
   const r=await api('POST','/api/settings',b);
   closeModal('settingsModal');
   if(r.error){alert('保存失败: '+r.error);return}
-  // 家宽地址刚变过时，拉取结果单独反馈：拉不到就直说，别让用户以为已经配好了
-  if(r.clashError){alert('设置已保存，但家宽订阅拉取失败：'+r.clashError);return}
-  if(b.clashSubUrl&&r.clashNodeCount!==undefined){
-    alert('设置已保存。家宽订阅共 '+r.clashNodeCount+' 个节点，在左侧「家宽节点」分组里点一个即可启用。');
-    curGrp='';loadGroups();
-  }else if(!b.clashSubUrl){
-    alert('设置已保存，家宽功能已关闭');
-    loadGroups();
-  }else{
-    alert('设置已保存，代理配置已应用');
-  }
+  alert('设置已保存，代理配置已应用');
 }
 
 // 配置备份 / 恢复
