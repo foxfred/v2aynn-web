@@ -209,8 +209,9 @@ func TestClashNodesList(t *testing.T) {
 	}
 }
 
-// 家宽节点不支持本程序的 TCP 探测，必须明确返回 unsupported 而不是伪装成超时
-func TestPingClashNodeUnsupported(t *testing.T) {
+// 家宽节点的测速由 mihomo 内核代劳（本程序的 TCP 探测对 OpenVPN 隧道没意义）。
+// 内核没跑起来时，接口必须如实报错并给出 ms=-1，让界面显示「超时」而不是假装成功。
+func TestPingClashNodeWithoutKernel(t *testing.T) {
 	s, _, _ := newClashTestServer(t)
 	req := httptest.NewRequest("POST", "/api/ping/x", nil)
 	req.SetPathValue("id", config.ClashNodeIDPrefix+"🏠 JP-家宽-01")
@@ -218,14 +219,41 @@ func TestPingClashNodeUnsupported(t *testing.T) {
 	s.apiPing(rec, req)
 
 	var resp struct {
-		MS          int  `json:"ms"`
-		Unsupported bool `json:"unsupported"`
+		ID    string `json:"id"`
+		MS    int    `json:"ms"`
+		Error string `json:"error"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("解析响应失败: %v", err)
 	}
-	if !resp.Unsupported || resp.MS != -1 {
-		t.Errorf("家宽节点探测响应异常: %+v", resp)
+	if resp.MS != -1 {
+		t.Errorf("内核不可用时 ms 应为 -1, 得到 %d", resp.MS)
+	}
+	if resp.Error == "" {
+		t.Error("内核不可用时应当返回 error，方便用户排查")
+	}
+	if resp.ID != config.ClashNodeIDPrefix+"🏠 JP-家宽-01" {
+		t.Errorf("返回的 id 必须原样带回（界面靠它定位行）: %q", resp.ID)
+	}
+}
+
+// 整组测速走的是另一条路径：内核不可用时不能 panic，也不能返回 200 空结果，
+// 必须让界面能区分「全都不通」和「内核没起来」。
+func TestPingClashGroupWithoutKernel(t *testing.T) {
+	s, _, _ := newClashTestServer(t)
+	req := httptest.NewRequest("POST", "/api/ping/group/"+config.ClashGroupID, nil)
+	req.SetPathValue("id", config.ClashGroupID)
+	rec := httptest.NewRecorder()
+	s.apiPingGroup(rec, req)
+
+	var resp struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if resp.Error == "" {
+		t.Error("内核不可用时整组测速应当返回 error")
 	}
 }
 

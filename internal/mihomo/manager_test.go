@@ -1,6 +1,8 @@
 package mihomo
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -349,5 +351,179 @@ func TestParseRealSubscription(t *testing.T) {
 	if n := strings.Count(out, "dialer-proxy:"); n != strings.Count(string(b), "dialer-proxy:") {
 		t.Errorf("dialer-proxy 数量变化: %d -> %d",
 			strings.Count(string(b), "dialer-proxy:"), n)
+	}
+}
+
+// --- 以下是家宽节点测速相关测试 ---
+//
+// 家宽节点的延迟必须由 mihomo 内核来测（本程序的 TCP 探测只能探到 CF 前置节点，
+// 反映不出 OpenVPN 隧道是否可用）。这里用假 external-controller 覆盖客户端逻辑。
+
+// newFakeKernel 造一个假的 external-controller，并把管理器的控制地址指过去。
+func newFakeKernel(t *testing.T, handler http.HandlerFunc) *Manager {
+	t.Helper()
+	fake := httptest.NewServer(handler)
+	t.Cleanup(fake.Close)
+
+	m := NewManager(t.TempDir())
+	m.mu.Lock()
+	m.nodes = []string{"🏠 JP-家宽-01", "🏠 KR-家宽-01"}
+	m.nodeGroup = "🏠 家宽节点"
+	m.topGroup = "🚀 节点选择"
+	m.ctrlAddr = strings.TrimPrefix(fake.URL, "http://")
+	m.mu.Unlock()
+	return m
+}
+
+// 读内核缓存：内核记了历史就照实返回，没测过的节点不出现在结果里。
+func TestProxyDelaysReadsKernelHistory(t *testing.T) {
+	m := newFakeKernel(t, func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/proxies" {
+			t.Errorf("路径 = %q, 期望 /proxies", r.URL.Path)
+		}
+		_, _ = rw.Write([]byte(`{"proxies":{
+			"🏠 JP-家宽-01":{"type":"OpenVPN","name":"🏠 JP-家宽-01","alive":true,
+				"history":[{"time":"2026-09-30T20:00:00Z","delay":1500},{"time":"2026-09-30T20:01:00Z","delay":1200}]},
+			"🏠 KR-家宽-01":{"type":"OpenVPN","name":"🏠 KR-家宽-01","alive":false,
+				"history":[{"time":"2026-09-30T20:01:00Z","delay":0}]},
+			"🏠 家宽节点":{"type":"Selector","name":"🏠 家宽节点","alive":true},
+			"优选域名-01":{"type":"Vless","name":"优选域名-01","alive":true,
+				"history":[{"time":"2026-09-30T20:01:00Z","delay":42}]}
+		}}`))
+	})
+
+	got := m.ProxyDelays()
+	if got["🏠 JP-家宽-01"] != 1200 {
+		t.Errorf("JP 延迟 = %d, 期望取最后一次 1200", got["🏠 JP-家宽-01"])
+	}
+	if v, ok := got["🏠 KR-家宽-01"]; !ok || v != 0 {
+		t.Errorf("KR 应当返回 0（测过但不通），得到 %v/%v", v, ok)
+	}
+	// 策略组和普通节点都不是家宽节点，不能污染界面
+	if _, ok := got["🏠 家宽节点"]; ok {
+		t.Error("策略组不应出现在家宽节点延迟里")
+	}
+	if _, ok := got["优选域名-01"]; ok {
+		t.Error("非家宽节点不应出现在家宽节点延迟里")
+	}
+}
+
+// 内核没跑（端口不通）时必须安静地返回 nil，不能 panic、不能报错刷屏
+func TestProxyDelaysSilentWhenKernelDown(t *testing.T) {
+	m := NewManager(t.TempDir())
+	m.mu.Lock()
+	m.nodes = []string{"🏠 JP-家宽-01"}
+	m.ctrlAddr = "127.0.0.1:1" // 几乎必然连不上
+	m.mu.Unlock()
+
+	if got := m.ProxyDelays(); got != nil {
+		t.Errorf("内核不可用时应返回 nil, 得到 %v", got)
+	}
+}
+
+// 单节点测速：内核返回 delay 就照实转成毫秒
+func TestProxyDelayOK(t *testing.T) {
+	var gotQuery string
+	m := newFakeKernel(t, func(rw http.ResponseWriter, r *http.Request) {
+		// 节点名带 emoji 和空格，必须正确转义后再拼进路径
+		if r.URL.Path != "/proxies/🏠 JP-家宽-01/delay" {
+			t.Errorf("路径 = %q", r.URL.Path)
+		}
+		gotQuery = r.URL.RawQuery
+		_, _ = rw.Write([]byte(`{"delay":1234}`))
+	})
+
+	ms, err := m.ProxyDelay("🏠 JP-家宽-01", 8000)
+	if err != nil {
+		t.Fatalf("测速失败: %v", err)
+	}
+	if ms != 1234 {
+		t.Errorf("延迟 = %d, 期望 1234", ms)
+	}
+	if !strings.Contains(gotQuery, "timeout=8000") {
+		t.Errorf("超时未透传: %q", gotQuery)
+	}
+	if !strings.Contains(gotQuery, "generate_204") {
+		t.Errorf("测速地址不对: %q", gotQuery)
+	}
+}
+
+// 测不通时内核返回 4xx + message，必须把 message 原样带出来给用户看
+func TestProxyDelayReportsKernelMessage(t *testing.T) {
+	m := newFakeKernel(t, func(rw http.ResponseWriter, r *http.Request) {
+		rw.WriteHeader(http.StatusRequestTimeout)
+		_, _ = rw.Write([]byte(`{"message":"An error occurred in the delay test"}`))
+	})
+
+	ms, err := m.ProxyDelay("🏠 JP-家宽-01", 8000)
+	if err == nil {
+		t.Fatal("测不通时必须返回 error")
+	}
+	if ms != 0 {
+		t.Errorf("失败时延迟应为 0, 得到 %d", ms)
+	}
+	if !strings.Contains(err.Error(), "delay test") {
+		t.Errorf("内核给的原因被吞掉了: %v", err)
+	}
+}
+
+// 内核返回 200 但 delay<=0（节点无响应）也要当成失败，不能显示成「0ms」
+func TestProxyDelayZeroMeansUnreachable(t *testing.T) {
+	m := newFakeKernel(t, func(rw http.ResponseWriter, r *http.Request) {
+		_, _ = rw.Write([]byte(`{"delay":0}`))
+	})
+
+	if _, err := m.ProxyDelay("🏠 JP-家宽-01", 8000); err == nil {
+		t.Error("delay=0 应当视为无响应")
+	}
+}
+
+// 整组测速：内核返回的是 map，非家宽节点要被过滤掉
+func TestGroupDelayFiltersNonClashNodes(t *testing.T) {
+	m := newFakeKernel(t, func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/group/🏠 家宽节点/delay" {
+			t.Errorf("路径 = %q", r.URL.Path)
+		}
+		_, _ = rw.Write([]byte(`{
+			"🏠 JP-家宽-01":1800,
+			"🏠 KR-家宽-01":0,
+			"优选域名-01":42
+		}`))
+	})
+
+	got, err := m.GroupDelay("🏠 家宽节点", 8000)
+	if err != nil {
+		t.Fatalf("整组测速失败: %v", err)
+	}
+	if got["🏠 JP-家宽-01"] != 1800 {
+		t.Errorf("JP 延迟 = %d, 期望 1800", got["🏠 JP-家宽-01"])
+	}
+	if v, ok := got["🏠 KR-家宽-01"]; !ok || v != 0 {
+		t.Errorf("KR 应当保留 0 值（表示测不通）: %v/%v", v, ok)
+	}
+	if _, ok := got["优选域名-01"]; ok {
+		t.Error("非家宽节点混进了整组测速结果")
+	}
+}
+
+// 没识别出手动选择组时（比如订阅格式变了）要明确报错，而不是默默返回空结果
+func TestGroupDelayWithoutNodeGroup(t *testing.T) {
+	m := newFakeKernel(t, func(rw http.ResponseWriter, r *http.Request) {
+		t.Error("组名为空时不应发起请求")
+	})
+	m.mu.Lock()
+	m.nodeGroup = ""
+	m.mu.Unlock()
+
+	if _, err := m.GroupDelay("", 8000); err == nil {
+		t.Error("组名为空时必须报错")
+	}
+}
+
+// NodeGroup 要能安全并发读（界面每次刷新都会调）
+func TestNodeGroupAccessor(t *testing.T) {
+	m := newFakeKernel(t, func(rw http.ResponseWriter, r *http.Request) {})
+	if got := m.NodeGroup(); got != "🏠 家宽节点" {
+		t.Errorf("NodeGroup() = %q", got)
 	}
 }

@@ -344,17 +344,17 @@ async function selectGroup(id){
   const isClashGrp=!!(grp&&grp.clash);
   document.getElementById('grpName').textContent=grp?grp.name:'节点';
   document.getElementById('delGrpBtn').style.display=(grp&&grp.url)?'inline-block':'none';
-  // 家宽节点由 mihomo 内核自己测延迟并自动切换，本程序的 TCP 探测对它没有意义
+  // 家宽节点由内核测延迟（本程序的 TCP 探测对隧道没意义），但没有「删除」——
+  // 它们来自订阅，不是本程序管理的节点
   const pgBtn=document.getElementById('pingGrpBtn');
-  if(pgBtn){pgBtn.disabled=isClashGrp;pgBtn.title=isClashGrp?'家宽节点由内核自动选择，无需手动测速':''}
+  if(pgBtn){pgBtn.disabled=false;pgBtn.title=isClashGrp?'家宽节点测速较慢：每个节点都要现场建立隧道，整组可能一两分钟':''}
   if(!nodes.length){el.innerHTML='<div class="empty">'+(isClashGrp?'还没有家宽节点，请在设置里填写家宽订阅地址':'暂无节点')+'</div>';return}
   el.innerHTML=nodes.map(n=>{
-    // 家宽节点没有 server/port，也不支持本程序的测速与删除
     const isClash=n.id.indexOf('clash:')===0;
     const pc=n.ping<0?'var(--danger)':'var(--text-muted)';
     const p=n.ping>0?n.ping+'ms':(n.ping<0?'超时':'');
-    const meta=isClash?'住宅宽带出口 · 内核自动测速':(esc(n.server)+':'+esc(n.port));
-    const acts=isClash?'':'<button class="btn" onclick="event.stopPropagation();pingNode(\''+n.id+'\')">测速</button><button class="btn" style="margin-left:3px;color:var(--danger)" onclick="event.stopPropagation();delNode(\''+n.id+'\')">删除</button>';
+    const meta=isClash?'住宅宽带出口 · 内核测速':(esc(n.server)+':'+esc(n.port));
+    const acts='<button class="btn" onclick="event.stopPropagation();pingNode(\''+n.id+'\')">测速</button>'+(isClash?'':'<button class="btn" style="margin-left:3px;color:var(--danger)" onclick="event.stopPropagation();delNode(\''+n.id+'\')">删除</button>');
     return '<div class="ni '+(n.id===active?'ac':'')+'" onclick="switchN(\''+n.id+'\')"><div class="c1"><div class="nn">'+esc(n.name)+'</div><div class="nm">'+meta+' <span class="tag '+n.protocol+'">'+n.protocol+'</span></div></div><div class="c2"><span class="ping" id="p'+n.id+'" style="font-size:10px;color:'+pc+'">'+p+'</span>'+(n.speed>0?'<div style="font-size:9px;color:var(--success)">'+n.speed.toFixed(1)+'M</div>':'')+'</div><div class="c3">'+acts+'</div></div>'
   }).join('');
 }
@@ -402,10 +402,12 @@ async function refreshAll(){
 // 测速当前分组
 async function pingGroup(){
   if(!curGrp)return;
-  const btn=document.querySelector('[onclick="pingGroup()"]');
-  if(btn){btn.disabled=true;btn.textContent='测速中...'}
+  const isClash=curGrp==='__clash__';
+  const btn=document.getElementById('pingGrpBtn');
+  if(btn){btn.disabled=true;btn.textContent=isClash?'测速中(较慢)…':'测速中...'}
   const r=await api('POST','/api/ping/group/'+curGrp);
   if(btn){btn.disabled=false;btn.textContent='测速'}
+  if(r&&r.error){alert('测速失败: '+r.error);return}
   selectGroup(curGrp);
 }
 
@@ -448,8 +450,17 @@ async function delNode(id){
 // 测速
 async function pingNode(id){
   const el=document.getElementById('p'+id);
-  if(el)el.textContent='测速中...';
-  try{const r=await api('POST','/api/ping/'+id);if(el)el.textContent=r.ms>0?r.ms+'ms':(r.ms<0?'超时':'')}catch(e){if(el)el.textContent='超时'}
+  // 家宽节点要现场建隧道，单节点就要几秒，文案上区分一下
+  const isClash=id.indexOf('clash:')===0;
+  if(el){el.textContent=isClash?'测速中…':'测速中...';el.title=''}
+  try{
+    const r=await api('POST','/api/ping/'+id);
+    if(el){
+      el.textContent=r.ms>0?r.ms+'ms':(r.ms<0?'超时':'');
+      // 家宽节点测不通时把内核给的原因挂在 title 上，鼠标悬停能看到（不弹窗，免得刷屏）
+      if(isClash&&r.error)el.title=r.error;
+    }
+  }catch(e){if(el)el.textContent='超时'}
 }
 
 async function setSort(v){await api('POST','/api/sort',{order:v});selectGroup(curGrp)}

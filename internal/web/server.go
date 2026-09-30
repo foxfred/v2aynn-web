@@ -260,12 +260,25 @@ func (w *WebServer) writeClashNodes(rw http.ResponseWriter) {
 	w.cfg.Unlock()
 
 	names := w.mhm.Nodes()
+	// 附带内核记录的历史延迟。这个调用只读内核缓存、不触发测速，
+	// 所以每次加载列表都可以放心调用。
+	delays := w.mhm.ProxyDelays()
 	nodes := make([]config.Node, 0, len(names))
 	for _, n := range names {
+		// 0 = 内核从没测过（界面留空）；-1 = 测过但不通（界面显示超时）
+		ping := 0
+		if d, ok := delays[n]; ok {
+			if d > 0 {
+				ping = d
+			} else {
+				ping = -1
+			}
+		}
 		nodes = append(nodes, config.Node{
 			ID:       config.ClashNodeIDPrefix + n,
 			Name:     n,
 			Protocol: "openvpn",
+			Ping:     ping,
 		})
 	}
 	// 只有内核确实在家宽模式时才标「当前使用中」，否则会出现
@@ -278,6 +291,57 @@ func (w *WebServer) writeClashNodes(rw http.ResponseWriter) {
 		"nodes": nodes, "active": active, "sort": "",
 		"groupId": config.ClashGroupID, "clash": true,
 	})
+}
+
+// clashDelayTimeout 家宽节点测延迟的超时（毫秒）。
+// 比普通节点宽松得多：每个节点都要现场建立一条 OpenVPN over Cloudflare 隧道。
+const clashDelayTimeout = 8000
+
+// pingClashNode 让内核测单个家宽节点的延迟。
+//
+// 家宽节点的出口是一条 OpenVPN 隧道，本程序那套 TCP/TLS 握手探测对它没有意义
+// —— 探到的只是 CF 前置节点，和隧道能不能用是两回事。所以必须交给内核来测。
+func (w *WebServer) pingClashNode(rw http.ResponseWriter, id string) {
+	if !w.clashReady() {
+		w.writeJSON(rw, map[string]interface{}{"id": id, "ms": -1, "error": "家宽通道未启用"})
+		return
+	}
+	name := strings.TrimPrefix(id, config.ClashNodeIDPrefix)
+	ms, err := w.mhm.ProxyDelay(name, clashDelayTimeout)
+	if err != nil {
+		w.writeJSON(rw, map[string]interface{}{"id": id, "ms": -1, "error": err.Error()})
+		return
+	}
+	w.writeJSON(rw, map[string]interface{}{"id": id, "ms": ms})
+}
+
+// pingClashGroup 让内核并发测整个家宽组的延迟。
+//
+// 并发调度在内核里做，比本程序逐个调用高效得多。但 71 个节点每个都要现场建隧道，
+// 整体耗时可能一两分钟，所以前端要给出「较慢」的等待提示。
+func (w *WebServer) pingClashGroup(rw http.ResponseWriter) {
+	if !w.clashReady() {
+		// 返回 error 而不是空数组：空数组会被界面当成「全都不通」，
+		// 掩盖掉「家宽根本没启用」这个真实原因。
+		w.writeJSON(rw, map[string]string{"error": "家宽通道未启用"})
+		return
+	}
+	delays, err := w.mhm.GroupDelay(w.mhm.NodeGroup(), clashDelayTimeout)
+	if err != nil {
+		w.writeJSON(rw, map[string]string{"error": err.Error()})
+		return
+	}
+	results := make([]map[string]interface{}, 0, len(delays))
+	for name, d := range delays {
+		ms := d
+		if ms <= 0 {
+			ms = -1 // 内核把测不通记为 0，界面统一用 -1 表示超时
+		}
+		results = append(results, map[string]interface{}{
+			"id": config.ClashNodeIDPrefix + name, "ms": ms,
+		})
+	}
+	w.writeJSON(rw, results)
 }
 
 // apiAddGroup 添加订阅分组
@@ -563,9 +627,7 @@ func (w *WebServer) apiSwitch(rw http.ResponseWriter, r *http.Request) {
 func (w *WebServer) apiPing(rw http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if strings.HasPrefix(id, config.ClashNodeIDPrefix) {
-		// 家宽节点由 mihomo 自己测延迟并自动切换，本程序不参与探测。
-		// 返回 -1 让界面显示成「不可测」，而不是误导性的「超时」。
-		w.writeJSON(rw, map[string]interface{}{"id": id, "ms": -1, "unsupported": true})
+		w.pingClashNode(rw, id)
 		return
 	}
 	w.cfg.Lock()
@@ -593,6 +655,10 @@ func (w *WebServer) apiPing(rw http.ResponseWriter, r *http.Request) {
 // apiPingGroup 测速指定分组的全部节点
 func (w *WebServer) apiPingGroup(rw http.ResponseWriter, r *http.Request) {
 	gid := r.PathValue("id")
+	if gid == config.ClashGroupID {
+		w.pingClashGroup(rw)
+		return
+	}
 	w.cfg.Lock()
 	var nodes []config.Node
 	for _, g := range w.cfg.Groups {

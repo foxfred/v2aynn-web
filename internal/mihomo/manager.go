@@ -85,6 +85,10 @@ type Manager struct {
 	restartCount int
 	lastRestart  time.Time
 	restartMu    sync.Mutex
+
+	// ctrlAddr 覆盖 external-controller 的地址，仅测试用。
+	// 留空时用 127.0.0.1:ControlPort（生产路径永远走这个）。
+	ctrlAddr string
 }
 
 // NewManager 创建 mihomo 管理器。dataDir 必须与 xray 用的是同一个目录，
@@ -485,10 +489,170 @@ func httpGet(rawURL, proxy string) ([]byte, error) {
 
 // --- external-controller 客户端 ---
 
-var apiClient = &http.Client{Timeout: 10 * time.Second}
+var (
+	apiClient = &http.Client{Timeout: 10 * time.Second}
+
+	// stateClient 读内核状态用（/proxies、/version）。
+	// 短超时是刻意的：加载家宽节点列表时每次都要读一遍历史延迟，
+	// 不能让内核的慢响应把界面拖住。
+	stateClient = &http.Client{Timeout: 3 * time.Second}
+
+	// delayClient 单个节点测延迟。家宽节点要现场建立 OpenVPN 隧道，
+	// 比普通节点慢得多，超时给宽一些。
+	delayClient = &http.Client{Timeout: 30 * time.Second}
+
+	// groupDelayClient 整组测延迟。内核内部会并发跑，71 个节点可能要一两分钟。
+	groupDelayClient = &http.Client{Timeout: 180 * time.Second}
+)
+
+// delayTestURL 测延迟的目标地址。
+// 与订阅里各策略组用的 url 保持一致（gstatic 204），
+// 这样界面显示的延迟和内核自动选择节点的依据是同一个。
+const delayTestURL = "http://www.gstatic.com/generate_204"
 
 func (m *Manager) controlAddr() string {
+	m.mu.Lock()
+	addr := m.ctrlAddr
+	m.mu.Unlock()
+	if addr != "" {
+		return addr
+	}
 	return fmt.Sprintf("127.0.0.1:%d", ControlPort)
+}
+
+// NodeGroup 返回家宽节点所属的手动选择组名（内核测速时用）
+func (m *Manager) NodeGroup() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.nodeGroup
+}
+
+// proxyInfo /proxies 接口返回的单个代理条目
+type proxyInfo struct {
+	Type    string `json:"type"`
+	Name    string `json:"name"`
+	Alive   bool   `json:"alive"`
+	History []struct {
+		Time  string `json:"time"`
+		Delay int    `json:"delay"`
+	} `json:"history"`
+}
+
+// ProxyDelays 返回内核记录的各家宽节点最近一次延迟（毫秒）。
+//
+// 值的含义：
+//   - 不在 map 里 —— 内核从没测过这个节点（界面显示为空白）
+//   - 0           —— 测过但不通（界面显示为超时）
+//   - 正数        —— 延迟毫秒数
+//
+// 这个调用不触发任何测速，只读缓存，所以可以放心在每次加载列表时调用。
+func (m *Manager) ProxyDelays() map[string]int {
+	m.mu.Lock()
+	known := make(map[string]bool, len(m.nodes))
+	for _, n := range m.nodes {
+		known[n] = true
+	}
+	m.mu.Unlock()
+	if len(known) == 0 {
+		return nil
+	}
+
+	resp, err := stateClient.Get("http://" + m.controlAddr() + "/proxies")
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	var body struct {
+		Proxies map[string]proxyInfo `json:"proxies"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil
+	}
+
+	out := map[string]int{}
+	for name, p := range body.Proxies {
+		if !known[name] || len(p.History) == 0 {
+			continue
+		}
+		out[name] = p.History[len(p.History)-1].Delay
+	}
+	return out
+}
+
+// ProxyDelay 让内核测单个家宽节点的延迟，返回毫秒。
+//
+// 必须由内核测而不是本程序 TCP 探测：家宽节点的出口是一条 OpenVPN over
+// Cloudflare 的隧道，探测它自己的 IP:端口完全反映不出隧道是否可用。
+func (m *Manager) ProxyDelay(name string, timeoutMs int) (int, error) {
+	u := fmt.Sprintf("http://%s/proxies/%s/delay?timeout=%d&url=%s",
+		m.controlAddr(), url.PathEscape(name), timeoutMs, url.QueryEscape(delayTestURL))
+	resp, err := delayClient.Get(u)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+
+	var r struct {
+		Delay   int    `json:"delay"`
+		Message string `json:"message"`
+	}
+	_ = json.Unmarshal(body, &r)
+	if resp.StatusCode != http.StatusOK {
+		// 测不通时内核返回 4xx/5xx + {"message":"..."}
+		if r.Message != "" {
+			return 0, fmt.Errorf("%s", r.Message)
+		}
+		return 0, fmt.Errorf("内核返回 %s", resp.Status)
+	}
+	if r.Delay <= 0 {
+		return 0, fmt.Errorf("节点无响应")
+	}
+	return r.Delay, nil
+}
+
+// GroupDelay 让内核并发测试整个策略组里所有节点的延迟。
+//
+// 比本程序逐个调用高效得多：并发调度在核心里做，不受本程序的连接数限制。
+// 返回 map[节点名]延迟毫秒，测不通的节点值为 0。
+func (m *Manager) GroupDelay(group string, timeoutMs int) (map[string]int, error) {
+	if group == "" {
+		return nil, fmt.Errorf("未识别到家宽节点选择组")
+	}
+	u := fmt.Sprintf("http://%s/group/%s/delay?timeout=%d&url=%s",
+		m.controlAddr(), url.PathEscape(group), timeoutMs, url.QueryEscape(delayTestURL))
+	resp, err := groupDelayClient.Get(u)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("内核返回 %s", resp.Status)
+	}
+
+	var raw map[string]int
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+	// 只保留确实是家宽节点的条目（组里万一混了别的节点，不要污染界面）
+	m.mu.Lock()
+	known := make(map[string]bool, len(m.nodes))
+	for _, n := range m.nodes {
+		known[n] = true
+	}
+	m.mu.Unlock()
+
+	out := make(map[string]int, len(raw))
+	for name, d := range raw {
+		if known[name] {
+			out[name] = d
+		}
+	}
+	return out, nil
 }
 
 // putProxy 通过 external-controller 切换某个策略组的当前选择。
