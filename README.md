@@ -10,6 +10,7 @@
 ## ✨ 功能特点
 
 - **多订阅聚合**：支持多个订阅源合并管理，可配置订阅代理，支持周期自动刷新或关闭
+- **🏠 家宽模式（可选）**：额外支持 cfnew 的「家宽」Clash 订阅，让流量从真实住宅宽带 IP 出去。由 mihomo 内核承载（普通节点仍走 xray），点哪类节点就用哪个内核，**界面上没有额外的内核开关**。不配就完全看不到这个功能，行为与以前一致
 - **协议支持**：vmess / vless / trojan / ss 四种主流协议自动解析
 - **三种代理入口**：SOCKS5 (默认 10808) + HTTP (默认 10810) + 透明代理 (12345)，一键启停
 - **智能分流**：国内域名/IP 直连（geosite:cn / geoip:cn），海外走代理；可切换全局模式
@@ -47,7 +48,8 @@
 | 组件         | 说明                                       |
 | ------------ | ------------------------------------------ |
 | Go           | 单二进制 Web 服务（仅标准库）              |
-| Xray-core    | 代理内核（VMess/VLESS/Trojan/Shadowsocks） |
+| Xray-core    | 普通节点内核（VMess/VLESS/Trojan/Shadowsocks） |
+| Mihomo       | 家宽模式内核（openvpn 出站 + dialer-proxy 链式转发），仅启用家宽时使用 |
 | Alpine/Linux | arm64 / amd64 均可，低至 64MB 内存可用     |
 
 ---
@@ -96,6 +98,49 @@ sudo systemctl enable --now v2aynn-web
 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o v2aynn-web ./cmd/server/
 ```
 
+### 方式四：更新已部署的设备
+
+> ⚠️ **不能靠设备上的 `git pull` 更新**。仓库里只有 Go 源码，编译产物
+> （`v2aynn-web` / `xray` / `geoip.dat` / `geosite.dat`）都在 `.gitignore` 里，
+> 且设备本身通常没有 Go 工具链、内存也不够编译。**必须先在电脑上编译，再把二进制传过去。**
+
+**1. 电脑上编译**（同方式三），然后把产物复制到 `pkg/` 目录：
+
+```bash
+cp v2aynn-web pkg/v2aynn-web
+md5sum pkg/v2aynn-web      # 记下这个值，第 4 步要对比
+```
+
+**2. 电脑上起内网文件服务**（在项目根目录执行，`<你的项目路径>` 换成实际路径）：
+
+```bash
+python -c "import http.server,socketserver,functools; socketserver.ThreadingTCPServer.allow_reuse_address=True; h=functools.partial(http.server.SimpleHTTPRequestHandler, directory='<你的项目路径>/pkg'); socketserver.ThreadingTCPServer(('0.0.0.0',9999),h).serve_forever()"
+```
+
+**3. 设备上逐行执行**（`<电脑IP>` 换成电脑的局域网地址；**不要用 `&&` 串联**）：
+
+```bash
+cd /opt/v2aynn-web
+cp data/config.json /tmp/v2aynn-config-backup.json
+systemctl stop v2aynn-web
+curl -o v2aynn-web.new http://<电脑IP>:9999/v2aynn-web
+ls -l v2aynn-web.new
+chmod +x v2aynn-web.new
+mv v2aynn-web.new v2aynn-web
+systemctl start v2aynn-web
+```
+
+**4. 验证**：
+
+```bash
+systemctl status v2aynn-web --no-pager
+md5sum /opt/v2aynn-web/v2aynn-web     # 与第 1 步的值一致才算成功
+curl -s http://127.0.0.1:8000/api/status
+```
+
+> **体积相同 ≠ 更新成功**：Go 链接器按 64KB 段边界对齐，新旧产物的文件大小可能
+> 一模一样。**一定要比 MD5**，或者用 `grep -c 特征串 v2aynn-web` 确认。
+
 ---
 
 ## 🔌 使用说明
@@ -106,8 +151,69 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o v2aynn-web ./
 4. **透明代理**：可选，将局域网设备网关指向本机即可
 5. **设置**：点顶栏「设置 ⚙」，可改 SOCKS5/HTTP 端口、Web 监听地址、订阅刷新间隔、代理模式、全局订阅代理、测速 URL，以及开关「自动故障转移」
 6. **备份与恢复**：设置面板内点「导出配置」下载 JSON 备份；换设备或配置改乱时点「导入配置」选回该文件即可。导入前会校验，非法文件不会破坏现有配置
+7. **家宽模式**（可选）：在设置里填入家宽订阅地址，左侧会出现「🏠 家宽节点」分组，点一个节点即启用。详见 [家宽模式](#-家宽模式可选)
 
 > **提示**：导入配置后建议检查一下节点列表，确认新配置里的订阅源能正常拉取。
+
+---
+
+## 🏠 家宽模式（可选）
+
+「家宽」是指让流量从**真实家庭宽带的 IP** 出去，而不是从机房 IP，因此访问某些站点时更像普通家庭用户。cfnew 这类服务把 OpenVPN 塞进 Cloudflare 通道，最终落到别人家的宽带上。
+
+这个功能**默认不启用**。不配的话界面上完全看不到它，行为和以前一模一样。
+
+### 为什么需要第二个内核
+
+家宽订阅里的节点类型是 `openvpn`，并且用 `dialer-proxy` 做链式转发。这两样 xray 都不支持，只有 mihomo（Clash.Meta）能跑。所以程序内置两条通道：
+
+| 你点的节点 | 用哪个内核 |
+| ---------- | ---------- |
+| 普通节点（vless / vmess / trojan / ss） | xray |
+| 家宽节点（名字带 🏠） | mihomo |
+
+两个内核监听同一组端口，所以**同一时刻只会跑一个**。点普通节点自动切回 xray，点家宽节点自动切到 mihomo —— 不需要你手动选内核。
+
+### 准备内核文件
+
+家宽模式需要额外三个文件（不用家宽就不用管）：
+
+| 文件 | 放到哪 | 说明 |
+| ---- | ------ | ---- |
+| `mihomo` | `/usr/local/bin/mihomo` | 内核本体，需 **1.19.25 以上**，低版本不认 openvpn 节点 |
+| `geoip.metadb` | 数据目录（`DATA_DIR`，默认 `/app/data`） | mihomo 专用 GeoIP 库，**必需** |
+| `geosite.dat` | 同上 | mihomo 专用 geosite 库。只有订阅规则里用到 `GEOSITE` 才需要 —— cfnew 的默认订阅只用 `GEOIP`，所以通常可以不装 |
+
+> ⚠️ **注意**：这两个 geo 文件与项目根目录里给 xray 用的 `geoip.dat` / `geosite.dat` **同名但格式不同，不能混用**。
+>
+> ⚠️ **位置也不能错**。缺了 geo 数据时 mihomo 会去 GitHub 下载，墙内会卡满 90 秒超时，期间代理端口完全不监听，看起来就像「启动失败」。程序启动前会检查这几个文件，缺了会直接给出明确提示，不会让你干等。
+
+```bash
+# mihomo 内核（arm64，约 20MB）
+curl -L -o mihomo.gz https://github.com/MetaCubeX/mihomo/releases/download/v1.19.31/mihomo-linux-arm64-v1.19.31.gz
+gunzip -f mihomo.gz
+chmod +x mihomo
+
+# geo 数据（mihomo 专用格式，约 8MB）。geosite.dat 按需，见上表
+curl -L -o geoip.metadb https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb
+```
+
+> 墙内直连 GitHub 多半会失败。可以在本机（能上外网的机器）下载好，再用[方式四](#方式四更新已部署的设备)里的内网直传办法传进设备。
+
+### 使用
+
+1. 打开「设置 ⚙」，在**家宽订阅地址**里填入 Clash 格式的订阅链接（cfnew 的链接必须带 `target=vg` 参数，例如 `https://你的域名/sub?target=vg`），保存
+2. 保存后程序会立刻拉一次订阅，左侧随即出现「🏠 家宽节点」分组
+3. 点进该分组，点任意一个节点即启用。**首次启用要十几秒**（加载 geo 数据 + OpenVPN 握手），状态栏会提示「正在启用家宽内核」
+4. 启用后状态栏显示 `运行中 [家宽] - 🏠 XX-家宽-01`
+5. 想切回普通节点，直接点普通节点；想彻底关掉家宽，把家宽订阅地址清空后保存
+
+### 几点说明
+
+- 家宽节点由 mihomo 自己测延迟并自动往下换（订阅里配的是 fallback 组），所以它们的「测速」按钮不显示，这是正常的
+- 家宽节点是网友共享的，掉线很常见，换一个即可
+- 「订阅刷新间隔」只作用于普通订阅；家宽订阅在保存地址或点「刷新家宽订阅」时拉取
+- 家宽模式下透明代理照常可用，端口不变（12345）
 
 ---
 
@@ -118,7 +224,8 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o v2aynn-web ./
 | 8000  | Web 管理界面              |
 | 10808 | SOCKS5 代理               |
 | 10810 | HTTP 代理                 |
-| 12345 | 透明代理（dokodemo-door） |
+| 12345 | 透明代理（dokodemo-door / redir） |
+| 19090 | mihomo 控制接口（仅监听 127.0.0.1，家宽模式用，不对外开放） |
 
 ---
 
@@ -131,7 +238,9 @@ v2aynn-web/
 │   ├── config/               # 配置结构、JSON 持久化、UUID
 │   ├── subscription/         # 订阅拉取、协议解析、去重
 │   ├── v2ray/                # xray 进程管理、配置生成
+│   ├── mihomo/               # mihomo 进程管理、Clash 订阅解析与改写（家宽模式）
 │   └── web/                  # HTTP API + 内嵌单页前端
+├── docs/                     # 设计与调研文档
 ├── download-assets.sh        # 下载 xray + geo 资源
 ├── start.sh                  # 一键启动
 └── transparent.sh            # 透明代理开关脚本
@@ -140,6 +249,22 @@ v2aynn-web/
 ---
 
 ## 📝 更新记录
+
+### 2026-09-30
+
+**新增：家宽模式（第二个内核 mihomo）**
+
+cfnew 3.1 的「家宽」订阅能让流量从真实住宅宽带 IP 出去，但它的节点是 `openvpn` 类型 + `dialer-proxy` 链式转发，这两样 xray 内核都不支持。所以这次给程序加了第二条内核通道。**不配家宽的用户，界面与行为完全不变。**
+
+- 新增 `internal/mihomo`：mihomo 进程管理 + Clash 订阅解析与配置改写
+- 新增设置项「家宽订阅地址」，填入后左侧出现「🏠 家宽节点」虚拟分组
+- 点哪类节点就自动用哪个内核，界面上不设额外开关；两个内核抢同一组端口，切换时自动停掉另一个
+- 生成的 mihomo 配置**只改顶层 7 个键**（HTTP/SOCKS/mixed 端口、allow-lan、redir-port、日志级别、控制接口），`proxies` / `proxy-groups` / `rules` 一个字节不动 —— 家宽链的 `dialer-proxy` 指向的是策略组，结构一旦被重建整条链就会静默失效
+- 仍保持**零外部依赖**：订阅解析走行级扫描，没有引入 YAML 库
+- 启动前硬检查 mihomo 二进制与 `geoip.metadb` / `geosite.dat`，缺了直接报明确错误。否则 mihomo 会联网下载 geo 数据并卡满 90 秒，现象是「进程在跑但代理端口完全不监听」，极难排查
+- 家宽节点由 mihomo 自己测延迟并自动切换，界面上不显示测速与删除按钮
+
+调研与盒子实测过程见 `docs/家宽功能调研与验证报告.md`。
 
 ### 2026-09-20
 

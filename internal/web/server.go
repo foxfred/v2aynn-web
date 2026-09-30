@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"math"
 	"net"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"v2aynn-web/internal/config"
+	"v2aynn-web/internal/mihomo"
 	"v2aynn-web/internal/subscription"
 	"v2aynn-web/internal/v2ray"
 )
@@ -29,17 +31,71 @@ var staticFS embed.FS
 
 const speedTestURL = "https://speed.cloudflare.com/__down?bytes=2000000"
 
+// kernel 抽象两个内核管理器的公共能力。
+//
+// 本程序同时支持 xray 与 mihomo 两个内核：普通节点走 xray，家宽节点走 mihomo。
+// 两者监听同一组端口，所以同一时刻只有一个在跑。web 层凡是「启停/查状态」这类
+// 与内核无关的操作，都通过这个接口按当前内核分派，避免到处写 if/else。
+//
+// 注意 SwitchNode 没有放进接口：两个内核的入参语义完全不同
+// （xray 收节点 ID，mihomo 收家宽节点名），混在一起只会写错。
+type kernel interface {
+	IsRunning() bool
+	Start() error
+	Stop()
+	Status() map[string]interface{}
+}
+
 type WebServer struct {
 	cfg *config.Config
 	v2m *v2ray.Manager
+	// mhm 家宽（mihomo）内核管理器。为 nil 表示本次运行没启用家宽通道
+	// （单元测试场景），所有家宽相关入口都要先判空。
+	mhm *mihomo.Manager
 }
 
-func NewServer(cfg *config.Config, v2m *v2ray.Manager) *WebServer {
+func NewServer(cfg *config.Config, v2m *v2ray.Manager, mhm *mihomo.Manager) *WebServer {
 	v2m.SetConfig(cfg)
-	return &WebServer{cfg: cfg, v2m: v2m}
+	if mhm != nil {
+		mhm.SetConfig(cfg)
+	}
+	return &WebServer{cfg: cfg, v2m: v2m, mhm: mhm}
+}
+
+// clashReady 家宽通道是否可用
+func (w *WebServer) clashReady() bool { return w.mhm != nil }
+
+// kernelName 当前应当运行的内核
+func (w *WebServer) kernelName() string {
+	w.cfg.Lock()
+	defer w.cfg.Unlock()
+	return w.cfg.CurrentKernel()
+}
+
+// activeKernel 返回当前应当运行的内核管理器。家宽通道未启用时永远返回 xray。
+func (w *WebServer) activeKernel() kernel {
+	if w.kernelName() == config.KernelMihomo && w.clashReady() {
+		return w.mhm
+	}
+	return w.v2m
+}
+
+// stopAllKernels 停掉两个内核。切换内核、改端口、恢复配置时使用 ——
+// 两个内核抢同一组端口，不先停干净就会启动失败。
+func (w *WebServer) stopAllKernels() {
+	w.v2m.Stop()
+	if w.clashReady() {
+		w.mhm.Stop()
+	}
 }
 
 func (w *WebServer) Run(addr string) error {
+	return http.ListenAndServe(addr, corsHandler(w.newMux()))
+}
+
+// newMux 构造完整路由表。单独抽出来是为了让测试能走真实路由 ——
+// 端点漏注册、路径写错这类问题只有过一遍真实 mux 才测得出来。
+func (w *WebServer) newMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/status", w.apiStatus)
 	mux.HandleFunc("GET /api/groups", w.apiGroups)
@@ -60,13 +116,14 @@ func (w *WebServer) Run(addr string) error {
 	mux.HandleFunc("POST /api/proxy/stop", w.apiStop)
 	mux.HandleFunc("GET /api/settings", w.apiGetSettings)
 	mux.HandleFunc("POST /api/settings", w.apiSettings)
+	mux.HandleFunc("POST /api/clash/fetch", w.apiClashFetch)
 	mux.HandleFunc("GET /api/backup", w.apiBackup)
 	mux.HandleFunc("POST /api/restore", w.apiRestore)
 	subFS, _ := fs.Sub(staticFS, "static")
 	mux.Handle("/static/", http.FileServer(http.FS(subFS)))
 	mux.HandleFunc("/", w.apiIndex)
 
-	return http.ListenAndServe(addr, corsHandler(mux))
+	return mux
 }
 
 func (w *WebServer) apiIndex(rw http.ResponseWriter, r *http.Request) {
@@ -79,39 +136,83 @@ func (w *WebServer) apiIndex(rw http.ResponseWriter, r *http.Request) {
 }
 
 func (w *WebServer) apiStatus(rw http.ResponseWriter, r *http.Request) {
-	w.writeJSON(rw, w.v2m.Status())
+	st := w.activeKernel().Status()
+	// kernel 用于界面标注当前在跑哪个内核；clashEnabled 用于决定是否显示家宽分组。
+	st["kernel"] = w.kernelName()
+	st["clashEnabled"] = w.clashReady() && w.clashConfigured()
+	w.writeJSON(rw, st)
+}
+
+// clashConfigured 是否已配置家宽订阅（未注入家宽通道时恒为 false）
+func (w *WebServer) clashConfigured() bool {
+	if !w.clashReady() {
+		return false
+	}
+	w.cfg.Lock()
+	defer w.cfg.Unlock()
+	return w.cfg.ClashEnabled()
+}
+
+// groupSummary 分组概览（不含节点列表，仅含节点数）
+type groupSummary struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	URL       string `json:"url"`
+	NodeCount int    `json:"nodeCount"`
+	LastFetch string `json:"lastFetch"`
+	SubProxy  string `json:"subProxy"`
+	// Clash 标记这是家宽虚拟分组：节点由 mihomo 内核管理，
+	// 不参与订阅刷新、测速、排序、删除等普通分组才有的操作。
+	Clash bool `json:"clash,omitempty"`
 }
 
 // apiGroups 返回所有分组概览（不含节点列表，仅含节点数）
 func (w *WebServer) apiGroups(rw http.ResponseWriter, r *http.Request) {
 	w.cfg.Lock()
-	type groupSummary struct {
-		ID        string `json:"id"`
-		Name      string `json:"name"`
-		URL       string `json:"url"`
-		NodeCount int    `json:"nodeCount"`
-		LastFetch string `json:"lastFetch"`
-		SubProxy  string `json:"subProxy"`
-	}
-	groups := make([]groupSummary, len(w.cfg.Groups))
-	for i, g := range w.cfg.Groups {
-		groups[i] = groupSummary{
+	groups := make([]groupSummary, 0, len(w.cfg.Groups)+1)
+	for _, g := range w.cfg.Groups {
+		groups = append(groups, groupSummary{
 			ID: g.ID, Name: g.Name, URL: g.URL,
 			NodeCount: len(g.Nodes), LastFetch: g.LastFetch,
 			SubProxy: g.SubProxy,
-		}
+		})
 	}
 	activeGrp := w.cfg.ActiveGrp
+	clashSub := w.cfg.ClashSubURL
+	clashNode := w.cfg.ClashNode
+	kernel := w.cfg.CurrentKernel()
 	w.cfg.Unlock()
+
+	// 家宽虚拟分组。只在配置了家宽订阅、且订阅里确实解析出节点时才出现，
+	// 这样没启用家宽的用户界面上完全看不到它的痕迹。
+	if w.clashReady() && clashSub != "" {
+		if n := len(w.mhm.Nodes()); n > 0 {
+			groups = append(groups, groupSummary{
+				ID: config.ClashGroupID, Name: "家宽节点",
+				NodeCount: n, LastFetch: w.mhm.SubLastFetch(),
+				Clash: true,
+			})
+			// 家宽模式下高亮家宽分组，否则界面会把普通分组标成「当前使用中」
+			if kernel == config.KernelMihomo && clashNode != "" {
+				activeGrp = config.ClashGroupID
+			}
+		}
+	}
+
 	w.writeJSON(rw, map[string]interface{}{
 		"groups":    groups,
 		"activeGrp": activeGrp,
+		"kernel":    kernel,
 	})
 }
 
 // apiGroupNodes 返回指定分组的节点列表
 func (w *WebServer) apiGroupNodes(rw http.ResponseWriter, r *http.Request) {
 	gid := r.PathValue("id")
+	if gid == config.ClashGroupID {
+		w.writeClashNodes(rw)
+		return
+	}
 	w.cfg.Lock()
 	var nodes []config.Node
 	active := w.cfg.ActiveNode
@@ -137,6 +238,46 @@ func (w *WebServer) apiGroupNodes(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	w.writeJSON(rw, map[string]interface{}{"nodes": nodes, "active": active, "sort": sortOrder, "groupId": gid})
+}
+
+// writeClashNodes 返回家宽节点列表。
+//
+// 家宽节点不由本程序管理，没有 Node 结构；但界面复用同一套节点列表渲染，
+// 所以这里造一份「够用就好」的 Node：ID 带 clash: 前缀（服务端与前端都靠它识别），
+// 名称与协议填上，其余留空。前端据此隐藏测速按钮等只对普通节点有意义的操作。
+func (w *WebServer) writeClashNodes(rw http.ResponseWriter) {
+	if !w.clashReady() {
+		w.writeJSON(rw, map[string]interface{}{
+			"nodes": []config.Node{}, "active": "", "sort": "",
+			"groupId": config.ClashGroupID, "clash": true,
+		})
+		return
+	}
+
+	w.cfg.Lock()
+	clashNode := w.cfg.ClashNode
+	kernel := w.cfg.CurrentKernel()
+	w.cfg.Unlock()
+
+	names := w.mhm.Nodes()
+	nodes := make([]config.Node, 0, len(names))
+	for _, n := range names {
+		nodes = append(nodes, config.Node{
+			ID:       config.ClashNodeIDPrefix + n,
+			Name:     n,
+			Protocol: "openvpn",
+		})
+	}
+	// 只有内核确实在家宽模式时才标「当前使用中」，否则会出现
+	// 普通节点与家宽节点同时被标成激活的矛盾状态。
+	active := ""
+	if kernel == config.KernelMihomo && clashNode != "" {
+		active = config.ClashNodeIDPrefix + clashNode
+	}
+	w.writeJSON(rw, map[string]interface{}{
+		"nodes": nodes, "active": active, "sort": "",
+		"groupId": config.ClashGroupID, "clash": true,
+	})
 }
 
 // apiAddGroup 添加订阅分组
@@ -364,8 +505,54 @@ func (w *WebServer) apiDelNode(rw http.ResponseWriter, r *http.Request) {
 	w.writeJSON(rw, map[string]string{"ok": "true"})
 }
 
+// apiSwitch 切换当前使用的节点。
+//
+// 入参 id 有两种形态，服务端按前缀分流：
+//   - 普通节点 ID        -> 走 xray 内核
+//   - "clash:<节点名>"   -> 走 mihomo 内核（家宽）
+//
+// 内核由节点类型自动决定，界面上不设额外的内核开关：点普通节点就用 xray，
+// 点家宽节点就用 mihomo。两个内核抢同一组端口，切换前必须先把另一个停干净。
 func (w *WebServer) apiSwitch(rw http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+
+	if strings.HasPrefix(id, config.ClashNodeIDPrefix) {
+		if !w.clashReady() {
+			w.writeJSON(rw, map[string]string{"error": "家宽通道未启用"})
+			return
+		}
+		name := strings.TrimPrefix(id, config.ClashNodeIDPrefix)
+
+		w.cfg.Lock()
+		w.cfg.Kernel = config.KernelMihomo
+		w.cfg.ClashNode = name
+		_ = w.cfg.Save()
+		w.cfg.Unlock()
+
+		w.v2m.Stop()
+		if w.mhm.IsRunning() {
+			if err := w.mhm.SwitchNode(name); err != nil {
+				w.writeJSON(rw, map[string]string{"error": err.Error()})
+				return
+			}
+		} else {
+			// 首次进入家宽模式：Start() 会自动套用 cfg.ClashNode，不必再切一次
+			if err := w.mhm.Start(); err != nil {
+				w.writeJSON(rw, map[string]string{"error": err.Error()})
+				return
+			}
+		}
+		w.writeJSON(rw, map[string]string{"ok": "true"})
+		return
+	}
+
+	// 普通节点：切回 xray 内核
+	w.cfg.Lock()
+	w.cfg.Kernel = config.KernelXray
+	w.cfg.Unlock()
+	if w.clashReady() {
+		w.mhm.Stop()
+	}
 	if err := w.v2m.SwitchNode(id); err != nil {
 		w.writeJSON(rw, map[string]string{"error": err.Error()})
 		return
@@ -375,6 +562,12 @@ func (w *WebServer) apiSwitch(rw http.ResponseWriter, r *http.Request) {
 
 func (w *WebServer) apiPing(rw http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if strings.HasPrefix(id, config.ClashNodeIDPrefix) {
+		// 家宽节点由 mihomo 自己测延迟并自动切换，本程序不参与探测。
+		// 返回 -1 让界面显示成「不可测」，而不是误导性的「超时」。
+		w.writeJSON(rw, map[string]interface{}{"id": id, "ms": -1, "unsupported": true})
+		return
+	}
 	w.cfg.Lock()
 	node, gid := w.cfg.FindNode(id)
 	w.cfg.Unlock()
@@ -456,7 +649,7 @@ func (w *WebServer) apiPingGroup(rw http.ResponseWriter, r *http.Request) {
 }
 
 func (w *WebServer) apiSpeed(rw http.ResponseWriter, r *http.Request) {
-	if !w.v2m.IsRunning() {
+	if !w.activeKernel().IsRunning() {
 		w.writeJSON(rw, map[string]interface{}{"ok": false, "error": "代理未运行，请先启动", "mbps": 0})
 		return
 	}
@@ -509,7 +702,7 @@ func (w *WebServer) apiSpeed(rw http.ResponseWriter, r *http.Request) {
 }
 
 func (w *WebServer) apiStart(rw http.ResponseWriter, r *http.Request) {
-	if err := w.v2m.Start(); err != nil {
+	if err := w.activeKernel().Start(); err != nil {
 		w.writeJSON(rw, map[string]string{"error": err.Error()})
 		return
 	}
@@ -517,7 +710,9 @@ func (w *WebServer) apiStart(rw http.ResponseWriter, r *http.Request) {
 }
 
 func (w *WebServer) apiStop(rw http.ResponseWriter, r *http.Request) {
-	w.v2m.Stop()
+	// 两个内核都停。用户点的是「停止代理」，不该关心当前跑的是哪个内核；
+	// 只停一个的话，另一个会继续占着端口，下次启动必然失败。
+	w.stopAllKernels()
 	w.writeJSON(rw, map[string]string{"ok": "true"})
 }
 
@@ -547,8 +742,11 @@ func (w *WebServer) apiGetSettings(rw http.ResponseWriter, r *http.Request) {
 		"listenAddr": w.cfg.ListenAddr, "subRefresh": w.cfg.SubRefresh,
 		"subProxy": w.cfg.SubProxy, "proxyMode": w.cfg.ProxyMode,
 		"speedURL": w.cfg.SpeedURL, "autoFailover": w.cfg.FailoverEnabled(),
+		"clashSubUrl": w.cfg.ClashSubURL, "kernel": w.cfg.CurrentKernel(),
+		"clashNodeCount": len(w.cfg.ClashNodes),
 	}
 	w.cfg.Unlock()
+	st["clashAvailable"] = w.clashReady()
 	w.writeJSON(rw, st)
 }
 
@@ -559,18 +757,110 @@ func (w *WebServer) apiSettings(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w.cfg.Lock()
+	oldSub := w.cfg.ClashSubURL
+	w.cfg.Unlock()
+
 	if err := w.applySettings(req); err != nil {
 		w.writeJSON(rw, map[string]string{"error": err.Error()})
 		return
 	}
 
-	// 端口/监听地址/代理模式变化需要重启代理才能生效
-	if w.v2m.IsRunning() {
-		w.v2m.Stop()
-		time.Sleep(300 * time.Millisecond)
-		_ = w.v2m.Start()
+	w.cfg.Lock()
+	newSub := w.cfg.ClashSubURL
+	w.cfg.Unlock()
+	subChanged := newSub != oldSub
+
+	resp := map[string]interface{}{"ok": "true"}
+
+	switch {
+	case subChanged && newSub == "":
+		// 清空家宽订阅 = 关闭家宽通道，把内核切回 xray。
+		// 否则 mihomo 会继续跑着，而界面上已经看不到家宽分组，用户无从关闭它。
+		w.cfg.Lock()
+		w.cfg.Kernel = config.KernelXray
+		w.cfg.ClashNodes = nil
+		w.cfg.ClashNode = ""
+		_ = w.cfg.Save()
+		hasNode := w.cfg.ActiveNode != ""
+		w.cfg.Unlock()
+
+		w.stopAllKernels()
+		if hasNode {
+			time.Sleep(300 * time.Millisecond)
+			_ = w.v2m.Start()
+		}
+		resp["clashNodeCount"] = 0
+
+	case subChanged && newSub != "" && w.clashReady():
+		// 家宽地址变了：同步拉一次。这样保存后界面上立刻能看到家宽分组，
+		// 拉取失败也能当场把错误回给用户，而不是等定时刷新时才暴露。
+		if err := w.fetchClashSub(); err != nil {
+			resp["clashError"] = err.Error()
+		}
+		w.cfg.Lock()
+		resp["clashNodeCount"] = len(w.cfg.ClashNodes)
+		w.cfg.Unlock()
+
+	default:
+		// 端口/监听地址/代理模式变化需要重启当前内核才能生效
+		if k := w.activeKernel(); k.IsRunning() {
+			w.stopAllKernels()
+			time.Sleep(300 * time.Millisecond)
+			_ = k.Start()
+		}
 	}
-	w.writeJSON(rw, map[string]string{"ok": "true"})
+	w.writeJSON(rw, resp)
+}
+
+// fetchClashSub 拉取家宽订阅、更新节点缓存，并在内核正处于家宽模式时重启它。
+// 由「保存设置」与「手动刷新」两处调用。
+func (w *WebServer) fetchClashSub() error {
+	if !w.clashReady() {
+		return fmt.Errorf("家宽通道未启用")
+	}
+	w.cfg.Lock()
+	subURL, proxy := w.cfg.ClashSubURL, w.cfg.SubProxy
+	w.cfg.Unlock()
+	if subURL == "" {
+		return fmt.Errorf("家宽订阅地址为空")
+	}
+
+	nodes, err := w.mhm.FetchSubscription(subURL, proxy)
+	if err != nil {
+		log.Printf("拉取家宽订阅失败: %v", err)
+		return err
+	}
+
+	w.cfg.Lock()
+	w.cfg.ClashNodes = nodes
+	kernel := w.cfg.CurrentKernel()
+	_ = w.cfg.Save()
+	w.cfg.Unlock()
+
+	// 内核正在跑家宽模式时重启一次，让它加载新配置。
+	// 没跑就不用管 —— 用户下次点家宽节点时会自然用上新配置。
+	if kernel == config.KernelMihomo && w.mhm.IsRunning() {
+		w.mhm.Stop()
+		time.Sleep(500 * time.Millisecond)
+		if err := w.mhm.Start(); err != nil {
+			log.Printf("家宽内核重启失败: %v", err)
+			return err
+		}
+	}
+	return nil
+}
+
+// apiClashFetch 手动刷新家宽订阅
+func (w *WebServer) apiClashFetch(rw http.ResponseWriter, r *http.Request) {
+	if err := w.fetchClashSub(); err != nil {
+		w.writeJSON(rw, map[string]string{"error": err.Error()})
+		return
+	}
+	w.cfg.Lock()
+	n := len(w.cfg.ClashNodes)
+	w.cfg.Unlock()
+	w.writeJSON(rw, map[string]interface{}{"ok": "true", "count": n})
 }
 
 // applySettings 校验并应用设置请求，全部通过后写盘。
@@ -656,6 +946,15 @@ func (w *WebServer) applySettings(req map[string]interface{}) error {
 		}
 		w.cfg.AutoFailover = &b
 	}
+	if v, ok := req["clashSubUrl"]; ok {
+		s, err := toStr(v, "家宽订阅地址")
+		if err != nil {
+			return err
+		}
+		// 空串是合法值（表示关闭家宽通道），不能按"空值即缺失"跳过 ——
+		// 否则用户永远没法把已经配上的家宽关掉。
+		w.cfg.ClashSubURL = strings.TrimSpace(s)
+	}
 
 	return w.cfg.Save()
 }
@@ -738,11 +1037,19 @@ func (w *WebServer) apiRestore(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 恢复后原节点可能已失效，重启代理以套用新配置
-	if w.v2m.IsRunning() {
-		w.v2m.Stop()
-		time.Sleep(300 * time.Millisecond)
-		_ = w.v2m.Start()
+	// 恢复后原节点可能已失效，按新配置的内核重启代理。
+	// 内核不能写死用 v2m —— 备份里可能带着家宽配置，恢复后应当跑 mihomo。
+	if w.clashReady() && w.clashConfigured() && !w.mhm.HasConfig() {
+		// 备份里有家宽订阅地址但本地还没生成过配置：先拉订阅，
+		// fetchClashSub 拉完会自己按需重启内核。
+		go func() { _ = w.fetchClashSub() }()
+	} else {
+		wasRunning := w.activeKernel().IsRunning()
+		w.stopAllKernels()
+		if wasRunning {
+			time.Sleep(300 * time.Millisecond)
+			_ = w.activeKernel().Start()
+		}
 	}
 	w.writeJSON(rw, map[string]interface{}{"ok": "true", "groups": len(nc.Groups)})
 }

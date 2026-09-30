@@ -98,8 +98,26 @@ type Config struct {
 	// 用指针区分"未设置"与"显式关闭"：nil 表示默认开启。
 	AutoFailover *bool   `json:"autoFailover,omitempty"`
 	Groups       []Group `json:"groups"` // 分组列表，替代原来的 Subs + Nodes
-	path         string
-	dirty        bool // 存在未落盘的高频改动（如测速结果），由后台 Flush 合并写入
+
+	// --- 家宽（Clash / mihomo 内核）相关字段 ---
+	//
+	// 背景：cfnew 的「家宽链式」订阅是 Clash 格式，节点类型为 openvpn，
+	// 并靠 mihomo 的 dialer-proxy 做链式转发。xray 内核既没有 openvpn 出站、
+	// 也没有 dialer-proxy 的等价能力，所以这部分必须交给 mihomo 内核跑。
+	//
+	// 四个字段的分工：
+	//   ClashSubURL —— 订阅地址。为空表示完全未启用家宽功能，此时行为与旧版一致。
+	//   ClashNodes  —— 从订阅里扫出来的家宽节点名，缓存下来供界面展示与切换。
+	//                  家宽节点不由本程序管理，所以只存名字，不建 Node 结构。
+	//   Kernel      —— 当前实际在跑的内核。"xray"（空值等价）或 "mihomo"。
+	//                  两个内核监听同样的端口，因此同一时刻只能跑一个。
+	//   ClashNode   —— 家宽模式下当前选中的节点名。
+	ClashSubURL string   `json:"clashSubUrl,omitempty"`
+	ClashNodes  []string `json:"clashNodes,omitempty"`
+	Kernel      string   `json:"kernel,omitempty"`
+	ClashNode   string   `json:"clashNode,omitempty"`
+	path        string
+	dirty       bool // 存在未落盘的高频改动（如测速结果），由后台 Flush 合并写入
 }
 
 // 默认分组ID（手动节点/导入节点存放于此）
@@ -317,5 +335,46 @@ func (c *Config) Restore(other *Config) {
 	c.AutoFailover = other.AutoFailover
 	c.Groups = other.Groups
 
+	// 家宽字段同样整体拷贝：ClashSubURL 为空即"未启用家宽"，
+	// 不能套用 pickS 之类的"空值回落默认"，否则导入一份不含家宽的备份
+	// 会被静默改回某个默认订阅地址。
+	c.ClashSubURL = other.ClashSubURL
+	c.ClashNodes = other.ClashNodes
+	c.Kernel = other.Kernel
+	c.ClashNode = other.ClashNode
+
 	c.EnsureDefaultGroup()
 }
+
+// --- 家宽相关辅助 ---
+
+// ClashEnabled 是否配置了家宽订阅。调用方需持有 c 的锁。
+func (c *Config) ClashEnabled() bool {
+	return c.ClashSubURL != ""
+}
+
+// CurrentKernel 返回当前应当运行的内核，只可能是 "xray" 或 "mihomo"。
+// 空值与任何未知取值都回落到 "xray"（与旧版行为一致）。
+// 调用方需持有 c 的锁。
+func (c *Config) CurrentKernel() string {
+	if c.Kernel == KernelMihomo {
+		return KernelMihomo
+	}
+	return KernelXray
+}
+
+// 内核标识常量。两个内核监听同一组端口，故同一时刻只能运行其一。
+const (
+	KernelXray   = "xray"
+	KernelMihomo = "mihomo"
+)
+
+// ClashNodeIDPrefix 家宽节点在界面上的 ID 前缀。
+//
+// 家宽节点由 mihomo 管理，本程序没有它们的 Node 结构，但界面切换节点
+// 走的是统一的 /api/node/{id} 接口。给家宽节点造一个 "clash:<节点名>" 形式的
+// ID，服务端按前缀分流即可，前端无需为家宽单独写一套切换逻辑。
+const ClashNodeIDPrefix = "clash:"
+
+// ClashGroupID 家宽分组的虚拟 ID，用于在分组列表里展示家宽节点。
+const ClashGroupID = "__clash__"

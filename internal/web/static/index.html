@@ -203,7 +203,7 @@ body{font-family:system-ui,sans-serif;background:var(--bg-body);color:var(--text
 <span class="cht" id="grpName">全部节点</span>
 <button class="btn ac" onclick="toggleAddNode()">+ 手动</button>
 <button class="btn st" onclick="toggleImport()">+ 粘贴</button>
-<button class="btn" onclick="pingGroup()">测速</button>
+<button class="btn" id="pingGrpBtn" onclick="pingGroup()">测速</button>
 <button class="btn sp" onclick="delGroup()" id="delGrpBtn" style="display:none">删除分组</button>
 <select id="sortSel" onchange="setSort(this.value)">
 <option value="">默认</option><option value="ping_asc">延迟↑</option><option value="ping_desc">延迟↓</option>
@@ -270,12 +270,17 @@ body{font-family:system-ui,sans-serif;background:var(--bg-body);color:var(--text
 <div class="st-full"><label class="ck"><input type="checkbox" id="setFailover">节点连续失败时，自动切换到其他可用节点</label></div>
 <div class="st-full"><label>全局订阅代理（HTTP代理，可选）</label><input id="setSubProxy" placeholder="http://127.0.0.1:7890"></div>
 <div class="st-full"><label>测速URL（用于真实测速）</label><input id="setSpeedURL" placeholder="https://speed.cloudflare.com/__down?bytes=2000000"></div>
+<div class="st-full"><label>家宽订阅地址（Clash 格式，留空即关闭家宽功能）</label><input id="setClashSub" placeholder="https://.../sub?target=vg"></div>
+<div class="st-full" id="clashRow" style="display:none;font-size:12px;color:var(--text-muted)">
+<span id="clashInfo"></span>
+<button class="btn" onclick="refreshClash(this)">刷新家宽订阅</button>
+</div>
 <div class="st-full"><label>配置备份 / 恢复</label>
 <button class="btn" onclick="backupCfg()">导出配置</button>
 <button class="btn" onclick="document.getElementById('restoreFile').click()">导入配置</button>
 <input type="file" id="restoreFile" accept=".json,application/json" style="display:none" onchange="restoreCfg(this)">
 </div>
-<div class="st-full st-ft">提示：订阅刷新间隔修改后立即生效，设为 0 即禁用自动刷新（服务启动时仍会拉取一次订阅，用于校验节点有效性）。修改端口 / 监听地址 / 代理模式后，代理会自动重启以应用新配置；若修改了 Web 端口，需重启系统服务后生效。</div>
+<div class="st-full st-ft">提示：订阅刷新间隔修改后立即生效，设为 0 即禁用自动刷新（服务启动时仍会拉取一次订阅，用于校验节点有效性）。修改端口 / 监听地址 / 代理模式后，代理会自动重启以应用新配置；若修改了 Web 端口，需重启系统服务后生效。<br>家宽订阅是 Clash 格式，需要 mihomo 内核（与普通节点用的 xray 内核不是同一个，两个内核不会同时运行）。填好地址保存后，左侧会出现「家宽节点」分组，点其中一个即可启用，首次启用要十几秒。之后点任意普通节点会自动切回 xray。</div>
 </div>
 <div><button class="btn st" onclick="saveSettings()">保存</button><button class="btn" onclick="closeModal('settingsModal')">取消</button></div>
 </div>
@@ -318,8 +323,11 @@ async function loadGroups(){
   el.innerHTML=groups.map(g=>{
     const isActive=g.id===curGrp;
     const isDefault=g.id==='__default__';
-    const editBtn=(!isDefault&&g.url)?'<span class="gact" onclick="event.stopPropagation();editGroup(\''+g.id+'\')">编辑</span>':'';
-    return '<div class="gi'+(isActive?' ac':'')+'" onclick="selectGroup(\''+g.id+'\')"><div class="gn"><div class="gnm">'+esc(g.name)+'</div><div class="gns">'+(g.url?esc(g.url).substring(0,30)+'...':'无订阅')+'</div></div><span class="gcnt">'+g.nodeCount+'</span>'+editBtn+'</div>'
+    // 家宽分组的节点由 mihomo 内核管理，没有订阅 URL，也不支持编辑
+    const isClash=g.clash===true;
+    const editBtn=(!isDefault&&!isClash&&g.url)?'<span class="gact" onclick="event.stopPropagation();editGroup(\''+g.id+'\')">编辑</span>':'';
+    const subText=isClash?'mihomo 内核':(g.url?esc(g.url).substring(0,30)+'...':'无订阅');
+    return '<div class="gi'+(isActive?' ac':'')+'" onclick="selectGroup(\''+g.id+'\')"><div class="gn"><div class="gnm">'+esc(g.name)+'</div><div class="gns">'+subText+'</div></div><span class="gcnt">'+g.nodeCount+'</span>'+editBtn+'</div>'
   }).join('');
   if(!curGrp&&groups.length>0)selectGroup(groups[0].id);
 }
@@ -333,18 +341,33 @@ async function selectGroup(id){
   active=d.active||'';
   const el=document.getElementById('nl');
   const grp=groups.find(g=>g.id===id);
+  const isClashGrp=!!(grp&&grp.clash);
   document.getElementById('grpName').textContent=grp?grp.name:'节点';
   document.getElementById('delGrpBtn').style.display=(grp&&grp.url)?'inline-block':'none';
-  if(!nodes.length){el.innerHTML='<div class="empty">暂无节点</div>';return}
+  // 家宽节点由 mihomo 内核自己测延迟并自动切换，本程序的 TCP 探测对它没有意义
+  const pgBtn=document.getElementById('pingGrpBtn');
+  if(pgBtn){pgBtn.disabled=isClashGrp;pgBtn.title=isClashGrp?'家宽节点由内核自动选择，无需手动测速':''}
+  if(!nodes.length){el.innerHTML='<div class="empty">'+(isClashGrp?'还没有家宽节点，请在设置里填写家宽订阅地址':'暂无节点')+'</div>';return}
   el.innerHTML=nodes.map(n=>{
+    // 家宽节点没有 server/port，也不支持本程序的测速与删除
+    const isClash=n.id.indexOf('clash:')===0;
     const pc=n.ping<0?'var(--danger)':'var(--text-muted)';
     const p=n.ping>0?n.ping+'ms':(n.ping<0?'超时':'');
-    return '<div class="ni '+(n.id===active?'ac':'')+'" onclick="switchN(\''+n.id+'\')"><div class="c1"><div class="nn">'+esc(n.name)+'</div><div class="nm">'+n.server+':'+n.port+' <span class="tag '+n.protocol+'">'+n.protocol+'</span></div></div><div class="c2"><span class="ping" id="p'+n.id+'" style="font-size:10px;color:'+pc+'">'+p+'</span>'+(n.speed>0?'<div style="font-size:9px;color:var(--success)">'+n.speed.toFixed(1)+'M</div>':'')+'</div><div class="c3"><button class="btn" onclick="event.stopPropagation();pingNode(\''+n.id+'\')">测速</button><button class="btn" style="margin-left:3px;color:var(--danger)" onclick="event.stopPropagation();delNode(\''+n.id+'\')">删除</button></div></div>'
+    const meta=isClash?'住宅宽带出口 · 内核自动测速':(esc(n.server)+':'+esc(n.port));
+    const acts=isClash?'':'<button class="btn" onclick="event.stopPropagation();pingNode(\''+n.id+'\')">测速</button><button class="btn" style="margin-left:3px;color:var(--danger)" onclick="event.stopPropagation();delNode(\''+n.id+'\')">删除</button>';
+    return '<div class="ni '+(n.id===active?'ac':'')+'" onclick="switchN(\''+n.id+'\')"><div class="c1"><div class="nn">'+esc(n.name)+'</div><div class="nm">'+meta+' <span class="tag '+n.protocol+'">'+n.protocol+'</span></div></div><div class="c2"><span class="ping" id="p'+n.id+'" style="font-size:10px;color:'+pc+'">'+p+'</span>'+(n.speed>0?'<div style="font-size:9px;color:var(--success)">'+n.speed.toFixed(1)+'M</div>':'')+'</div><div class="c3">'+acts+'</div></div>'
   }).join('');
 }
 
 async function loadStatus(){
-  try{const s=await api('GET','/api/status');document.getElementById('dot').className='dot'+(s.running?' on':'');document.getElementById('st').textContent=(s.running?'运行中':'已停止')+(s.activeName?' - '+s.activeName:'');active=s.activeNode}catch(e){document.getElementById('st').textContent='连接失败'}
+  try{const s=await api('GET','/api/status');
+    document.getElementById('dot').className='dot'+(s.running?' on':'');
+    // 两个内核跑的业务不同（普通节点 vs 家宽），状态栏必须标出来，
+    // 否则用户看到「运行中」却不知道自己连的是哪条线路
+    const kn=s.kernel==='mihomo'?' [家宽]':'';
+    document.getElementById('st').textContent=(s.running?'运行中':'已停止')+kn+(s.activeName?' - '+s.activeName:'');
+    active=s.activeNode
+  }catch(e){document.getElementById('st').textContent='连接失败'}
 }
 
 // 添加分组
@@ -387,7 +410,14 @@ async function pingGroup(){
 }
 
 // 切换节点
-async function switchN(id){await api('POST','/api/node/'+id);selectGroup(curGrp);loadStatus()}
+async function switchN(id){
+  // 家宽节点首次启用要拉起 mihomo 内核（加载 geo 数据、OpenVPN 握手），
+  // 需要十几秒。不给提示的话用户会以为点了没反应。
+  if(id.indexOf('clash:')===0)document.getElementById('st').textContent='正在启用家宽内核，首次需要十几秒...';
+  const r=await api('POST','/api/node/'+id);
+  if(r&&r.error){alert('切换失败: '+r.error);loadStatus();return}
+  selectGroup(curGrp);loadStatus();
+}
 
 // 手动添加节点
 function toggleAddNode(){document.getElementById('addNodeModal').classList.add('show')}
@@ -471,8 +501,22 @@ async function showSettings(){
     document.getElementById('setSubProxy').value=s.subProxy||'';
     document.getElementById('setSpeedURL').value=s.speedURL||'';
     document.getElementById('setFailover').checked=(s.autoFailover!==false);
+    document.getElementById('setClashSub').value=s.clashSubUrl||'';
+    const hasClash=!!s.clashSubUrl;
+    document.getElementById('clashRow').style.display=hasClash?'block':'none';
+    if(hasClash)document.getElementById('clashInfo').textContent='已缓存 '+(s.clashNodeCount||0)+' 个家宽节点　';
   }catch(e){}
   document.getElementById('settingsModal').classList.add('show');
+}
+
+// 手动刷新家宽订阅（不改任何设置，只重新拉一次）
+async function refreshClash(btn){
+  if(btn){btn.disabled=true;btn.textContent='刷新中...'}
+  const r=await api('POST','/api/clash/fetch');
+  if(btn){btn.disabled=false;btn.textContent='刷新家宽订阅'}
+  if(r.error){alert('刷新失败: '+r.error);return}
+  document.getElementById('clashInfo').textContent='已缓存 '+r.count+' 个家宽节点　';
+  loadGroups();
 }
 
 async function saveSettings(){
@@ -495,12 +539,23 @@ async function saveSettings(){
     proxyMode:document.getElementById('setMode').value,
     subProxy:document.getElementById('setSubProxy').value.trim(),
     speedURL:document.getElementById('setSpeedURL').value.trim()||'https://speed.cloudflare.com/__down?bytes=2000000',
-    autoFailover:document.getElementById('setFailover').checked
+    autoFailover:document.getElementById('setFailover').checked,
+    clashSubUrl:document.getElementById('setClashSub').value.trim()
   };
   const r=await api('POST','/api/settings',b);
   closeModal('settingsModal');
   if(r.error){alert('保存失败: '+r.error);return}
-  alert('设置已保存，代理配置已应用');
+  // 家宽地址刚变过时，拉取结果单独反馈：拉不到就直说，别让用户以为已经配好了
+  if(r.clashError){alert('设置已保存，但家宽订阅拉取失败：'+r.clashError);return}
+  if(b.clashSubUrl&&r.clashNodeCount!==undefined){
+    alert('设置已保存。家宽订阅共 '+r.clashNodeCount+' 个节点，在左侧「家宽节点」分组里点一个即可启用。');
+    curGrp='';loadGroups();
+  }else if(!b.clashSubUrl){
+    alert('设置已保存，家宽功能已关闭');
+    loadGroups();
+  }else{
+    alert('设置已保存，代理配置已应用');
+  }
 }
 
 // 配置备份 / 恢复
