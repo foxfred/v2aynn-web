@@ -198,9 +198,28 @@ func TestRewriteConfig(t *testing.T) {
 		}
 	}
 
-	// 订阅原文里没有 port/socks-port/redir-port，应当被插入 3 行
-	if n := strings.Count(out, "\n"); n != strings.Count(sampleSub, "\n")+3 {
-		t.Errorf("改写后行数 = %d, 期望 %d", n, strings.Count(sampleSub, "\n")+3)
+	// 订阅原文里没有 port/socks-port/redir-port，应当被插入 3 行；
+	// 另外 rules: 段最前面会新增 1 行国内直连规则（见 injectCNDirectRule）。
+	if n := strings.Count(out, "\n"); n != strings.Count(sampleSub, "\n")+4 {
+		t.Errorf("改写后行数 = %d, 期望 %d", n, strings.Count(sampleSub, "\n")+4)
+	}
+
+	// 新增的那条国内直连规则必须排在 rules: 段的最前面。
+	// 家宽订阅原本只有 GEOIP（纯 IP 判据）+ no-resolve，浏览器经代理进来的
+	// 流量只有域名没有 IP，一条都匹配不上，会全部落到 MATCH 走代理 ——
+	// 实测就是「家宽模式下连百度都走代理了」。
+	if !strings.Contains(out, "rules:\n  - "+cnDirectRule+"\n") {
+		t.Errorf("rules: 段最前面应插入 %s，实际片段:\n%s",
+			cnDirectRule, out[strings.Index(out, "rules:"):strings.Index(out, "rules:")+120])
+	}
+	// 订阅原有的规则一条都不能少、不能改
+	for _, keep := range []string{
+		"  - GEOIP,CN,DIRECT,no-resolve",
+		"  - MATCH,🚀 节点选择",
+	} {
+		if !strings.Contains(out, keep) {
+			t.Errorf("原有规则被改动了: %q", keep)
+		}
 	}
 
 	// 关键：proxies / proxy-groups / rules 一个字节都不能动。
@@ -243,6 +262,47 @@ func TestRewriteConfigIdempotent(t *testing.T) {
 func TestRewriteConfigNoProxies(t *testing.T) {
 	if _, err := rewriteConfig("mode: rule\n", confPorts{socks: 10808, http: 10810, redir: 12345, ctrl: 19090, allowLan: true}); err == nil {
 		t.Error("缺少 proxies: 段时应当报错")
+	}
+}
+
+// 补进去的国内直连规则必须幂等：改写会在「启动内核」与「保存设置」时各跑一遍，
+// 不幂等的话每跑一次 rules 就多一行，配置文件会不断膨胀。
+func TestInjectCNDirectRuleIdempotent(t *testing.T) {
+	src := "rules:\n  - GEOIP,CN,DIRECT,no-resolve\n  - MATCH,🚀 节点选择\n"
+	once := strings.Join(injectCNDirectRule(strings.Split(src, "\n")), "\n")
+	twice := strings.Join(injectCNDirectRule(strings.Split(once, "\n")), "\n")
+	if once != twice {
+		t.Errorf("不幂等:\n一次:\n%s\n二次:\n%s", once, twice)
+	}
+	if n := strings.Count(once, cnDirectRule); n != 1 {
+		t.Errorf("规则出现 %d 次, 期望 1 次", n)
+	}
+}
+
+// 缩进要跟着订阅走，不能写死 —— 写死两格遇到四格缩进的订阅会生成非法 YAML。
+func TestInjectCNDirectRuleFollowsIndent(t *testing.T) {
+	src := "rules:\n    - GEOIP,CN,DIRECT,no-resolve\n    - MATCH,🚀 节点选择\n"
+	out := strings.Join(injectCNDirectRule(strings.Split(src, "\n")), "\n")
+	if !strings.Contains(out, "\n    - "+cnDirectRule+"\n") {
+		t.Errorf("应按订阅的缩进插入, 得到:\n%s", out)
+	}
+}
+
+// 没有 rules: 段时原样返回 —— 宁可不改，也不要凭空造一个规则段出来。
+func TestInjectCNDirectRuleNoRulesSection(t *testing.T) {
+	src := "mode: rule\nproxies:\n  - name: a\n"
+	got := strings.Join(injectCNDirectRule(strings.Split(src, "\n")), "\n")
+	if got != src {
+		t.Errorf("没有 rules: 段时不应改动, 得到:\n%s", got)
+	}
+}
+
+// 空的 rules: 段（后面直接跟下一个顶层键）也要能插进去
+func TestInjectCNDirectRuleEmptyRules(t *testing.T) {
+	src := "rules:\nproxies:\n  - name: a\n"
+	out := strings.Join(injectCNDirectRule(strings.Split(src, "\n")), "\n")
+	if !strings.Contains(out, "rules:\n  - "+cnDirectRule+"\n") {
+		t.Errorf("空 rules: 段也应插入, 得到:\n%s", out)
 	}
 }
 
@@ -379,6 +439,18 @@ func TestParseRealSubscription(t *testing.T) {
 		t.Errorf("dialer-proxy 数量变化: %d -> %d",
 			strings.Count(string(b), "dialer-proxy:"), n)
 	}
+
+	// 真实订阅的规则只有纯 IP 判据（GEOIP）+ no-resolve，浏览器经代理进来时
+	// 只有域名没有 IP ⇒ 一条都匹配不上 ⇒ 国内站也走代理。必须补一条域名规则。
+	// 这条断言直接拿真订阅跑，防止「样本里对、真订阅里不对」。
+	rules := out[strings.Index(out, "rules:"):]
+	if i := strings.Index(rules, "\nproxy"); i > 0 {
+		rules = rules[:i]
+	}
+	if !strings.HasPrefix(rules, "rules:\n  - "+cnDirectRule) {
+		t.Errorf("真实订阅改写后 rules: 段第一条应为 %s，实际:\n%s", cnDirectRule, rules)
+	}
+	t.Logf("真实订阅改写后的 rules:\n%s", rules)
 }
 
 // --- 以下是家宽节点测速相关测试 ---

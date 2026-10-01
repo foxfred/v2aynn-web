@@ -375,6 +375,28 @@ func (w *WebServer) apiGroupNodes(rw http.ResponseWriter, r *http.Request) {
 	w.writeJSON(rw, map[string]interface{}{"nodes": nodes, "active": active, "sort": sortOrder, "groupId": gid})
 }
 
+// clashNodePing 合并「存下来的探针结果」与「内核的实时记录」，得到列表上显示的延迟。
+//
+// 内核的记录只在**确实测到延迟**（>0）时才覆盖，这是本函数的全部要点。
+//
+// 为什么不能信内核的 0：家宽节点除了 select 组，还挂在订阅的 fallback 组
+// （`🏠 家宽自动`）下，而 mihomo 的整组健康检查**没有并发限制** —— 它会把
+// 几十个节点一次性全打出去，而这些家宽节点的出口全挤在**同一条前置通道**里，
+// 一挤爆就大批失败。失败的健康检查会往该节点的 history 里写一条 `{"delay":0}`
+// （2026-10-01 盒子实测确认），于是界面把明明测通的节点显示成「超时」，
+// 用户看到的就是「以前有延迟的节点全变超时了」。
+//
+// 我们自己的扫描是**限并发 4 + 每节点错峰 0–200ms** 的，对家宽链更可信，
+// 所以内核的 0 / 负数只当作「没有可用信息」，保留我们自己的结果。
+//
+// 返回值语义与 Node.Ping 一致：0 = 没测过（界面留空），-1 = 测过但不通（显示超时）。
+func clashNodePing(storedMS, liveMS int, hasLive bool) int {
+	if hasLive && liveMS > 0 {
+		return liveMS
+	}
+	return storedMS
+}
+
 // writeClashNodes 返回某个家宽分组的节点列表。
 //
 // 家宽节点不由本程序管理，没有 Node 结构；但界面复用同一套节点列表渲染，
@@ -431,11 +453,7 @@ func (w *WebServer) writeClashNodes(rw http.ResponseWriter, groupID string) {
 			ping, speed = p.MS, p.MBPS
 		}
 		if d, ok := live[n]; ok {
-			if d > 0 {
-				ping = d
-			} else {
-				ping = -1
-			}
+			ping = clashNodePing(ping, d, true)
 		}
 		nodes = append(nodes, config.Node{
 			ID:       config.ClashNodeID(groupID, n),

@@ -1100,6 +1100,39 @@ func TestClashNodesShowStoredProbes(t *testing.T) {
 	}
 }
 
+// 内核记录里的 0 不能覆盖我们自己扫出来的延迟。
+//
+// 家宽节点除了 select 组，还挂在订阅的 fallback 组（🏠 家宽自动）下，而
+// mihomo 的整组健康检查**没有并发限制** —— 它会把几十个节点一次性全打出去，
+// 这些家宽节点的出口又全挤在同一条前置通道里，一挤爆就大批失败，失败会往
+// history 里写一条 {"delay":0}（2026-10-01 盒子实测确认）。
+//
+// 若让这条 0 覆盖掉我们自己的扫描结果，界面就会把明明测通的节点显示成
+// 「超时」—— 用户看到的就是「以前有延迟的节点全变超时了」。
+// 我们自己的扫描是限并发 4 + 每节点错峰 0–200ms 的，对家宽链更可信。
+func TestClashNodePingKernelZeroDoesNotOverrideStored(t *testing.T) {
+	cases := []struct {
+		name    string
+		stored  int
+		live    int
+		hasLive bool
+		want    int
+	}{
+		{"内核记 0（fallback 健康检查失败）不能盖掉我们测到的 480", 480, 0, true, 480},
+		{"内核记负数同样不能盖掉", 480, -1, true, 480},
+		{"内核确实测到延迟时以内核为准", 480, 300, true, 300},
+		{"内核没这个节点的记录时用存下来的", 480, 0, false, 480},
+		{"两边都没测到 -> 0（界面留空）", 0, 0, true, 0},
+		{"我们测过不通(-1) 且内核没记录 -> 保持 -1", -1, 0, false, -1},
+	}
+	for _, c := range cases {
+		if got := clashNodePing(c.stored, c.live, c.hasLive); got != c.want {
+			t.Errorf("%s: clashNodePing(%d,%d,%v) = %d, 期望 %d",
+				c.name, c.stored, c.live, c.hasLive, got, c.want)
+		}
+	}
+}
+
 // 家宽分组的「延迟↑ / 延迟↓」排序必须生效。
 //
 // 前端是**纯服务端排序**（下拉框只发一次 /api/sort，然后重拉列表），而

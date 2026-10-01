@@ -2176,5 +2176,64 @@ func rewriteConfig(src string, p confPorts) (string, error) {
 		lines = append(lines[:idx], append(miss, tail...)...)
 	}
 
+	// 订阅的规则只有纯 IP 判据，国内域名一条都匹配不上，全部落到 MATCH 走代理。
+	// 这里在最前面补一条按域名的国内直连规则（只新增，不改不删原有规则）。
+	lines = injectCNDirectRule(lines)
+
 	return strings.Join(lines, "\n"), nil
+}
+
+// cnDirectRule 家宽配置里补的「国内直连」规则。
+//
+// 为什么必须补：cfnew 家宽订阅的规则只有
+//
+//	GEOIP,LAN,DIRECT,no-resolve
+//	GEOIP,CN,DIRECT,no-resolve
+//	MATCH,🚀 节点选择
+//
+// GEOIP 是**纯 IP 判据**，而浏览器经 HTTP / SOCKS 代理进来时内核只拿得到域名、
+// 拿不到目标 IP；`no-resolve` 又明确禁止内核为了匹配规则去解析域名。
+// 两者叠加 ⇒ 国内域名一条都匹配不上 ⇒ 全部落到 `MATCH` 走家宽链。
+// 2026-10-01 盒子实测：家宽模式下访问百度确实被 `match Match` 接走（走了代理），
+// 而普通节点配置因为第一条就是 GEOSITE,cn,DIRECT 所以没这个问题。
+//
+// 为什么用 GEOSITE 而不是给 GEOIP,CN 去掉 no-resolve：后者要靠 DNS 解析结果
+// 判断，而解析用的是订阅里写的国内 DNS，外国域名可能被解析成被污染的国内 IP，
+// 反而把该走代理的站点误判成直连。GEOSITE 按域名判断，不依赖解析结果。
+//
+// 为什么不算破坏「不动订阅规则」这条红线：这是**纯新增**一条规则，订阅原有的
+// 规则一条没改也没删，`proxies` / `proxy-groups` 一个字节没动 ⇒ 家宽链
+// （openvpn 的 dialer-proxy 指向策略组）完全不受影响。
+const cnDirectRule = "GEOSITE,cn,DIRECT"
+
+// injectCNDirectRule 在 rules: 段的最前面插入一条国内直连规则。
+//
+// 幂等：已经存在同名规则时原样返回。找不到 rules: 段时也原样返回 ——
+// 宁可不改，也不要凭空造一个规则段出来。
+func injectCNDirectRule(lines []string) []string {
+	for i, ln := range lines {
+		if k, ok := topKey(ln); !ok || k != "rules" {
+			continue
+		}
+		indent := "  " // 订阅里列表项统一缩进两格
+		for j := i + 1; j < len(lines); j++ {
+			t := lines[j]
+			if strings.TrimSpace(t) == "" {
+				continue
+			}
+			if strings.Contains(t, cnDirectRule) {
+				return lines // 已经有了，不重复插
+			}
+			if strings.HasPrefix(strings.TrimSpace(t), "- ") {
+				indent = t[:len(t)-len(strings.TrimLeft(t, " \t"))]
+			}
+			break
+		}
+		out := make([]string, 0, len(lines)+1)
+		out = append(out, lines[:i+1]...)
+		out = append(out, indent+"- "+cnDirectRule)
+		out = append(out, lines[i+1:]...)
+		return out
+	}
+	return lines
 }
