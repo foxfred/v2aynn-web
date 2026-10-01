@@ -869,10 +869,45 @@ var (
 	groupDelayClient = &http.Client{Timeout: 180 * time.Second}
 )
 
-// delayTestURL 测延迟的目标地址。
-// 与订阅里各策略组用的 url 保持一致（gstatic 204），
-// 这样界面显示的延迟和内核自动选择节点的依据是同一个。
-const delayTestURL = "http://www.gstatic.com/generate_204"
+// defaultTestURL 测延迟的兜底目标地址 —— 订阅里读不到组自己的 url 时用它。
+//
+// 必须是 https。订阅开了 unified-delay（cfnew 默认开）时，mihomo 会对同一个
+// 地址连发两次 HEAD 请求；地址是 http:// 时官方源码会打印
+//
+//	It is recommended to use HTTPS ... using HTTP may result in failed tests
+//
+// 表现就是数字忽大忽小、时有时无。cfnew 订阅自己给组写的就是 https://。
+const defaultTestURL = "https://www.gstatic.com/generate_204"
+
+// TestURLOf 从订阅原文里挑出「测延迟该用的目标地址」。
+//
+// 优先用前置通道组自己写的 url：家宽节点的出口全挤在那条链上，订阅就是拿这个
+// 地址判定链子好坏的，我们跟着用同一个，界面上的数字才和内核自动选点的依据一致。
+// 前置组没写 url（比如它是 select 组）时，退而取第一个写了 url 的组。
+//
+// 为什么从订阅里读而不是写死：写死等于把订阅的配置抄一份进自己代码，订阅换了
+// 测试地址我们无从知晓；早先硬编码的 http:// 更是正好踩中上面那条官方警告。
+func TestURLOf(subBody []byte) string {
+	info := parseSubscription(string(subBody))
+	if u := info.groupURLs[info.frontGroup]; u != "" {
+		return u
+	}
+	for _, name := range info.groupOrder {
+		if u := info.groupURLs[name]; u != "" {
+			return u
+		}
+	}
+	return defaultTestURL
+}
+
+// TestURL 取某个家宽分组测延迟要用的地址。读不到订阅原文就退回默认值。
+func (m *Manager) TestURL(groupID string) string {
+	body, err := readSubFile(m.dataDir, groupID)
+	if err != nil {
+		return defaultTestURL
+	}
+	return TestURLOf(body)
+}
 
 func (m *Manager) controlAddr() string {
 	m.mu.Lock()
@@ -989,15 +1024,20 @@ func ctrlProxyDelays(addr string, known map[string]bool) map[string]int {
 // 必须由内核测而不是本程序 TCP 探测：家宽节点的出口是一条 OpenVPN over
 // Cloudflare 的隧道，探测它自己的 IP:端口完全反映不出隧道是否可用。
 func (m *Manager) ProxyDelay(name string, timeoutMs int) (int, error) {
-	return ctrlProxyDelay(m.controlAddr(), name, timeoutMs)
+	return ctrlProxyDelay(m.controlAddr(), name, timeoutMs, m.TestURL(m.LoadedGroup()))
 }
 
 // ctrlProxyDelay 走 external-controller 测单个代理（节点或策略组）的延迟。
 //
-// name 传策略组名也成立 —— 测前置通道时用的就是这条路。
-func ctrlProxyDelay(addr, name string, timeoutMs int) (int, error) {
+// name 传策略组名也成立 —— 但它走的是组的 fast()，在组里还没有延迟历史时
+// 取的是成员列表里的第一个节点、且不检查它死活（见 ProxyNow 的说明）。
+// 想知道「这个组现在实际在用哪个节点」，用 ProxyNow。
+func ctrlProxyDelay(addr, name string, timeoutMs int, testURL string) (int, error) {
+	if testURL == "" {
+		testURL = defaultTestURL
+	}
 	u := fmt.Sprintf("http://%s/proxies/%s/delay?timeout=%d&url=%s",
-		addr, url.PathEscape(name), timeoutMs, url.QueryEscape(delayTestURL))
+		addr, url.PathEscape(name), timeoutMs, url.QueryEscape(testURL))
 	resp, err := delayClient.Get(u)
 	if err != nil {
 		return 0, err
@@ -1023,6 +1063,46 @@ func ctrlProxyDelay(addr, name string, timeoutMs int) (int, error) {
 	return r.Delay, nil
 }
 
+// GroupNowTester 能报出某个策略组「此刻实际在用哪个节点」的后端。
+//
+// 单独一个接口而不是塞进 DelayTester：它只有诊断路径用得上，不是测速的必需能力。
+type GroupNowTester interface {
+	ProxyNow(name string) (string, error)
+}
+
+// ProxyNow 读内核里某个策略组当前选中的节点名。
+//
+// 为什么要专门读它，而不是直接拿组名去测延迟：`/proxies/{组}/delay` 走的是组的
+// fast()，而 fast() 在组里还没有延迟历史时**无条件取成员列表的第一个节点**，
+// 且不检查它是否存活。于是「测前置通道」实际变成了「测订阅里第一个 CF 节点」——
+// 它恰好挂着就误报「前置不通」，另外两百多个明明好好的；订阅一刷新节点顺序变了，
+// 同一个分组又时好时坏。先问内核「你现在用的是谁」再去测，结论才站得住。
+func (m *Manager) ProxyNow(name string) (string, error) {
+	return ctrlProxyNow(m.controlAddr(), name)
+}
+
+// ctrlProxyNow 走 external-controller 读某个代理/策略组的 now 字段。
+func ctrlProxyNow(addr, name string) (string, error) {
+	resp, err := stateClient.Get("http://" + addr + "/proxies/" + url.PathEscape(name))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("内核返回 %s", resp.Status)
+	}
+	var r struct {
+		Now string `json:"now"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&r); err != nil {
+		return "", err
+	}
+	if r.Now == "" {
+		return "", fmt.Errorf("内核没报出[%s]当前用哪个节点", name)
+	}
+	return r.Now, nil
+}
+
 // GroupDelay 让内核并发测试整个策略组里所有节点的延迟。
 //
 // ⚠️ 整组并发测速会把组里所有节点一次性全打出去。家宽节点共用同一条前置
@@ -1036,18 +1116,21 @@ func (m *Manager) GroupDelay(group string, timeoutMs int) (map[string]int, error
 		known[n] = true
 	}
 	m.mu.Unlock()
-	return ctrlGroupDelay(m.controlAddr(), group, timeoutMs, known)
+	return ctrlGroupDelay(m.controlAddr(), group, timeoutMs, known, m.TestURL(m.LoadedGroup()))
 }
 
 // ctrlGroupDelay 走 external-controller 测一个策略组里所有节点的延迟。
 // known 用于过滤掉不属于本分组的条目（组里万一混了别的节点，不要污染界面）；
 // 传 nil 表示不过滤。
-func ctrlGroupDelay(addr, group string, timeoutMs int, known map[string]bool) (map[string]int, error) {
+func ctrlGroupDelay(addr, group string, timeoutMs int, known map[string]bool, testURL string) (map[string]int, error) {
 	if group == "" {
 		return nil, fmt.Errorf("未识别到家宽节点选择组")
 	}
+	if testURL == "" {
+		testURL = defaultTestURL
+	}
 	u := fmt.Sprintf("http://%s/group/%s/delay?timeout=%d&url=%s",
-		addr, url.PathEscape(group), timeoutMs, url.QueryEscape(delayTestURL))
+		addr, url.PathEscape(group), timeoutMs, url.QueryEscape(testURL))
 	resp, err := groupDelayClient.Get(u)
 	if err != nil {
 		return nil, err
@@ -1182,6 +1265,11 @@ type subInfo struct {
 	// frontGroup 前置通道组名 —— openvpn 节点靠 dialer-proxy 指向它做链式转发。
 	// 全部家宽节点的出口都挤在这一个组上，所以它不通时所有家宽节点都不通。
 	frontGroup string
+	// groupURLs 各策略组自己声明的测速地址（组名 → url）。
+	// 测延迟时跟着订阅走，别自己写死 —— 见 TestURLOf。
+	groupURLs map[string]string
+	// groupOrder 组名按在订阅里出现的顺序，取 url 时用它保证结果稳定。
+	groupOrder []string
 }
 
 // FrontGroupOf 从家宽订阅原文里取出前置通道组名。取不到返回空串。
@@ -1212,6 +1300,7 @@ func parseSubscription(src string) subInfo {
 		gNames      []string
 		gTypes      []string
 		gMembers    [][]string
+		gURLs       []string
 		curG        = -1
 		groupIndent = -1
 		inMembers   bool
@@ -1255,6 +1344,7 @@ func parseSubscription(src string) subInfo {
 					gNames = append(gNames, unquote(m[2]))
 					gTypes = append(gTypes, "")
 					gMembers = append(gMembers, nil)
+					gURLs = append(gURLs, "")
 					curG = len(gNames) - 1
 					inMembers = false
 					continue
@@ -1269,6 +1359,10 @@ func parseSubscription(src string) subInfo {
 					inMembers = true
 				case "type":
 					gTypes[curG] = unquote(m[2])
+					inMembers = false
+				case "url":
+					// 组自己声明的测速地址。测延迟时优先用它 —— 见 TestURLOf。
+					gURLs[curG] = unquote(m[2])
 					inMembers = false
 				default:
 					inMembers = false
@@ -1352,6 +1446,16 @@ func parseSubscription(src string) subInfo {
 			if info.topGroup != "" {
 				break
 			}
+		}
+	}
+
+	// 4) 各组声明的测速地址，按出现顺序记下来。
+	//    不提前 return 空 map —— TestURLOf 要能区分「组没写 url」与「压根没解析到」。
+	info.groupURLs = make(map[string]string, len(gNames))
+	for i, n := range gNames {
+		info.groupOrder = append(info.groupOrder, n)
+		if i < len(gURLs) && gURLs[i] != "" {
+			info.groupURLs[n] = gURLs[i]
 		}
 	}
 	return info

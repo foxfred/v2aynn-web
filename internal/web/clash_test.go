@@ -41,6 +41,7 @@ proxies:
 proxy-groups:
   - name: "⚡ CF前置"
     type: url-test
+    url: https://www.gstatic.com/generate_204
     proxies:
       - "优选域名-01"
   - name: "🏠 家宽节点"
@@ -98,16 +99,22 @@ type fakeProber struct {
 	running  bool
 	startErr error
 	delays   map[string]int
+	// nows 各策略组「当前在用哪个节点」。真实内核里这是 /proxies/{组} 的 now 字段。
+	nows map[string]string
 }
 
 func newFakeProber() *fakeProber {
-	return &fakeProber{delays: map[string]int{
-		// 前置通道默认是通的 —— 真实场景里前置不通时所有家宽节点都不通，
-		// 那条路径由 TestPingClashGroupFailsFastWhenFrontDown 单独覆盖。
-		"⚡ CF前置":     120,
-		"🏠 JP-家宽-01": 480,
-		"🏠 KR-家宽-01": 620,
-	}}
+	return &fakeProber{
+		delays: map[string]int{
+			"🏠 JP-家宽-01": 480,
+			"🏠 KR-家宽-01": 620,
+		},
+		nows: map[string]string{
+			// 前置组当前用的节点。刻意让它**不在** delays 表里 ——
+			// 这正是「拿组名去测会落到一个说不清是谁的节点」那个坑的替身。
+			"⚡ CF前置": "优选域名-01",
+		},
+	}
 }
 
 func (f *fakeProber) Ensure(groupID string, resident bool) error {
@@ -146,6 +153,17 @@ func (f *fakeProber) ProxyDelay(name string, timeoutMs int) (int, error) {
 		return 0, fmt.Errorf("节点无响应")
 	}
 	return ms, nil
+}
+
+// ProxyNow 对应真实内核 /proxies/{组} 的 now 字段。
+func (f *fakeProber) ProxyNow(name string) (string, error) {
+	f.mu.Lock()
+	now, ok := f.nows[name]
+	f.mu.Unlock()
+	if !ok || now == "" {
+		return "", fmt.Errorf("内核没报出[%s]当前用哪个节点", name)
+	}
+	return now, nil
 }
 
 func newClashTestServer(t *testing.T) (*WebServer, *config.Config, *mihomo.Manager, string) {
@@ -543,14 +561,43 @@ func TestPingClashGroupUsesProberAndPersists(t *testing.T) {
 	}
 }
 
-// 前置通道不通时，所有家宽节点都不可能通。必须直接说清楚，
-// 别让用户对着 70 多个超时发呆 —— 那正是「数字乱」的一部分。
-func TestPingClashGroupFailsFastWhenFrontDown(t *testing.T) {
+// ★ 回归：家宽节点自己测得出延迟时，绝不能因为「前置通道探测」把整轮结果挡掉。
+//
+// 这正是「网关检测不稳定」的根因：内核的 /proxies/{组}/delay 走的是组的 fast()，
+// 而 fast() 在组里还没有延迟历史时**无条件取成员列表的第一个节点、且不检查它死活**。
+// 于是「探前置通道」实际变成了「探订阅里第一个 CF 节点」—— 它恰好挂着就误报
+// 「前置不通」，另外两百多个明明好好的；订阅一刷新节点顺序变了，同一个分组
+// 又时好时坏。
+//
+// 这里让 delays 表里**没有**任何以组名出现的前置条目（等价于 fast() 挑中的那个
+// 节点测不通），而两个家宽节点都正常 —— 期望照常返回节点结果，不报错。
+func TestPingClashGroupNotBlockedByFrontProbe(t *testing.T) {
 	s, cfg, mhm, url := newClashTestServer(t)
 	seedClashGroup(t, cfg, mhm, "g1", "家宽", url)
+
+	req := httptest.NewRequest("POST", "/api/ping/group/g1", nil)
+	req.SetPathValue("id", "g1")
+	rec := httptest.NewRecorder()
+	s.apiPingGroup(rec, req)
+
+	var res []map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatalf("应当返回节点结果数组，实际 body=%s", rec.Body.String())
+	}
+	if len(res) != 2 {
+		t.Fatalf("应当返回 2 个节点的结果, 得到 %d (body=%s)", len(res), rec.Body.String())
+	}
+}
+
+// 家宽节点一个都测不通、且前置通道当前用的那个节点也不通时，必须点名说是
+// 前置通道的问题 —— 家宽节点的出口全挤在它上面，先修它才有意义。
+func TestPingClashGroupBlamesFrontWhenAllNodesFail(t *testing.T) {
+	s, cfg, mhm, url := newClashTestServer(t)
+	seedClashGroup(t, cfg, mhm, "g1", "家宽", url)
+
 	f := s.prober.(*fakeProber)
 	f.mu.Lock()
-	delete(f.delays, "⚡ CF前置")
+	f.delays = map[string]int{} // 全都不通，前置组当前用的节点同样不在表里
 	f.mu.Unlock()
 
 	req := httptest.NewRequest("POST", "/api/ping/group/g1", nil)
@@ -563,13 +610,44 @@ func TestPingClashGroupFailsFastWhenFrontDown(t *testing.T) {
 	if !strings.Contains(resp["error"], "前置通道") {
 		t.Errorf("应当明确指出前置通道不通, 实际: %q", resp["error"])
 	}
-	// 前置不通时不该白测一轮：节点表里不应留下任何结果
+	// 报的是「前置组当前用的那个节点」，不是拿组名去蒙的
+	if !strings.Contains(resp["error"], "优选域名-01") {
+		t.Errorf("应当点名前置通道当前用的节点, 实际: %q", resp["error"])
+	}
+	// 全都不通时不该留下半截结果
 	cfg.Lock()
 	g := cfg.FindClashGroup("g1")
 	_, has := g.Probe("🏠 JP-家宽-01")
 	cfg.Unlock()
 	if has {
-		t.Error("前置不通时不该产出节点结果")
+		t.Error("全都不通时不该产出节点结果")
+	}
+}
+
+// 前置通道是好的、但家宽节点全挂（掉线是常态）时，别把锅甩给前置，
+// 该提示的是「换一批节点」。
+func TestPingClashGroupSuggestsRefreshWhenFrontIsFine(t *testing.T) {
+	s, cfg, mhm, url := newClashTestServer(t)
+	seedClashGroup(t, cfg, mhm, "g1", "家宽", url)
+
+	f := s.prober.(*fakeProber)
+	f.mu.Lock()
+	// 家宽节点全挂，但前置组当前用的节点是通的
+	f.delays = map[string]int{"优选域名-01": 120}
+	f.mu.Unlock()
+
+	req := httptest.NewRequest("POST", "/api/ping/group/g1", nil)
+	req.SetPathValue("id", "g1")
+	rec := httptest.NewRecorder()
+	s.apiPingGroup(rec, req)
+
+	var resp map[string]string
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if !strings.Contains(resp["error"], "更新") {
+		t.Errorf("前置正常时应提示换一批节点, 实际: %q", resp["error"])
+	}
+	if strings.Contains(resp["error"], "前置通道") && strings.Contains(resp["error"], "也测不通") {
+		t.Errorf("前置明明是通的, 不该说它不通: %q", resp["error"])
 	}
 }
 

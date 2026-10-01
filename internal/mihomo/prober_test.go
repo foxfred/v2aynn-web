@@ -264,3 +264,108 @@ func TestProberCanReside(t *testing.T) {
 		t.Errorf("可用 %d MB 已超过阈值 %d，应当允许常驻", mb, probeMinFreeMB)
 	}
 }
+
+// 每个节点开测前都要错峰一次 —— 同时开测的几个节点会一起抢同一条前置通道，
+// 互相踩踏之后测出来的就是噪声。对齐 Clash Verge Rev 的做法。
+//
+// 这里把抖动换成「返回 0」的确定实现：既验证了它每个节点都调用了一次，
+// 又不会为了等随机睡眠把用例拖慢（也避免对随机数断言造成偶发失败）。
+func TestSweepDelayAppliesJitterBeforeEachMeasure(t *testing.T) {
+	old := sweepJitter
+	defer func() { sweepJitter = old }()
+
+	var mu sync.Mutex
+	calls := 0
+	sweepJitter = func() time.Duration {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		return 0
+	}
+
+	d := delayTesterFunc(func(name string, timeoutMs int) (int, error) { return 100, nil })
+	names := []string{"a", "b", "c", "d"}
+	SweepDelay(d, names, 1000, 2)
+
+	if calls != len(names) {
+		t.Errorf("每个节点开测前都该错峰一次, 期望 %d 次, 实际 %d", len(names), calls)
+	}
+}
+
+// 错峰等待不能设太大：70 多个节点累加起来会把整轮测速拖得很难受。
+func TestSweepJitterStaysSmall(t *testing.T) {
+	if SweepJitterMax <= 0 {
+		t.Fatal("错峰等待被关掉了 —— 并发测速会重新变成互相踩踏")
+	}
+	if SweepJitterMax > 500*time.Millisecond {
+		t.Errorf("错峰等待 %v 太长，70 多个节点累加会明显拖慢整轮测速", SweepJitterMax)
+	}
+}
+
+// 测速地址必须跟着订阅走：cfnew 给组写的是 https://，早先我们硬编码成 http://，
+// 正好踩中 mihomo 那条「unified-delay 下用 HTTP 可能测不通」的官方警告，
+// 表现就是数字忽大忽小、时有时无。
+func TestTestURLOfPrefersFrontGroupURL(t *testing.T) {
+	src := `proxies:
+  - name: "HW1"
+    type: openvpn
+    dialer-proxy: "⚡ CF前置"
+proxy-groups:
+  - name: "⚡ CF前置"
+    type: url-test
+    url: https://www.gstatic.com/generate_204
+    proxies:
+      - "A"
+  - name: "家宽组"
+    type: select
+    proxies:
+      - "HW1"
+`
+	if got := TestURLOf([]byte(src)); got != "https://www.gstatic.com/generate_204" {
+		t.Errorf("TestURLOf = %q, 期望取前置组自己写的 url", got)
+	}
+}
+
+// 前置组没写 url（比如它是 select 组）时，退而取别的组写的地址；
+// 一个都没有才用兜底值 —— 而兜底值必须是 https。
+func TestTestURLOfFallsBack(t *testing.T) {
+	noURL := `proxies:
+  - name: "HW1"
+    type: openvpn
+    dialer-proxy: "⚡ CF前置"
+proxy-groups:
+  - name: "⚡ CF前置"
+    type: url-test
+    proxies:
+      - "A"
+`
+	if got := TestURLOf([]byte(noURL)); got != defaultTestURL {
+		t.Errorf("组里都没写 url 时应当退回默认值 %q, 得到 %q", defaultTestURL, got)
+	}
+
+	otherURL := `proxies:
+  - name: "HW1"
+    type: openvpn
+    dialer-proxy: "⚡ CF前置"
+proxy-groups:
+  - name: "⚡ CF前置"
+    type: select
+    proxies:
+      - "A"
+  - name: "别的组"
+    type: url-test
+    url: "https://cp.cloudflare.com/generate_204"
+    proxies:
+      - "A"
+`
+	if got := TestURLOf([]byte(otherURL)); got != "https://cp.cloudflare.com/generate_204" {
+		t.Errorf("前置组没写 url 时应取其他组写的, 得到 %q", got)
+	}
+}
+
+// 兜底地址一旦变成 http:// 就等于把刚修好的坑又踩回去，钉死它。
+func TestDefaultTestURLIsHTTPS(t *testing.T) {
+	if !strings.HasPrefix(defaultTestURL, "https://") {
+		t.Errorf("兜底测速地址必须是 https（unified-delay 下用 http 会测不通）, 得到 %q", defaultTestURL)
+	}
+}

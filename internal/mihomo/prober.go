@@ -3,6 +3,7 @@ package mihomo
 import (
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"os/exec"
@@ -45,6 +46,23 @@ func MeasureDelay(t DelayTester, name string, timeoutMs int) int {
 	return ms
 }
 
+// SweepJitterMax 每个节点开测前的最大随机等待。
+//
+// 并发一放出去，几个节点会在同一瞬间去抢同一条前置通道建隧道，互相踩踏之后
+// 测到的数字是噪声而不是节点本身。每个 worker 开测前随机等一小会儿把压力摊平，
+// 代价只是整轮多花几百毫秒。做法对齐 Clash Verge Rev（它对每个节点随机等 0–200ms）。
+var SweepJitterMax = 200 * time.Millisecond
+
+// sweepJitter 返回一个节点开测前要等多久。
+//
+// 单独抽成变量是为了让测试能换成确定实现 —— 直接对随机数断言会变成偶发失败的用例。
+var sweepJitter = func() time.Duration {
+	if SweepJitterMax <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int63n(int64(SweepJitterMax)))
+}
+
 // SweepDelay 限并发地逐个测家宽节点的延迟，返回 节点名→毫秒（-1 表示不通）。
 //
 // 为什么不用内核的「整组测延迟」接口（/group/<组名>/delay）：那个接口把组里
@@ -65,6 +83,11 @@ func SweepDelay(t DelayTester, names []string, timeoutMs, concurrency int) map[s
 		go func(name string) {
 			defer wg.Done()
 			sem <- struct{}{}
+			// 错峰放在占住名额之后：真正会互相踩的是同时在测的那几个，
+			// 让它们的开测时刻散开才有意义。
+			if d := sweepJitter(); d > 0 {
+				time.Sleep(d)
+			}
 			ms := MeasureDelay(t, name, timeoutMs)
 			<-sem
 			mu.Lock()
@@ -163,6 +186,10 @@ type Prober struct {
 	cmd     *exec.Cmd
 	running bool
 	groupID string // 当前装在里面的是哪个家宽分组
+	// testURL 这个分组测延迟该用的地址，从订阅原文里读出来（见 TestURLOf）。
+	// 在 Ensure 里算一次存下来即可 —— 一轮测速每个节点要调用两次，
+	// 没必要每次都重扫一遍订阅原文。
+	testURL string
 
 	socks, http, redir, ctrl int
 	// resident 是否常驻。内存紧张、或家宽内核正在服务流量时为 false，
@@ -245,6 +272,8 @@ func (p *Prober) Ensure(groupID string, resident bool) error {
 	if len(parseSubscription(string(body)).nodes) == 0 {
 		return fmt.Errorf("订阅里没有 openvpn 节点（cfnew 的链接需要带 target=vg 参数）")
 	}
+	// 测速地址从订阅里读，别写死 —— 见 TestURLOf 的说明。
+	testURL := TestURLOf(body)
 
 	// 端口每次重来都重新挑：上一次用过的端口可能已经被别的进程占走
 	var ports [4]int
@@ -261,6 +290,7 @@ func (p *Prober) Ensure(groupID string, resident bool) error {
 	// 都不能留下「看起来装好了其实没装」的状态，那会让后续测速去问一个
 	// 不存在的内核要数据。
 	p.groupID = ""
+	p.testURL = ""
 	p.resident = resident
 	timeout := p.startTimeout
 	p.mu.Unlock()
@@ -301,6 +331,7 @@ func (p *Prober) Ensure(groupID string, resident bool) error {
 	// 就绪之后才认这个分组
 	p.mu.Lock()
 	p.groupID = groupID
+	p.testURL = testURL
 	p.mu.Unlock()
 	log.Printf("家宽测速探针已就绪（分组 %s，控制口 %d）", groupID, ctrl)
 	return nil
@@ -320,6 +351,7 @@ func (p *Prober) kill() {
 	p.cmd = nil
 	p.running = false
 	p.groupID = ""
+	p.testURL = ""
 	p.mu.Unlock()
 	if cmd != nil && cmd.Process != nil {
 		// 不在这里 Wait，由 reap goroutine 收尸，避免重复 Wait panic
@@ -401,12 +433,23 @@ func (p *Prober) waitReady(timeout time.Duration) error {
 // ProxyDelay 测单个家宽节点的延迟（DelayTester 接口）
 func (p *Prober) ProxyDelay(name string, timeoutMs int) (int, error) {
 	p.mu.Lock()
-	running, addr := p.running, p.ctrlAddrLocked()
+	running, addr, testURL := p.running, p.ctrlAddrLocked(), p.testURL
 	p.mu.Unlock()
 	if !running {
 		return 0, fmt.Errorf("测速探针没在跑")
 	}
-	return ctrlProxyDelay(addr, name, timeoutMs)
+	return ctrlProxyDelay(addr, name, timeoutMs, testURL)
+}
+
+// ProxyNow 读探针里某个策略组当前选中的节点名（GroupNowTester 接口）。
+func (p *Prober) ProxyNow(name string) (string, error) {
+	p.mu.Lock()
+	running, addr := p.running, p.ctrlAddrLocked()
+	p.mu.Unlock()
+	if !running {
+		return "", fmt.Errorf("测速探针没在跑")
+	}
+	return ctrlProxyNow(addr, name)
 }
 
 // Delays 读探针缓存里这些节点的最近延迟（不触发测速）。
