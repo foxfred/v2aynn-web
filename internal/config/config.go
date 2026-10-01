@@ -217,6 +217,25 @@ func (c *Config) AllNodes() []Node {
 	return all
 }
 
+// NormalNodes 返回所有**普通**分组的节点，家宽分组一律跳过。
+//
+// 内核统一后普通节点也要交给 mihomo，而 mihomo 一次只加载一份配置，
+// 所以生成配置时必须把全部普通分组的节点合在一起 —— 与旧版 xray 的行为一致
+// （xray 那套的 AllNodes 也是全量合并，只是那时家宽节点不存在 Node 结构）。
+//
+// 家宽分组的 Nodes 恒为空，跳过只是把意图写明，避免以后有人给家宽分组塞节点。
+// 调用方需持有 c 的锁。
+func (c *Config) NormalNodes() []Node {
+	var all []Node
+	for _, g := range c.Groups {
+		if g.IsClash() {
+			continue
+		}
+		all = append(all, g.Nodes...)
+	}
+	return all
+}
+
 // FailoverEnabled 自动故障转移是否开启（未显式设置时默认开启）
 func (c *Config) FailoverEnabled() bool {
 	return c.AutoFailover == nil || *c.AutoFailover
@@ -522,20 +541,38 @@ func (c *Config) ActiveClashGroup() *Group {
 	return nil
 }
 
-// CurrentKernel 返回当前应当运行的内核，只可能是 "xray" 或 "mihomo"。
-// 空值与任何未知取值都回落到 "xray"（与旧版行为一致）。
-// 调用方需持有 c 的锁。
-func (c *Config) CurrentKernel() string {
-	if c.Kernel == KernelMihomo {
-		return KernelMihomo
+// ActiveKind 返回当前生效的**节点类型**：KindNormal（普通节点）或 KindClash（家宽节点）。
+//
+// 名字里的「Kernel」是历史遗留。早期两个内核按节点类型分派（普通走 xray、家宽走
+// mihomo），所以这个字段等价于「哪个内核在跑」。内核统一之后**永远只有 mihomo 在跑**，
+// 该字段不再表示「哪个内核」，而是「现在加载的是哪一份配置」——
+// 普通节点配置还是某个家宽分组的订阅原文。
+//
+// 之所以保留 Kernel 字段名与 "xray"/"mihomo" 这两个取值：config.json 里存的就是它们，
+// 改名会让老配置读不出来，而这两个值现在只当作「普通 / 家宽」的标签用。
+//
+// 空值与任何未知取值都回落到普通节点（与旧版行为一致）。调用方需持有 c 的锁。
+func (c *Config) ActiveKind() string {
+	if c.Kernel == KindClash {
+		return KindClash
 	}
-	return KernelXray
+	return KindNormal
 }
 
-// 内核标识常量。两个内核监听同一组端口，故同一时刻只能运行其一。
+// 节点类型常量。
+//
+// 历史上这两个值对应两个内核，所以字面量仍是 "xray"/"mihomo"（config.json 兼容）。
+// 内核统一后它们只表示「当前生效的节点类型」：
+//
+//	KindNormal —— 普通节点（trojan/vless/vmess/ss），由 BuildNormalConfig 生成配置
+//	KindClash  —— 家宽节点，直接改写订阅原文
 const (
-	KernelXray   = "xray"
-	KernelMihomo = "mihomo"
+	KindNormal = "xray"
+	KindClash  = "mihomo"
+
+	// 旧名，保留给既有调用方与测试，语义同 KindNormal / KindClash。
+	KernelXray   = KindNormal
+	KernelMihomo = KindClash
 )
 
 // ClashNodeIDPrefix 家宽节点在界面上的 ID 前缀。

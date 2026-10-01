@@ -14,6 +14,7 @@ package mihomo
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -104,6 +105,22 @@ type Manager struct {
 	topGroup    string   // 顶层主 select 组名，成员包含 nodeGroup
 	activeName  string   // 当前选中的家宽节点名
 
+	// normalMode 当前加载的是「普通节点配置」（由 BuildNormalConfig 生成），
+	// 而不是某个家宽分组的订阅原文。
+	//
+	// 两种配置共用同一个 confFileName：mihomo 一次只加载一份，落到同一个文件
+	// 最省事，Start()/watch()/自愈那套也就完全不用分叉。
+	normalMode bool
+	// normalSig 生成当前普通节点配置时那批节点的签名，用来判断「要不要重写配置」。
+	// 切节点是高频操作，节点集合没变时只拨一下策略组即可，不必重启内核。
+	normalSig string
+	// normalByID / normalByName 普通节点在「界面 ID」与「配置里的节点名」之间的映射。
+	//
+	// 必须有这两张表：Clash 要求节点名唯一，重名节点在生成配置时会被加上 " #N"
+	// 后缀，所以界面上点的是节点 ID，而内核里认的是那个被改过的名字。
+	normalByID   map[string]normalNodeRef
+	normalByName map[string]string
+
 	// nodeCounts 各分组解析出的节点数。侧栏每个家宽分组都要显示节点数，
 	// 但只有「当前生效」那个的节点真在内存里，所以这里单独记一份。
 	nodeCounts map[string]int
@@ -188,6 +205,12 @@ func (m *Manager) ports() (socksPort, httpPort int) {
 	return
 }
 
+// ErrKernelMissing 内核或 geo 数据没部署好。
+//
+// 这是一类**确定性失败**：文件不在，重试多少次都还是不在。调用方（开机自动启动）
+// 靠它提前收手，而不是白等 5 轮重试 —— 那期间代理一直是停的，用户只会觉得程序卡住。
+var ErrKernelMissing = errors.New("mihomo 内核未就绪")
+
 // CheckEnv 启动前检查内核与 geo 数据是否就位。
 //
 // 缺 geo 数据时 mihomo 会尝试联网从 GitHub 下载，墙内会卡满 90 秒超时，
@@ -196,18 +219,23 @@ func (m *Manager) ports() (socksPort, httpPort int) {
 //
 // geosite.dat 只在订阅规则真的引用了 GEOSITE 时才必需：没引用的话 mihomo
 // 根本不会去加载它，缺了也不影响启动。cfnew 的默认订阅只用 GEOIP，所以
-// 多数情况下只需要 geoip.metadb 一个文件。
+// 多数情况下只需要 geoip.metadb 一个文件。普通节点那份配置用到了 GEOSITE，
+// 由 usesGeosite 自动识别。
+//
+// 所有错误都包了 ErrKernelMissing，方便调用方区分「环境没准备好」与「偶发失败」。
 func (m *Manager) CheckEnv() error {
 	if _, err := os.Stat(m.bin); err != nil {
-		return fmt.Errorf("找不到 mihomo 内核(%s)，请先把内核文件部署到该路径", m.bin)
+		return fmt.Errorf("%w: 找不到 mihomo 内核(%s)，请先把内核文件部署到该路径",
+			ErrKernelMissing, m.bin)
 	}
 	if _, err := os.Stat(filepath.Join(m.dataDir, GeoIPMetaDB)); err != nil {
-		return fmt.Errorf("缺少 GeoIP 库 %s（应放在 %s/）。缺这个文件时 mihomo 会联网下载并卡死 90 秒，期间代理端口不会监听",
-			GeoIPMetaDB, m.dataDir)
+		return fmt.Errorf("%w: 缺少 GeoIP 库 %s（应放在 %s/）。缺这个文件时 mihomo 会联网下载并卡死 90 秒，期间代理端口不会监听",
+			ErrKernelMissing, GeoIPMetaDB, m.dataDir)
 	}
 	if m.usesGeosite() {
 		if _, err := os.Stat(filepath.Join(m.dataDir, GeoFile)); err != nil {
-			return fmt.Errorf("订阅规则用到了 GEOSITE，但缺少 %s（应放在 %s/）", GeoFile, m.dataDir)
+			return fmt.Errorf("%w: 规则用到了 GEOSITE，但缺少 %s（应放在 %s/）",
+				ErrKernelMissing, GeoFile, m.dataDir)
 		}
 	}
 	return nil
@@ -251,19 +279,15 @@ func (m *Manager) Start() error {
 		return nil
 	}
 	if len(m.nodes) == 0 {
-		return fmt.Errorf("家宽节点列表为空，请重新拉取订阅")
+		return fmt.Errorf("节点列表为空，请先添加订阅分组或重新拉取订阅")
 	}
 	confPath := filepath.Join(m.dataDir, confFileName)
 	if _, err := os.Stat(confPath); err != nil {
-		return fmt.Errorf("家宽配置尚未生成，请先在左侧用「添加订阅分组」添加家宽订阅")
+		return fmt.Errorf("运行配置尚未生成，请先添加订阅分组")
 	}
 
-	// 恢复上次选中的节点名（内存态，进程重启后靠 config 里的 ClashNode 还原）
-	if m.cfg != nil {
-		m.cfg.Lock()
-		m.activeName = m.cfg.ClashNode
-		m.cfg.Unlock()
-	}
+	// 恢复上次选中的节点名（内存态，进程重启后靠 config 里的 ActiveNode/ClashNode 还原）
+	m.activeName = m.persistedActiveNameLocked()
 	m.ensureActiveNodeLocked()
 
 	m.cmd = exec.Command(m.bin, "-d", m.dataDir, "-f", confPath)
@@ -301,11 +325,20 @@ func (m *Manager) Start() error {
 // 单独抽出来是为了能被测试直接调用 —— 它整条都在跟内核说话，只有拆出来
 // 才测得到「两个重放都真的做了、顺序也对」。
 func (m *Manager) restoreSelection(want string) {
+	// 两种模式都会走到这里，日志里要分得清是哪一种 —— 内核统一之后普通节点
+	// 也由这个函数重放，再写死「家宽节点」会让人在排查时找错方向。
+	m.mu.Lock()
+	kind := "普通"
+	if !m.normalMode {
+		kind = "家宽"
+	}
+	m.mu.Unlock()
+
 	if want != "" {
 		if err := m.applyNode(want); err != nil {
-			log.Printf("恢复家宽节点[%s]失败: %v", want, err)
+			log.Printf("恢复%s节点[%s]失败: %v", kind, want, err)
 		} else {
-			log.Printf("已恢复家宽节点[%s]", want)
+			log.Printf("已恢复%s节点[%s]", kind, want)
 		}
 	}
 	if err := m.applyFront(); err != nil {
@@ -471,19 +504,26 @@ func (m *Manager) GroupNodeCount(groupID string) int {
 }
 
 // Status 返回状态，字段名与 v2ray.Manager.Status 对齐，web 层可直接透传。
+//
+// 普通模式下 activeNode 是节点 ID、activeName 是节点显示名 —— 与 v2ray 那套
+// 完全一致，界面不用区分当前跑的是哪种配置。
 func (m *Manager) Status() map[string]interface{} {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	activeNode := ""
-	if m.activeName != "" {
+	activeNode, activeName := "", m.activeName
+	if m.normalMode {
+		activeNode = m.normalByName[m.activeName]
+		activeName = m.normalByID[activeNode].display
+	} else if m.activeName != "" {
 		activeNode = config.ClashNodeID(m.loadedGroup, m.activeName)
 	}
 	return map[string]interface{}{
 		"running":     m.running,
-		"kernel":      config.KernelMihomo,
+		"kernel":      config.KindClash,
 		"activeNode":  activeNode,
-		"activeName":  m.activeName,
+		"activeName":  activeName,
 		"loadedGroup": m.loadedGroup,
+		"normalMode":  m.normalMode,
 	}
 }
 
@@ -597,6 +637,12 @@ func (m *Manager) LoadGroup(groupID, subURL, proxy string) error {
 	m.nodes = info.nodes
 	m.nodeGroup = info.nodeGroup
 	m.topGroup = info.topGroup
+	// 切回家宽模式，必须把普通节点那套映射一起清掉。不清的话 Status()、
+	// 选节点恢复、ensureActiveNodeLocked 会继续按普通模式的表去查，
+	// 查出来全是空值 —— 表现为「切到家宽后界面没有高亮、配置也不落盘」。
+	m.normalMode = false
+	m.normalByID, m.normalByName = nil, nil
+	m.normalSig = ""
 	if m.nodeCounts == nil {
 		m.nodeCounts = map[string]int{}
 	}
@@ -609,6 +655,146 @@ func (m *Manager) LoadGroup(groupID, subURL, proxy string) error {
 // readSub 读取某个分组的订阅原文（见 readSubFile）。
 func (m *Manager) readSub(groupID string) ([]byte, error) {
 	return readSubFile(m.dataDir, groupID)
+}
+
+// normalNodeRef 一个普通节点在生成配置之后对应的两个名字。
+type normalNodeRef struct {
+	clash   string // 配置里的节点名（重名时会带 " #N" 后缀）
+	display string // 界面显示用的原始节点名
+}
+
+// IsNormalMode 当前加载的是不是普通节点配置。
+func (m *Manager) IsNormalMode() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.normalMode
+}
+
+// LoadNormal 用普通节点生成一份 mihomo 配置并落盘。
+//
+// 与 LoadGroup 的区别：家宽订阅给的本来就是一份完整的 Clash 配置，只需改顶层
+// 7 个键；普通订阅给的是一串 trojan:// / vless:// 链接，程序已把它们解析成
+// config.Node，没有 Clash 原文可用，所以整份配置都要自己生成（见 BuildNormalConfig）。
+//
+// 只写文件、不动进程 —— 与 LoadGroup 一致，调用方负责在需要时重启内核。
+func (m *Manager) LoadNormal(nodes []config.Node, mode string) error {
+	if len(nodes) == 0 {
+		return fmt.Errorf("还没有可用的普通节点，请先添加订阅或导入节点")
+	}
+	socksPort, httpPort := m.ports()
+	nc, err := BuildNormalConfig(nodes, NormalOpts{
+		SocksPort: socksPort,
+		HTTPPort:  httpPort,
+		RedirPort: RedirPort,
+		CtrlPort:  ControlPort,
+		// 与 xray 那套保持一致：入站监听 0.0.0.0，网关模式下局域网设备才能用
+		AllowLan:  true,
+		ProxyMode: mode,
+	})
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(m.dataDir, 0755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(m.dataDir, confFileName), nc.YAML, 0644); err != nil {
+		return err
+	}
+
+	// 生成配置时重名节点会被改名（加 " #N" 后缀），所以必须把「节点 ID」
+	// 与「配置里真正用的名字」两张表都建出来：界面点的是 ID，内核认的是名字。
+	display := make(map[string]string, len(nodes))
+	for _, n := range nodes {
+		display[n.ID] = n.Name
+	}
+	byID := make(map[string]normalNodeRef, len(nc.NameToID))
+	byName := make(map[string]string, len(nc.NameToID))
+	for clashName, id := range nc.NameToID {
+		byID[id] = normalNodeRef{clash: clashName, display: display[id]}
+		byName[clashName] = id
+	}
+
+	m.mu.Lock()
+	m.normalMode = true
+	m.normalSig = NormalNodesSig(nodes)
+	m.normalByID, m.normalByName = byID, byName
+	// 普通模式没有家宽分组，这些字段必须清空 —— 留着会让 Status() 拼出一个
+	// 形如 "clash::节点名" 的假 ID，界面上的高亮会串到不存在的行上。
+	m.loadedGroup = ""
+	m.nodes = append([]string(nil), nc.Order...)
+	m.nodeGroup = NormalGroupName
+	m.topGroup = NormalGroupName
+	// 还原上次选中的节点，并修好「它已经不在列表里」的情况（见 ensureActiveNodeLocked）。
+	// 放在生成配置这一步是刻意的：修复是纯本地操作，不该依赖内核能不能起来。
+	m.activeName = m.persistedActiveNameLocked()
+	m.ensureActiveNodeLocked()
+	m.mu.Unlock()
+
+	if len(nc.Skipped) > 0 {
+		log.Printf("普通节点配置已生成 (%d 个节点, 模式 %s, %d 个无法转换已跳过)",
+			len(nc.Order), mode, len(nc.Skipped))
+	} else {
+		log.Printf("普通节点配置已生成 (%d 个节点, 模式 %s)", len(nc.Order), mode)
+	}
+	return nil
+}
+
+// NormalConfigUpToDate 当前加载的普通节点配置是否就是用这批节点生成的。
+// 不是普通模式、或节点集合变了，都返回 false。
+func (m *Manager) NormalConfigUpToDate(nodes []config.Node) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.normalMode && m.normalSig == NormalNodesSig(nodes)
+}
+
+// SetActiveNormalNode 记录「用户选了哪个普通节点」并落盘，但**不碰内核**。
+//
+// 为什么需要这一步：换配置那条路径要 Stop -> 改配置 -> Start，而 Start 会在
+// 内核就绪后异步重放 cfg.ActiveNode。若不在 Start 之前把选择落盘，重放就会把
+// 上一个节点又拨回来，用户点了没反应（或过几秒被改回去）。
+//
+// 只写文件/内存，不做网络调用，所以内核没跑时也能安全调用。
+func (m *Manager) SetActiveNormalNode(nodeID string) error {
+	m.mu.Lock()
+	ref, ok := m.normalByID[nodeID]
+	if ok {
+		m.activeName = ref.clash
+	}
+	m.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("这个节点不在当前配置里（可能已被删除，刷新页面后重试）")
+	}
+	if m.cfg != nil {
+		m.cfg.Lock()
+		m.cfg.ActiveNode = nodeID
+		_ = m.cfg.Save()
+		m.cfg.Unlock()
+	}
+	return nil
+}
+
+// SwitchNormalNode 在普通节点配置里切换当前使用的节点。nodeID 是界面上的节点 ID。
+//
+// 与家宽不同，这里**不重启内核**：普通节点配置只有一个 select 组，
+// 拨一下组就是全部工作，毫秒级。要求内核已经在跑（控制口可用）。
+func (m *Manager) SwitchNormalNode(nodeID string) error {
+	if err := m.SetActiveNormalNode(nodeID); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	name := m.activeName
+	m.mu.Unlock()
+	return m.applyNode(name)
+}
+
+// ActiveNormalNodeID 当前选中的普通节点 ID（没有时为空）。
+func (m *Manager) ActiveNormalNodeID() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.normalMode {
+		return ""
+	}
+	return m.normalByName[m.activeName]
 }
 
 // readSubFile 读取某个分组的订阅原文。
@@ -749,7 +935,9 @@ func (m *Manager) UnloadGroup(groupID string) {
 	_ = os.Remove(filepath.Join(m.dataDir, subFileNameFor(groupID)))
 
 	m.mu.Lock()
-	wasActive := m.loadedGroup == groupID
+	// 普通模式与家宽分组互不相干：删家宽分组不该动普通节点那份配置。
+	// 此时 loadedGroup 恒为空，下面的比较自然为 false。
+	wasActive := !m.normalMode && m.loadedGroup == groupID
 	if wasActive {
 		m.loadedGroup = ""
 		m.nodes = nil
@@ -830,13 +1018,54 @@ func (m *Manager) Reload(groupID, subURL, proxy string) error {
 	return m.Start()
 }
 
-// ensureActiveConfig 确保「当前应当生效的家宽分组」的配置已就绪。
+// ensureActiveConfig 确保「当前应当生效的那份配置」已就绪。
+//
+// 内核统一之后，mihomo 要跑两种配置之一：普通节点配置，或某个家宽分组的订阅原文。
+// 由 config.ActiveKind 决定，两者都落进同一个 confFileName。
+//
+// 家宽那种还多一层兜底：配的是家宽但一个家宽分组都没有时（比如刚把最后一个删掉），
+// 回落到普通节点 —— 总比什么都不加载、代理直接起不来强。
 func (m *Manager) ensureActiveConfig() error {
-	groupID, subURL, proxy := m.activeGroupInfo()
-	if groupID == "" {
-		return fmt.Errorf("还没有家宽订阅分组，请在左侧用「添加订阅分组」添加")
+	kind := config.KindNormal
+	if m.cfg != nil {
+		m.cfg.Lock()
+		kind = m.cfg.ActiveKind()
+		m.cfg.Unlock()
 	}
-	return m.LoadGroup(groupID, subURL, proxy)
+	if kind == config.KindClash {
+		groupID, subURL, proxy := m.activeGroupInfo()
+		if groupID != "" {
+			return m.LoadGroup(groupID, subURL, proxy)
+		}
+		log.Printf("配置指向家宽但没有任何家宽分组，回落到普通节点")
+	}
+	return m.ensureNormalConfig()
+}
+
+// PrepareNormalConfig 用当前配置里的全部普通节点生成运行配置，并顺带修好
+// 「上次选中的节点已经不在列表里」的情况。纯本地操作：不联网、不需要内核在跑。
+//
+// 为什么要单独暴露出来给开机流程用：修配置这件事必须在**拉起内核之前**完成。
+// 内核启动（Start）第一步是 CheckEnv，内核文件没部署好就直接返回了，根本走不到
+// 生成配置那一步 —— 于是配置里会一直留着一个已经不存在的节点 ID，界面挂着一个
+// 不存在的「当前使用中」，用户还得手动去点一次。
+func (m *Manager) PrepareNormalConfig() error {
+	return m.ensureNormalConfig()
+}
+
+// ensureNormalConfig 用当前配置里的全部普通节点生成运行配置。
+func (m *Manager) ensureNormalConfig() error {
+	if m.cfg == nil {
+		return fmt.Errorf("配置尚未注入")
+	}
+	m.cfg.Lock()
+	nodes := m.cfg.NormalNodes()
+	mode := m.cfg.ProxyMode
+	m.cfg.Unlock()
+	if len(nodes) == 0 {
+		return fmt.Errorf("还没有可用节点，请先添加订阅分组或导入节点")
+	}
+	return m.LoadNormal(nodes, mode)
 }
 
 // activeGroupInfo 读出当前应当生效的家宽分组的 ID / 订阅地址 / 订阅代理。
@@ -1022,27 +1251,84 @@ func (m *Manager) hasNodeLocked(name string) bool {
 	return false
 }
 
-// ensureActiveNodeLocked 修正「上次选中的家宽节点已消失」的情况。
+// persistedActiveNameLocked 把配置里记的「上次选的节点」还原成配置内使用的节点名。
 //
-// 家宽订阅源换节点很频繁，上次选的节点下次刷新就没了。不处理的话，
-// 启动后异步恢复那步会一直失败，界面还挂着一个不存在的「当前使用中」。
-// 这里改用订阅里的第一个节点顶上，并把结果落盘，免得每次重启都重复一遍。
+// 普通模式与家宽模式存的字段不同：家宽存的是节点名本身（ClashNode），
+// 普通节点存的是节点 ID（ActiveNode），得先换成生成配置时用的名字
+// —— 那个名字可能带 " #N" 后缀（重名节点被改过名）。
+//
+// 调用方需持有 m.mu；本方法内部会取配置锁，符合「内核锁先于配置锁」的约定。
+func (m *Manager) persistedActiveNameLocked() string {
+	if m.cfg == nil {
+		return ""
+	}
+	m.cfg.Lock()
+	defer m.cfg.Unlock()
+	if m.normalMode {
+		return m.normalByID[m.cfg.ActiveNode].clash
+	}
+	return m.cfg.ClashNode
+}
+
+// ensureActiveNodeLocked 修正「上次选中的节点已消失」的情况。
+//
+// 订阅刷新后节点会变（家宽源换节点很频繁；普通节点的 ID 是按内容派生的，
+// 源站一改整批失效）。不处理的话，启动后异步恢复那步会一直失败，界面还挂着
+// 一个不存在的「当前使用中」；更糟的是盒子重启后代理起不来，用户直接断网。
+// 这里改用列表里的第一个节点顶上，并把结果落盘，免得每次重启都重复一遍。
+//
+// 「从没选过」与「选过但没了」都会让 activeName 变成空串，但处理方式相反：
+// 前者不动（订阅里的 fallback 组自己会挑，界面也不该凭空冒出一个「当前使用中」），
+// 后者必须替补。所以判据不能只看 activeName —— 普通模式里节点 ID 找不到对应
+// 名字时，映射结果本来就是空串，光看 activeName 会把「选过但没了」误判成
+// 「从没选过」，自愈逻辑整个失效。得回头看一眼配置里到底记没记。
 //
 // 调用方需持有 m.mu，且 m.nodes 非空。
 func (m *Manager) ensureActiveNodeLocked() {
-	if m.activeName == "" || m.hasNodeLocked(m.activeName) {
+	if len(m.nodes) == 0 {
 		return
 	}
+	if m.activeName != "" && m.hasNodeLocked(m.activeName) {
+		return // 选中的节点还在，别动用户的选择
+	}
+	selected := m.selectedInConfigLocked()
+	if m.activeName == "" && selected == "" {
+		return // 从没选过：不替用户做决定
+	}
 	old := m.activeName
+	if old == "" {
+		// 普通模式下 activeName 已经映射失败成了空串，日志里报节点 ID 才有线索
+		old = selected
+	}
 	m.activeName = m.nodes[0]
-	log.Printf("上次选中的家宽节点[%s]已不在订阅中，改用[%s]", old, m.activeName)
+	log.Printf("激活节点(%s)已不在节点列表中，自动改用[%s]", old, m.activeName)
 	if m.cfg == nil {
 		return
 	}
 	m.cfg.Lock()
-	m.cfg.ClashNode = m.activeName
+	if m.normalMode {
+		m.cfg.ActiveNode = m.normalByName[m.activeName]
+	} else {
+		m.cfg.ClashNode = m.activeName
+	}
 	_ = m.cfg.Save()
 	m.cfg.Unlock()
+}
+
+// selectedInConfigLocked 读出配置里记的「上次选中的节点」。
+// 普通模式存的是节点 ID（ActiveNode），家宽模式存的是节点名（ClashNode）。
+//
+// 调用方需持有 m.mu；本方法内部会取配置锁，符合「内核锁先于配置锁」的约定。
+func (m *Manager) selectedInConfigLocked() string {
+	if m.cfg == nil {
+		return ""
+	}
+	m.cfg.Lock()
+	defer m.cfg.Unlock()
+	if m.normalMode {
+		return m.cfg.ActiveNode
+	}
+	return m.cfg.ClashNode
 }
 
 // NodeGroup 返回家宽节点所属的手动选择组名（内核测速时用）

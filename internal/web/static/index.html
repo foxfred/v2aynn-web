@@ -365,9 +365,11 @@ async function selectGroup(id){
 async function loadStatus(){
   try{const s=await api('GET','/api/status');
     document.getElementById('dot').className='dot'+(s.running?' on':'');
-    // 两个内核跑的业务不同（普通节点 vs 家宽），状态栏必须标出来，
-    // 否则用户看到「运行中」却不知道自己连的是哪条线路
-    const kn=s.kernel==='mihomo'?' [家宽]':'';
+    // 两种节点走的是同一条隧道但出口完全不同（普通节点 vs 家宽），状态栏必须标出来，
+    // 否则用户看到「运行中」却不知道自己连的是哪条线路。
+    // 注意用 nodeKind（当前生效的节点类型）而不是 kernel —— 内核统一之后
+    // kernel 恒为 mihomo，只有 nodeKind 还能区分普通节点与家宽。
+    const kn=s.nodeKind==='mihomo'?' [家宽]':'';
     document.getElementById('st').textContent=(s.running?'运行中':'已停止')+kn+(s.activeName?' - '+s.activeName:'');
     active=s.activeNode
   }catch(e){document.getElementById('st').textContent='连接失败'}

@@ -13,6 +13,9 @@ pkg/
 # 项目文档（非程序文件）
 AGENTS.md
 
+# 改写 refs 前做的 .git 备份（推送确认成功后应删掉，别让它污染 git status）
+.git.bak-*
+
 # 大文件：由 download-assets.sh 脚本下载
 /geoip.dat
 /geosite.dat

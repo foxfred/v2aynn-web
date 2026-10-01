@@ -1396,14 +1396,19 @@ func TestClashRoutes(t *testing.T) {
 		t.Errorf("首页异常: code=%d body=%.80s", rec.Code, rec.Body.String())
 	}
 
-	// 状态接口要带内核标记与家宽开关
+	// 状态接口要带内核标记、生效的节点类型与家宽开关
 	rec := do("GET", "/api/status", "")
 	var st map[string]interface{}
 	if err := json.Unmarshal(rec.Body.Bytes(), &st); err != nil {
 		t.Fatalf("status 解析失败: %v", err)
 	}
-	if st["kernel"] != config.KernelXray {
-		t.Errorf("默认内核 = %v, 期望 xray", st["kernel"])
+	// 内核统一之后只有一个内核在跑，kernel 恒为 mihomo；
+	// 「当前生效的是普通节点」改由 nodeKind 表达。
+	if st["kernel"] != config.KindClash {
+		t.Errorf("内核 = %v, 期望 mihomo（统一后只有一个内核）", st["kernel"])
+	}
+	if st["nodeKind"] != config.KindNormal {
+		t.Errorf("默认生效的节点类型 = %v, 期望 xray(普通节点)", st["nodeKind"])
 	}
 	if st["clashEnabled"] != true {
 		t.Errorf("clashEnabled = %v, 期望 true", st["clashEnabled"])

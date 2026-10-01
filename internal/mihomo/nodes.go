@@ -16,6 +16,7 @@ package mihomo
 
 import (
 	"fmt"
+	"hash/fnv"
 	"strconv"
 	"strings"
 
@@ -24,6 +25,23 @@ import (
 
 // NormalGroupName 普通节点生成的策略组默认名。
 const NormalGroupName = "节点选择"
+
+// NormalNodesSig 给一批普通节点算一个短签名，用来判断「节点集合变了没有」。
+//
+// 为什么需要它：切节点是高频操作，而 mihomo 只有换了配置才需要重启（十几秒）。
+// 节点集合没变时只拨一下策略组就行（毫秒级），变了才值得重写配置并重启内核。
+//
+// 只覆盖会影响生成结果的字段；用 FNV-1a 拼一遍即可 —— 这里只做相等比较，
+// 不需要抗碰撞，也不该为它引入一个哈希依赖。
+func NormalNodesSig(nodes []config.Node) string {
+	h := fnv.New64a()
+	for _, n := range nodes {
+		fmt.Fprintf(h, "%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\n",
+			n.ID, n.Name, n.Protocol, n.Server, n.Port, n.UUID, n.Password,
+			n.Method, n.Network, n.TLS, n.SNI, n.Path, n.RequestHost, n.Security)
+	}
+	return strconv.FormatUint(h.Sum64(), 16)
+}
 
 // NormalOpts 生成普通节点配置时的可调项。零值即合理默认。
 type NormalOpts struct {

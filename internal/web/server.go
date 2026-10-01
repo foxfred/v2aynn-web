@@ -82,16 +82,32 @@ func NewServer(cfg *config.Config, v2m *v2ray.Manager, mhm *mihomo.Manager) *Web
 // clashReady 家宽通道是否可用
 func (w *WebServer) clashReady() bool { return w.mhm != nil }
 
-// kernelName 当前应当运行的内核
-func (w *WebServer) kernelName() string {
+// activeKind 当前生效的节点类型：KindNormal（普通节点）或 KindClash（家宽节点）。
+//
+// 内核统一之后这个值不再表示「哪个内核在跑」（永远只有 mihomo 在跑），
+// 而是「现在加载的是哪一份配置」。界面靠它决定要不要标「[家宽]」。
+func (w *WebServer) activeKind() string {
 	w.cfg.Lock()
 	defer w.cfg.Unlock()
-	return w.cfg.CurrentKernel()
+	return w.cfg.ActiveKind()
 }
 
-// activeKernel 返回当前应当运行的内核管理器。家宽通道未启用时永远返回 xray。
+// runningKernelName 真实在跑的内核名。
+// 内核统一后恒为 mihomo；只有家宽通道没注入时（单元测试 / 未部署 mihomo）才回落 xray。
+func (w *WebServer) runningKernelName() string {
+	if w.clashReady() {
+		return config.KindClash
+	}
+	return config.KindNormal
+}
+
+// activeKernel 返回在跑的内核管理器。
+//
+// 普通节点与家宽节点现在都由 mihomo 承载，所以这里默认就是 mhm。
+// v2m 只在「家宽通道没注入」的降级场景里顶上 —— 那种环境下 mihomo 不可用，
+// 退回 xray 至少还能跑普通节点。
 func (w *WebServer) activeKernel() kernel {
-	if w.kernelName() == config.KernelMihomo && w.clashReady() {
+	if w.clashReady() {
 		return w.mhm
 	}
 	return w.v2m
@@ -123,7 +139,7 @@ func (w *WebServer) StopProbe() {
 //   - 内存紧张（盒子上只有 1 GB 且没有 swap）：探针用完就收，把内存还回去；
 //   - 家宽内核正在服务流量：再养一个 mihomo 纯属浪费，测完就收。
 func (w *WebServer) proberResident() bool {
-	if w.kernelName() == config.KernelMihomo {
+	if w.activeKind() == config.KindClash {
 		return false
 	}
 	return mihomo.ProberCanReside()
@@ -231,8 +247,11 @@ func (w *WebServer) apiIndex(rw http.ResponseWriter, r *http.Request) {
 
 func (w *WebServer) apiStatus(rw http.ResponseWriter, r *http.Request) {
 	st := w.activeKernel().Status()
-	// kernel 用于界面标注当前在跑哪个内核；clashEnabled 用于决定是否显示家宽分组。
-	st["kernel"] = w.kernelName()
+	// kernel 是真实在跑的内核（内核统一后恒为 mihomo）；
+	// nodeKind 是当前生效的节点类型，界面靠它标出「[家宽]」。
+	// clashEnabled 用于决定是否显示家宽分组。
+	st["kernel"] = w.runningKernelName()
+	st["nodeKind"] = w.activeKind()
 	st["clashEnabled"] = w.clashReady() && w.clashConfigured()
 	w.writeJSON(rw, st)
 }
@@ -277,7 +296,7 @@ func (w *WebServer) apiGroups(rw http.ResponseWriter, r *http.Request) {
 	}
 	activeGrp := w.cfg.ActiveGrp
 	clashNode := w.cfg.ClashNode
-	kernel := w.cfg.CurrentKernel()
+	kind := w.cfg.ActiveKind()
 	w.cfg.Unlock()
 
 	// 家宽分组的 Nodes 恒为空（节点由 mihomo 管），节点数与拉取时间得问内核。
@@ -299,15 +318,16 @@ func (w *WebServer) apiGroups(rw http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 家宽模式下把高亮挪到家宽分组，否则界面会把普通分组标成「当前使用中」
-	if kernel == config.KernelMihomo && clashNode != "" && !w.isClashGroup(activeGrp) {
+	// 生效的是家宽节点时把高亮挪到家宽分组，否则界面会把普通分组标成「当前使用中」
+	if kind == config.KindClash && clashNode != "" && !w.isClashGroup(activeGrp) {
 		activeGrp = ""
 	}
 
 	w.writeJSON(rw, map[string]interface{}{
 		"groups":    groups,
 		"activeGrp": activeGrp,
-		"kernel":    kernel,
+		"kernel":    w.runningKernelName(),
+		"nodeKind":  kind,
 	})
 }
 
@@ -381,7 +401,7 @@ func (w *WebServer) writeClashNodes(rw http.ResponseWriter, groupID string) {
 	w.cfg.Lock()
 	clashNode := w.cfg.ClashNode
 	activeGrp := w.cfg.ActiveGrp
-	kernel := w.cfg.CurrentKernel()
+	kind := w.cfg.ActiveKind()
 	sortOrder := w.cfg.SortOrder
 	// 上次测速存下来的结果。家宽节点没有 Node 结构，延迟与速度都存在分组的
 	// Probes 表里 —— 存下来才能在重启之后、以及没被内核加载的分组上显示出来。
@@ -425,10 +445,10 @@ func (w *WebServer) writeClashNodes(rw http.ResponseWriter, groupID string) {
 			Speed:    speed,
 		})
 	}
-	// 只有内核确实在家宽模式、且选中的节点属于这个分组时才标「当前使用中」，
+	// 只有生效的确实是家宽节点、且选中的节点属于这个分组时才标「当前使用中」，
 	// 否则会出现普通节点与家宽节点同时被标成激活的矛盾状态。
 	active := ""
-	if kernel == config.KernelMihomo && clashNode != "" && activeGrp == groupID {
+	if kind == config.KindClash && clashNode != "" && activeGrp == groupID {
 		active = config.ClashNodeID(groupID, clashNode)
 	}
 
@@ -671,11 +691,11 @@ func (w *WebServer) apiDelGroup(rw http.ResponseWriter, r *http.Request) {
 	if w.cfg.ActiveGrp == id {
 		w.cfg.ActiveGrp = ""
 	}
-	// 删掉正在生效的家宽分组时，必须把内核切回 xray：否则 mihomo 会继续跑着
+	// 删掉正在生效的家宽分组时，必须让内核换回普通节点配置：否则 mihomo 会继续跑着
 	// 一份已经不存在的分组的配置，而界面上已经看不到这个分组了，用户无从关闭它。
-	fallbackToXray := isClash && w.cfg.Kernel == config.KernelMihomo
-	if fallbackToXray {
-		w.cfg.Kernel = config.KernelXray
+	fallbackToNormal := isClash && w.cfg.Kernel == config.KindClash
+	if fallbackToNormal {
+		w.cfg.Kernel = config.KindNormal
 		w.cfg.ClashNode = ""
 	}
 	hasNormalNode := w.cfg.ActiveNode != ""
@@ -689,9 +709,12 @@ func (w *WebServer) apiDelGroup(rw http.ResponseWriter, r *http.Request) {
 		if w.prober != nil && w.prober.Group() == id {
 			w.prober.Stop()
 		}
-		if fallbackToXray && hasNormalNode {
+		if fallbackToNormal && hasNormalNode {
 			time.Sleep(300 * time.Millisecond)
-			_ = w.v2m.Start()
+			// Start 会按 KindNormal 自己生成普通节点配置，这里不用先 Load
+			if err := w.mhm.Start(); err != nil {
+				log.Printf("删除家宽分组后回落到普通节点失败: %v", err)
+			}
 			w.WarmProbe()
 		}
 	}
@@ -922,14 +945,11 @@ func (w *WebServer) apiDelNode(rw http.ResponseWriter, r *http.Request) {
 // apiSwitch 切换当前使用的节点。
 //
 // 入参 id 有两种形态，服务端按前缀分流：
-//   - 普通节点 ID                -> 走 xray 内核
-//   - "clash:<分组ID>:<节点名>"   -> 走 mihomo 内核（家宽）
+//   - 普通节点 ID                -> 普通节点配置（KindNormal）
+//   - "clash:<分组ID>:<节点名>"   -> 家宽分组配置（KindClash）
 //
-// 内核由节点类型自动决定，界面上不设额外的内核开关：点普通节点就用 xray，
-// 点家宽节点就用 mihomo。两个内核抢同一组端口，切换前必须先把另一个停干净。
-//
-// 家宽这边比 xray 多一层：mihomo 同一时刻只加载一份配置，所以跨分组点节点时
-// 必须先换配置再重启内核；同一个分组内换节点只需拨一下策略组，快得多。
+// 内核统一之后两种都由 mihomo 承载，区别只在于加载哪一份配置。
+// 两种节点类型由节点 ID 自动判定，界面上不设额外的开关。
 func (w *WebServer) apiSwitch(rw http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
@@ -937,21 +957,68 @@ func (w *WebServer) apiSwitch(rw http.ResponseWriter, r *http.Request) {
 		w.switchClashNode(rw, groupID, name)
 		return
 	}
+	w.switchNormalNode(rw, id)
+}
 
-	// 普通节点：切回 xray 内核
+// switchNormalNode 启用某个普通节点。
+//
+// 内核统一后普通节点也走 mihomo。这里必须分两种情况，代价差得很远：
+//
+//   - 内核里装的已经是这批普通节点的配置 -> 只拨一下策略组，毫秒级；
+//   - 装的是家宽的配置、或节点集合变了（刚刷新过订阅）-> 重写配置并重启内核。
+//
+// 不能无脑重启：切节点是高频操作，每点一次都等十几秒是不能接受的。
+func (w *WebServer) switchNormalNode(rw http.ResponseWriter, id string) {
 	w.cfg.Lock()
-	w.cfg.Kernel = config.KernelXray
+	w.cfg.Kernel = config.KindNormal
+	nodes := w.cfg.NormalNodes()
+	mode := w.cfg.ProxyMode
 	w.cfg.Unlock()
-	if w.clashReady() {
-		w.mhm.Stop()
+
+	if !w.clashReady() {
+		// 降级：没有 mihomo 可用（未部署 / 单元测试），退回 xray 跑普通节点
+		if err := w.v2m.SwitchNode(id); err != nil {
+			w.writeJSON(rw, map[string]string{"error": err.Error()})
+			return
+		}
+		w.WarmProbe()
+		w.writeJSON(rw, map[string]string{"ok": "true"})
+		return
 	}
-	if err := w.v2m.SwitchNode(id); err != nil {
+
+	// 内核跑着的就是这批节点的配置 —— 热切换，不重启
+	if w.mhm.NormalConfigUpToDate(nodes) && w.mhm.IsRunning() {
+		if err := w.mhm.SwitchNormalNode(id); err != nil {
+			w.writeJSON(rw, map[string]string{"error": err.Error()})
+			return
+		}
+		w.WarmProbe()
+		w.writeJSON(rw, map[string]string{"ok": "true"})
+		return
+	}
+
+	// 换配置：先停干净再重写。两份配置抢同一组端口，不先停会启动失败。
+	w.mhm.Stop()
+	// 家宽内核马上要服务流量了，测速探针让位 —— 再养一个 mihomo 纯属白占内存
+	if w.prober != nil {
+		w.prober.Stop()
+	}
+	if err := w.mhm.LoadNormal(nodes, mode); err != nil {
 		w.writeJSON(rw, map[string]string{"error": err.Error()})
 		return
 	}
-	// 接下来用户最可能做的事就是测家宽，趁现在把探针预热起来。
-	// 后台跑，不拖住这次切换请求。
-	w.WarmProbe()
+	// 必须在 Start 之前落盘：Start 就绪后会按 cfg.ActiveNode 重放选中的节点，
+	// 晚一步写就会把上一个节点又拨回来。
+	if err := w.mhm.SetActiveNormalNode(id); err != nil {
+		w.writeJSON(rw, map[string]string{"error": err.Error()})
+		return
+	}
+	// 端口释放需要一点时间，立刻拉起大概率报 address already in use
+	time.Sleep(300 * time.Millisecond)
+	if err := w.mhm.Start(); err != nil {
+		w.writeJSON(rw, map[string]string{"error": err.Error()})
+		return
+	}
 	w.writeJSON(rw, map[string]string{"ok": "true"})
 }
 
@@ -965,7 +1032,7 @@ func (w *WebServer) switchClashNode(rw http.ResponseWriter, groupID, name string
 	w.cfg.Lock()
 	exists := w.cfg.FindClashGroup(groupID) != nil
 	if exists {
-		w.cfg.Kernel = config.KernelMihomo
+		w.cfg.Kernel = config.KindClash
 		w.cfg.ActiveGrp = groupID
 		w.cfg.ClashNode = name
 	}
@@ -976,8 +1043,10 @@ func (w *WebServer) switchClashNode(rw http.ResponseWriter, groupID, name string
 		return
 	}
 
-	// 两个内核抢同一组端口，先把 xray 停干净
-	w.v2m.Stop()
+	// 两份配置抢同一组端口，先把普通节点那份停干净
+	if w.mhm.IsNormalMode() {
+		w.mhm.Stop()
+	}
 	// 家宽内核马上要起来服务流量了，测速探针就得让位 ——
 	// 再养一个 mihomo 纯属白占内存，而且它那份配置也不是当前在用的。
 	if w.prober != nil {
@@ -1164,7 +1233,7 @@ func (w *WebServer) apiSpeed(rw http.ResponseWriter, r *http.Request) {
 func (w *WebServer) saveSpeed(mbps float64) {
 	w.cfg.Lock()
 	defer w.cfg.Unlock()
-	if w.cfg.CurrentKernel() == config.KernelMihomo {
+	if w.cfg.ActiveKind() == config.KindClash {
 		if g := w.cfg.FindClashGroup(w.cfg.ActiveGrp); g != nil {
 			g.SetProbeSpeed(w.cfg.ClashNode, mbps)
 			_ = w.cfg.Save()
@@ -1219,12 +1288,14 @@ func (w *WebServer) apiGetSettings(rw http.ResponseWriter, r *http.Request) {
 		"listenAddr": w.cfg.ListenAddr, "subRefresh": w.cfg.SubRefresh,
 		"subProxy": w.cfg.SubProxy, "proxyMode": w.cfg.ProxyMode,
 		"speedURL": w.cfg.SpeedURL, "autoFailover": w.cfg.FailoverEnabled(),
-		"kernel": w.cfg.CurrentKernel(),
+		// kernel 是真实在跑的内核（统一后恒为 mihomo），nodeKind 是当前生效的节点类型。
+		"nodeKind": w.cfg.ActiveKind(),
 		// 家宽订阅不再从这里配，但界面要能告诉用户「你已经有几个家宽分组」，
 		// 免得他在设置里找不到家宽入口时以为是程序坏了。
 		"clashGroupCount": len(w.cfg.ClashGroups()),
 	}
 	w.cfg.Unlock()
+	st["kernel"] = w.runningKernelName()
 	st["clashAvailable"] = w.clashReady()
 	w.writeJSON(rw, st)
 }
