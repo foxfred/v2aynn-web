@@ -48,7 +48,7 @@ iptables -t nat -A V2AYNN -d 192.168.0.0/16 -j RETURN
 iptables -t nat -A V2AYNN -d 10.0.0.0/8 -j RETURN
 iptables -t nat -A V2AYNN -d 172.16.0.0/12 -j RETURN
 iptables -t nat -A V2AYNN -d 127.0.0.0/8 -j RETURN
-# 其余TCP重定向到xray透明端口
+# 其余TCP重定向到内核的透明代理端口（mihomo，对应配置里的 redir-port）
 iptables -t nat -A V2AYNN -p tcp -j REDIRECT --to-ports "$TPORT"
 
 # 4. 应用到入站（只处理其他设备发给盒子的流量）

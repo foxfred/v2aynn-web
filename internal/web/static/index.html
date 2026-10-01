@@ -273,7 +273,7 @@ body{font-family:system-ui,sans-serif;background:var(--bg-body);color:var(--text
 <div class="st-full" style="font-size:12px;color:var(--text-muted);line-height:1.85;border-top:1px solid var(--border-subtle);padding-top:8px;margin-bottom:9px">
 <b>家宽订阅不在这里配置。</b>请用左侧「订阅分组」栏的 <b>+</b> 按钮添加，填法和普通订阅一样：名称 + 链接。<br>
 · cfnew 的家宽链接要带 <code>target=vg</code> 参数，程序会自己认出它是家宽订阅。<br>
-· 家宽走 mihomo 内核，与普通节点的 xray 内核不是同一个，两者不会同时运行；点任意普通节点会自动切回 xray。<br>
+· 家宽和普通节点都由同一个 mihomo 内核承载，点哪种节点就自动加载对应的那份配置，不用手动切换内核。<br>
 · 家宽分组可以加多个，但同一时刻只有一份配置生效；切换分组时内核会重启一次（十几秒）。<br>
 · 点分组里任意一个节点即可启用，首次启用要十几秒。<span id="clashNoteCount"></span>
 </div>

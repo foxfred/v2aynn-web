@@ -19,4 +19,7 @@ AGENTS.md
 # 大文件：由 download-assets.sh 脚本下载
 /geoip.dat
 /geosite.dat
+/geoip.metadb
+/geosite.db
 /xray
+/mihomo
