@@ -141,6 +141,11 @@ type fakeProber struct {
 	probes []string
 	// frontGroup 前置组的组名（SetFront 时记下），拼 probes 时用。
 	frontGroup string
+	// ensured 记录每次 Ensure 的调用（组 ID），与成败无关。
+	//
+	// 用来验「某条路径到底有没有预热探针」：换配置路径会先把探针 Stop 掉，
+	// 漏了配对的预热时这里就是空的（2026-10-01 真机踩过）。
+	ensured []string
 }
 
 func newFakeProber() *fakeProber {
@@ -187,11 +192,19 @@ func (f *fakeProber) frontCalls() []string {
 func (f *fakeProber) Ensure(groupID string, resident bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.ensured = append(f.ensured, groupID)
 	if f.startErr != nil {
 		return f.startErr
 	}
 	f.group, f.running = groupID, true
 	return nil
+}
+
+// ensureCount 至今被预热过几次。换配置路径漏了预热时恒为 0。
+func (f *fakeProber) ensureCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.ensured)
 }
 
 func (f *fakeProber) Stop() {

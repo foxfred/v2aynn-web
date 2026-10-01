@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"v2aynn-web/internal/config"
 )
@@ -60,6 +61,44 @@ func TestSwitchPlainNodeLoadsNormalConfigIntoMihomo(t *testing.T) {
 	}
 	if got := mhm.LoadedGroup(); got != "" {
 		t.Errorf("普通模式下不该还挂着家宽分组 %q", got)
+	}
+}
+
+// 换配置路径把探针收掉后，必须把它补回来。
+//
+// 这条路径会先 prober.Stop()（重启内核期间省内存），早期漏了配对的预热 ⇒
+// 从家宽切回普通节点后探针不会自动起来，用户下次点「测速」要多等十几秒。
+// 2026-10-01 真机复现：切回后进程里只剩主内核，日志里连失败信息都没有（压根没调用）。
+//
+// 预热刻意用 defer 而不是写在 Start 之后 —— 本用例把内核路径指向不存在的文件让
+// Start 必然失败，顺带覆盖「即使 Start 失败，探针也不能被留在停止状态」。
+func TestSwitchPlainNodeConfigPathWarmsProbe(t *testing.T) {
+	s, cfg, mhm, url := newClashTestServer(t)
+	seedClashGroup(t, cfg, mhm, "g1", "家宽", url)
+	seedNormalGroup(t, cfg)
+	mhm.SetMihomoBin(filepath.Join(t.TempDir(), "no-such-mihomo"))
+
+	cfg.Lock()
+	cfg.Kernel = config.KindClash
+	cfg.ActiveGrp = "g1"
+	cfg.ClashNode = "🏠 JP-家宽-01"
+	cfg.Unlock()
+
+	f := s.prober.(*fakeProber)
+	req := httptest.NewRequest("POST", "/api/node/x", nil)
+	req.SetPathValue("id", "n1")
+	s.apiSwitch(httptest.NewRecorder(), req)
+
+	// WarmProbe 在后台 goroutine 里跑，等它落地
+	deadline := time.Now().Add(2 * time.Second)
+	for f.ensureCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if f.ensureCount() == 0 {
+		t.Fatal("换配置路径收掉探针后没有补回来（WarmProbe 漏调用）")
+	}
+	if !f.IsRunning() {
+		t.Error("探针应当已被重新拉起")
 	}
 }
 

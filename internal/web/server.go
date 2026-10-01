@@ -1017,7 +1017,13 @@ func (w *WebServer) switchNormalNode(rw http.ResponseWriter, id string) {
 
 	// 换配置：先停干净再重写。两份配置抢同一组端口，不先停会启动失败。
 	w.mhm.Stop()
-	// 家宽内核马上要服务流量了，测速探针让位 —— 再养一个 mihomo 纯属白占内存
+	// 重启内核期间内存有个峰值，先把测速探针收了。
+	//
+	// ★ 收了就必须补回来，所以紧跟一个 defer —— 无论下面 Start 成功还是失败，
+	// 探针都要回到可用状态。2026-10-01 真机复现过漏掉它的后果：从家宽切回普通
+	// 节点后进程里只剩主内核、也没有任何失败日志（因为压根没调用），
+	// 用户下次点「测速」白等十几秒。
+	defer w.WarmProbe()
 	if w.prober != nil {
 		w.prober.Stop()
 	}
