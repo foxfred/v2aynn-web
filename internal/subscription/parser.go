@@ -96,28 +96,8 @@ func FetchAll(cfg *config.Config) {
 			log.Printf("Fetch: 分组[%s]拉取失败，保留旧节点: %v", g.Name, err)
 			continue
 		}
-		// 保留旧节点的 ping/speed 数据
-		oldPings := make(map[string]int)
-		oldSpeeds := make(map[string]float64)
-		for _, n := range g.Nodes {
-			key := n.Server + ":" + n.Port + ":" + n.Protocol
-			if n.Ping != 0 {
-				oldPings[key] = n.Ping
-			}
-			if n.Speed > 0 {
-				oldSpeeds[key] = n.Speed
-			}
-		}
-		for i := range nodes {
-			key := nodes[i].Server + ":" + nodes[i].Port + ":" + nodes[i].Protocol
-			if p, ok := oldPings[key]; ok {
-				nodes[i].Ping = p
-			}
-			if s, ok := oldSpeeds[key]; ok {
-				nodes[i].Speed = s
-			}
-		}
-		g.Nodes = nodes
+		// 把旧节点的身份与测速结果接到新拉到的节点上（见 carryOver）
+		g.Nodes = carryOver(g.Nodes, nodes)
 		g.LastFetch = time.Now().Format("2006-01-02 15:04:05")
 		log.Printf("Fetch: 分组[%s]拉取到%d个节点", g.Name, len(nodes))
 	}
@@ -169,30 +149,13 @@ func FetchGroup(cfg *config.Config, groupID string) {
 		log.Printf("FetchGroup: 分组[%s]拉取失败: %v", g.Name, err)
 		return
 	}
-	oldPings := make(map[string]int)
-	oldSpeeds := make(map[string]float64)
-	for _, n := range g.Nodes {
-		key := n.Server + ":" + n.Port + ":" + n.Protocol
-		if n.Ping != 0 {
-			oldPings[key] = n.Ping
-		}
-		if n.Speed > 0 {
-			oldSpeeds[key] = n.Speed
-		}
-	}
-	for i := range nodes {
-		key := nodes[i].Server + ":" + nodes[i].Port + ":" + nodes[i].Protocol
-		if p, ok := oldPings[key]; ok {
-			nodes[i].Ping = p
-		}
-		if s, ok := oldSpeeds[key]; ok {
-			nodes[i].Speed = s
-		}
-	}
 	cfg.Lock()
 	for i := range cfg.Groups {
 		if cfg.Groups[i].ID == groupID {
-			cfg.Groups[i].Nodes = nodes
+			// 用锁里的当前节点做迁移，而不是函数开头抓的那个指针 —— 拉订阅
+			// 要联网、耗时好几秒，期间 cfg.Groups 可能已经被整批换过了
+			// （FetchAll 结尾就是 cfg.Groups = groups），老指针指向的是旧数组。
+			cfg.Groups[i].Nodes = carryOver(cfg.Groups[i].Nodes, nodes)
 			cfg.Groups[i].LastFetch = time.Now().Format("2006-01-02 15:04:05")
 			break
 		}
@@ -200,6 +163,97 @@ func FetchGroup(cfg *config.Config, groupID string) {
 	_ = cfg.Save()
 	cfg.Unlock()
 	log.Printf("FetchGroup: 分组[%s]拉取到%d个节点", g.Name, len(nodes))
+}
+
+// strictKey 节点的稳定身份键：协议 + 服务器 + 端口 + 凭证。
+//
+// 为什么不直接用 server:port:protocol：同一个订阅里两个节点指向同一服务器并不
+// 罕见（盒子实测 BPB 分组 105 个节点只有 104 个唯一 server:port:protocol），
+// 光按它匹配会让两个节点共用一份测速结果。
+//
+// 为什么把凭证算进去：订阅源改备注（换显示名）时节点其实没变，不该换身份；
+// 而 UUID / 密码才是节点的真实身份。ss 用 Password，trojan 用 Password，
+// vmess / vless 用 UUID，正好各占一个。
+func strictKey(n config.Node) string {
+	return n.Protocol + "|" + n.Server + "|" + n.Port + "|" + n.UUID + "|" + n.Password
+}
+
+// looseKey 节点的宽松身份键：协议 + 服务器 + 端口。
+//
+// 只用来接测速结果，不用来接 ID —— 理由见 carryOver。
+func looseKey(n config.Node) string {
+	return n.Protocol + "|" + n.Server + "|" + n.Port
+}
+
+// carryOver 把旧节点上的身份与测速结果接到新拉到的节点上。
+//
+// 订阅每次刷新都是重新解析出来的，节点 ID 也重新生成（config.NewUUID()）。
+// 如果就这么整批替换掉旧列表，会有两个后果：
+//
+//	① 配置里记的 ActiveNode 指向的 ID 已经不存在了 —— 重启时
+//	   ensureActiveNodeLocked / Start 会把用户选中的节点换成列表里的第一个，
+//	   用户看到的就是「我选定的节点自己变了」；
+//	② 界面上测速结果与节点的关联断掉（界面上是拿 ID 当 key 的）。
+//
+// 所以这里按稳定身份把旧节点的 ID / Ping / Speed 原样接过来。ID 沿用之后，
+// 一次订阅刷新不再等于「所有节点都换了人」，用户的选择能原地保留。
+//
+// 两层匹配，各有分工：
+//
+//	严格键（含凭证）命中 → ID、Ping、Speed 全部沿用；
+//	严格键失配但宽松键命中 → 只沿用 Ping、Speed，ID 重新生成。
+//
+// 第二层不能省：凭证被订阅源轮换、而服务器没变时严格键会失配，那正是老代码
+// 唯一能用的匹配方式，去掉就等于把「测速保留」做窄了。
+//
+// ID 只在「新列表里该严格键唯一、旧列表里也唯一」时才沿用 —— 否则会出现两个
+// 节点共用一个 ID，之后 FindNode / ActiveNode 都会命中错的那个。
+func carryOver(old, fresh []config.Node) []config.Node {
+	strict := make(map[string]config.Node, len(old))
+	strictDup := make(map[string]bool)
+	for _, n := range old {
+		k := strictKey(n)
+		if _, ok := strict[k]; ok {
+			strictDup[k] = true
+			continue
+		}
+		strict[k] = n
+	}
+
+	oldPings := make(map[string]int, len(old))
+	oldSpeeds := make(map[string]float64, len(old))
+	for _, n := range old {
+		k := looseKey(n)
+		if n.Ping != 0 {
+			oldPings[k] = n.Ping
+		}
+		if n.Speed > 0 {
+			oldSpeeds[k] = n.Speed
+		}
+	}
+
+	freshCount := make(map[string]int, len(fresh))
+	for _, n := range fresh {
+		freshCount[strictKey(n)]++
+	}
+
+	for i := range fresh {
+		k := strictKey(fresh[i])
+		if o, ok := strict[k]; ok && freshCount[k] == 1 && !strictDup[k] {
+			fresh[i].ID = o.ID
+			fresh[i].Ping = o.Ping
+			fresh[i].Speed = o.Speed
+			continue
+		}
+		lk := looseKey(fresh[i])
+		if p, ok := oldPings[lk]; ok {
+			fresh[i].Ping = p
+		}
+		if s, ok := oldSpeeds[lk]; ok {
+			fresh[i].Speed = s
+		}
+	}
+	return fresh
 }
 
 // ErrIsClashSub 表示拉回来的不是节点列表，而是一份 Clash 家宽配置。

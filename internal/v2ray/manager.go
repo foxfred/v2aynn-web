@@ -87,7 +87,7 @@ func (m *Manager) Start() error {
 		// 注意不能调 tryFailover()：它会走 SwitchNode → Stop/Start，而此处已经
 		// 持有 m.mu，必然死锁（同 watch 里那段注释说的坑）。所以这里只做
 		// 「挑一个 + 落盘」，进程照常往下启动。
-		picked, ok := m.pickFailoverNodeLocked()
+		picked, ok := m.pickReplacementNodeLocked()
 		if !ok {
 			return fmt.Errorf("%w: 激活节点(%s)不在节点列表中，且没有其他节点可替补",
 				ErrNoUsableNode, m.cfg.ActiveNode)
@@ -219,12 +219,14 @@ func failoverOrder(all []config.Node, exclude string) []config.Node {
 	return config.FailoverOrder(all, exclude, nil)
 }
 
-// pickFailoverNodeLocked 挑一个替补节点。与 tryFailover 的区别是它只读配置、
-// 不启动任何进程，因此可以在 Start() 持 m.mu 时安全调用。
-func (m *Manager) pickFailoverNodeLocked() (nodePick, bool) {
-	if !m.cfg.FailoverEnabled() {
-		return nodePick{}, false
-	}
+// pickReplacementNodeLocked 挑一个替补节点，用于「上次选中的节点已经不在列表里」。
+// 与 tryFailover 的区别是它只读配置、不启动任何进程，因此可以在 Start() 持 m.mu 时安全调用。
+//
+// ★ 刻意不看 AutoFailover 开关。那个开关管的是「运行中探测失败就自动换节点」，
+// 是用户偏好；而这里是「原节点已经没了、不换就起不来」，是必须做的自愈 ——
+// 不换的后果是盒子重启后代理起不来、全屋断网。2026-10-01 把开关默认值改成关闭时，
+// 差点把这条自愈一起关掉（原来它跟着 FailoverEnabled 走）。
+func (m *Manager) pickReplacementNodeLocked() (nodePick, bool) {
 	m.cfg.Lock()
 	cands := failoverOrder(m.cfg.AllNodes(), m.cfg.ActiveNode)
 	// 顺手把分组 ID 查出来（同一个锁里做完，避免二次加锁）

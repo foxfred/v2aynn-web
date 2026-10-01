@@ -100,7 +100,7 @@ func TestRestoreJSONRoundTrip(t *testing.T) {
 		t.Errorf("subRefresh 往返后应为 0（禁用），实际 %d", dst.SubRefresh)
 	}
 	if dst.AutoFailover == nil {
-		t.Fatal("autoFailover=false 往返后丢失（变回 nil=默认开启）")
+		t.Fatal("autoFailover=false 往返后丢失（变回 nil=默认关闭）")
 	}
 	if *dst.AutoFailover != false {
 		t.Errorf("autoFailover 往返后应为 false，实际 %v", *dst.AutoFailover)
@@ -139,7 +139,10 @@ func TestRestoreFillsDefaultsForMissingFields(t *testing.T) {
 	}
 }
 
-// TestFailoverEnabledTriState 校验 *bool 三态语义：nil=默认开启，显式值优先。
+// TestFailoverEnabledTriState 校验 *bool 三态语义：nil=默认关闭，显式值优先。
+//
+// 默认值曾经是「开启」，2026-10-01 改成关闭 —— 它会把用户手选的节点换掉，
+// 而探测本身偏严（6 秒超时）经常误判，真机上三分钟连换 4 个全是误伤。
 func TestFailoverEnabledTriState(t *testing.T) {
 	on, off := true, false
 
@@ -148,7 +151,7 @@ func TestFailoverEnabledTriState(t *testing.T) {
 		v    *bool
 		want bool
 	}{
-		{"nil 默认开启", nil, true},
+		{"nil 默认关闭", nil, false},
 		{"显式开启", &on, true},
 		{"显式关闭", &off, false},
 	}

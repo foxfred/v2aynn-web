@@ -129,8 +129,16 @@ func TestStartWithoutAnyNodeReturnsSentinel(t *testing.T) {
 	}
 }
 
-// 用户显式关掉自动故障转移时，不能擅自换节点 —— 那会违背用户的明确选择。
-func TestStartKeepsStaleNodeWhenFailoverDisabled(t *testing.T) {
+// 关掉自动故障转移开关，**不影响**开机自愈：原节点消失时仍然要挑一个顶上。
+//
+// 这条曾经写成「关掉开关就不许换、直接报错」，2026-10-01 改掉了。理由：
+// 开关管的是「运行中探测失败就自动换节点」这个用户偏好；而「上次选中的节点
+// 已经不在列表里」不换就起不来，后果是盒子重启后代理起不来、全屋断网。
+// 一个偏好开关不该把「能不能上网」也一起关掉。
+//
+// 真正该保持不变的是：原节点**还在**的时候不许动用户的选择（见
+// TestStartKeepsExistingActiveNode）。
+func TestStartReplacesStaleNodeEvenWhenFailoverDisabled(t *testing.T) {
 	off := false
 	dir := t.TempDir()
 	cfg, err := config.Load(filepath.Join(dir, "config.json"))
@@ -149,15 +157,16 @@ func TestStartKeepsStaleNodeWhenFailoverDisabled(t *testing.T) {
 	t.Setenv("V2AYNN_FAKE_XRAY", "1")
 	m.SetConfig(cfg)
 
-	if err := m.Start(); err == nil {
-		m.Stop()
-		t.Fatal("关闭故障转移后，原节点消失应当报错而不是偷偷换节点")
+	if err := m.Start(); err != nil {
+		t.Fatalf("原节点消失时应当挑替补顶上而不是报错（否则盒子重启就断网）: %v", err)
 	}
+	defer m.Stop()
+
 	cfg.Lock()
 	got := cfg.ActiveNode
 	cfg.Unlock()
-	if got != "已经不存在了的ID" {
-		t.Errorf("关闭故障转移后 ActiveNode 被改成了 %q，不该动它", got)
+	if got != "good" {
+		t.Errorf("原节点已消失时 ActiveNode = %q, 期望替补成 good", got)
 	}
 }
 

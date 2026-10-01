@@ -93,11 +93,17 @@ func (f *fakeKernelCtrl) serveHTTP(rw http.ResponseWriter, r *http.Request) {
 //
 // running 直接置位而不是真去拉进程：healthTick 只看这个标记，
 // 拉进程会让单测依赖 mihomo 二进制。
+//
+// ★ 必须显式把 AutoFailover 置为 true：开关的默认值是**关闭**
+// （2026-10-01 改的，见 config.FailoverEnabled），不打开的话 healthTick
+// 第一行就 return，这一组用例全部会变成「什么都没发生」。
 func newFailoverTestManager(t *testing.T, dead map[string]bool) (*Manager, *config.Config, *fakeKernelCtrl) {
 	t.Helper()
 	m, cfg, _ := newNormalTestManager(t)
 
+	on := true
 	cfg.Lock()
+	cfg.AutoFailover = &on
 	cfg.Groups = []config.Group{{ID: "g1", Name: "测试分组", Nodes: plainNodes()}}
 	cfg.Unlock()
 

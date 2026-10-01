@@ -183,7 +183,9 @@ type Config struct {
 	SortOrder  string `json:"sortOrder"`
 	SpeedURL   string `json:"speedURL"`
 	// AutoFailover 节点连续失败时是否自动切换到其他可用节点。
-	// 用指针区分"未设置"与"显式关闭"：nil 表示默认开启。
+	// 用指针区分"未设置"与"显式开启"：nil 表示默认关闭（见 FailoverEnabled）。
+	//
+	// 这个功能会换掉用户手选的节点，所以默认不开 —— 详见 FailoverEnabled 的说明。
 	AutoFailover *bool   `json:"autoFailover,omitempty"`
 	Groups       []Group `json:"groups"` // 分组列表，替代原来的 Subs + Nodes
 
@@ -237,9 +239,16 @@ func (c *Config) NormalNodes() []Node {
 	return all
 }
 
-// FailoverEnabled 自动故障转移是否开启（未显式设置时默认开启）
+// FailoverEnabled 自动故障转移是否开启（未显式设置时默认**关闭**）。
+//
+// 为什么默认关：这个功能会换掉用户手选的节点。2026-10-01 真机反馈「我选定的
+// 节点不能自己变化」，而且探测本身偏严 —— 走内核控制口、6 秒超时，CF 优选域名
+// 这类本来就容易抖的节点常被误判成「不通」，盒子日志里三分钟内连换 4 个
+// （联通-08 → 优选域名-44 → 电信-FRA-06 → 联通-04），全是误伤。
+//
+// 现在改成 opt-in：设置面板里的开关保留，用户想用自己打开。
 func (c *Config) FailoverEnabled() bool {
-	return c.AutoFailover == nil || *c.AutoFailover
+	return c.AutoFailover != nil && *c.AutoFailover
 }
 
 // FailoverOrder 按「可达优先 → 延迟升序」排出替补候选，排除 exclude 与 skip 里的节点。
@@ -509,8 +518,8 @@ func (c *Config) Restore(other *Config) {
 	c.ActiveGrp = other.ActiveGrp
 	c.SortOrder = other.SortOrder
 	c.SpeedURL = pickS(other.SpeedURL, "https://speed.cloudflare.com/__down?bytes=2000000")
-	// AutoFailover 是 *bool：nil 表示"未设置"（默认开启），非 nil 表示用户显式选择。
-	// 必须整体拷贝，否则导入一份"已关闭故障转移"的备份会被静默改回默认开启。
+	// AutoFailover 是 *bool：nil 表示"未设置"（默认关闭），非 nil 表示用户显式选择。
+	// 必须整体拷贝，否则导入一份"已开启故障转移"的备份会被静默改回默认关闭。
 	c.AutoFailover = other.AutoFailover
 	c.Groups = other.Groups
 
