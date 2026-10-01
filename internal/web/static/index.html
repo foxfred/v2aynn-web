@@ -295,7 +295,7 @@ body{font-family:system-ui,sans-serif;background:var(--bg-body);color:var(--text
 <label>名称</label><input id="egn">
 <label>订阅URL</label><input id="egu">
 <label>订阅代理（可选）</label><input id="egp" placeholder="http://127.0.0.1:7890">
-<div class="st-ft">保存后将清空该分组现有节点，并立即用新订阅链接重新拉取。</div>
+<div class="st-ft">改了订阅链接会清空该分组现有节点并立即重新拉取；只改名称或订阅代理不会清空，测速结果保留。</div>
 <div><button class="btn st" onclick="updateGroup()">保存</button><button class="btn" onclick="closeModal('editGroupModal')">取消</button></div>
 </div>
 </div>

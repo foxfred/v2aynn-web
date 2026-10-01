@@ -758,17 +758,31 @@ func (w *WebServer) apiUpdateGroup(rw http.ResponseWriter, r *http.Request) {
 	isClash := w.isClashGroup(id)
 	w.cfg.Lock()
 	updated := false
+	urlChanged := false
 	for i := range w.cfg.Groups {
 		if w.cfg.Groups[i].ID == id {
 			if req.Name != "" {
 				w.cfg.Groups[i].Name = req.Name
 			}
-			if req.URL != "" {
+			if req.URL != "" && req.URL != w.cfg.Groups[i].URL {
 				w.cfg.Groups[i].URL = req.URL
+				urlChanged = true
 			}
 			w.cfg.Groups[i].SubProxy = req.SubProxy
-			w.cfg.Groups[i].LastFetch = ""
-			w.cfg.Groups[i].Nodes = []config.Node{}
+			// ★ 只有订阅地址真的换了才清空节点。
+			//
+			// 原来是无条件清空，于是「只想改一下订阅代理」也会把整组节点连同
+			// 测过的延迟一起丢掉，而随后的异步拉取又救不回来 —— carryOver 的
+			// 旧数据源已经被这里清成空切片了。2026-10-01 实测：改 new3.1 的
+			// 订阅代理，288 个节点、165 条测速结果直接清成 0，正是用户报的
+			// 「已经测过速的链接不要轻易刷新没了」那一类。
+			//
+			// 地址没变时保留旧节点，随后的拉取会走 carryOver，把 ID 与测速
+			// 结果原样接过来；万一拉取失败，旧节点也还在（比清空强）。
+			if urlChanged {
+				w.cfg.Groups[i].LastFetch = ""
+				w.cfg.Groups[i].Nodes = []config.Node{}
+			}
 			updated = true
 			break
 		}
