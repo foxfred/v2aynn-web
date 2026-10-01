@@ -369,3 +369,79 @@ func TestDefaultTestURLIsHTTPS(t *testing.T) {
 		t.Errorf("兜底测速地址必须是 https（unified-delay 下用 http 会测不通）, 得到 %q", defaultTestURL)
 	}
 }
+
+// AnyAlive 用来判断「前置通道此刻能不能承载家宽链」：拿几个真实家宽节点
+// 试一下，有一个通就说明前置可用。
+func TestAnyAliveReturnsTrueOnFirstSuccess(t *testing.T) {
+	names := []string{"n0", "n1", "n2", "n3"}
+	var mu sync.Mutex
+	calls := map[string]int{}
+	d := delayTesterFunc(func(name string, timeoutMs int) (int, error) {
+		mu.Lock()
+		calls[name]++
+		mu.Unlock()
+		if name == "n0" {
+			return 300, nil
+		}
+		return 0, fmt.Errorf("节点无响应")
+	})
+
+	if !AnyAlive(d, names, 1000, 1) {
+		t.Fatal("有一个节点通时应当返回 true")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	// 串行跑（并发 1）时，n0 通了就该立刻收工，不该再等后面几个超时
+	if len(calls) != 1 {
+		t.Errorf("已经测通了还在继续测, 实际试过 %v", calls)
+	}
+}
+
+// 一个都不通时必须返回 false —— 这正是「换前置」的触发条件。
+func TestAnyAliveFalseWhenAllDead(t *testing.T) {
+	d := delayTesterFunc(func(name string, timeoutMs int) (int, error) {
+		return 0, fmt.Errorf("节点无响应")
+	})
+	if AnyAlive(d, []string{"n0", "n1"}, 1000, 2) {
+		t.Error("全都不通时应当返回 false")
+	}
+}
+
+// 样本为空时直接返回 false，不能因为「没有证据」就认定前置可用。
+func TestAnyAliveEmptySample(t *testing.T) {
+	d := delayTesterFunc(func(name string, timeoutMs int) (int, error) {
+		t.Error("样本为空时不该发起任何测量")
+		return 0, nil
+	})
+	if AnyAlive(d, nil, 1000, 2) {
+		t.Error("样本为空时应当返回 false")
+	}
+}
+
+// 抽样也要限并发：样本虽小，同样挤在同一条前置通道上。
+func TestAnyAliveRespectsConcurrency(t *testing.T) {
+	names := make([]string, 12)
+	for i := range names {
+		names[i] = fmt.Sprintf("n%02d", i)
+	}
+	var mu sync.Mutex
+	inFlight, peak := 0, 0
+	d := delayTesterFunc(func(name string, timeoutMs int) (int, error) {
+		mu.Lock()
+		inFlight++
+		if inFlight > peak {
+			peak = inFlight
+		}
+		mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+		return 0, fmt.Errorf("节点无响应")
+	})
+
+	AnyAlive(d, names, 1000, 3)
+	if peak > 3 {
+		t.Errorf("并发峰值 = %d, 不应超过 3", peak)
+	}
+}

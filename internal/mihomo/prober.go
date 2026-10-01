@@ -22,6 +22,28 @@ type DelayTester interface {
 	ProxyDelay(name string, timeoutMs int) (int, error)
 }
 
+// FrontSwitcher 能固定前置通道组的后端（DelayTester 的扩展）。
+//
+// 单独一个接口、并且用类型断言按需取用，是为了让「换前置」这件事只在真正
+// 支持的后端上发生。接口拆开还有个好处：单元测试里的替身可以只实现
+// DelayTester，不被迫实现一堆用不到的写操作。
+type FrontSwitcher interface {
+	SetFront(group, name string) error
+}
+
+// 编译期确认两个后端都满足 web 层要用到的全部接口。
+// 少实现一个不会报错，只会在运行期悄悄退化成「没有这个能力」。
+var (
+	_ DelayTester    = (*Manager)(nil)
+	_ DelayTester    = (*Prober)(nil)
+	_ FrontSwitcher  = (*Manager)(nil)
+	_ FrontSwitcher  = (*Prober)(nil)
+	_ GroupNowTester = (*Manager)(nil)
+	_ GroupNowTester = (*Prober)(nil)
+	_ DelayReader    = (*Manager)(nil)
+	_ DelayReader    = (*Prober)(nil)
+)
+
 // ClashSweepConcurrency 家宽分组测速的并发数。
 //
 // 全部家宽节点的出口都塞在同一条前置通道里，并发越高越容易互相踩踏 ——
@@ -97,6 +119,55 @@ func SweepDelay(t DelayTester, names []string, timeoutMs, concurrency int) map[s
 	}
 	wg.Wait()
 	return out
+}
+
+// AnyAlive 限并发地试这批节点，只要有一个能连通就立刻返回 true。
+//
+// 用途是「拿几个家宽节点当探针，判断前置通道此刻能不能承载家宽链」。
+// 与 SweepDelay 的两点差别：
+//   - 不取第二次。这里只问通不通，不关心真实延迟。
+//   - 一旦有一个通了就收工 —— 「通」是结论性证据，没必要把剩下的样本
+//     全等完。全都不通时才需要等满，那时每份样本都要耗到超时。
+//
+// 并发与错峰沿用整组测速那一套：样本虽小，也挤在同一条前置通道上。
+func AnyAlive(t DelayTester, names []string, timeoutMs, concurrency int) bool {
+	if len(names) == 0 {
+		return false
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	sem := make(chan struct{}, concurrency)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	alive := false
+	for _, n := range names {
+		// 先占名额再复查「已经通了没」：等名额期间可能有别的样本已经测通了，
+		// 这时该让出名额直接收工，而不是照样再打一发。
+		sem <- struct{}{}
+		mu.Lock()
+		stop := alive
+		mu.Unlock()
+		if stop {
+			<-sem
+			break
+		}
+		wg.Add(1)
+		go func(name string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if d := sweepJitter(); d > 0 {
+				time.Sleep(d)
+			}
+			if _, err := t.ProxyDelay(name, timeoutMs); err == nil {
+				mu.Lock()
+				alive = true
+				mu.Unlock()
+			}
+		}(n)
+	}
+	wg.Wait()
+	return alive
 }
 
 // freePort 找一个当前空闲的本地端口。
@@ -452,18 +523,39 @@ func (p *Prober) ProxyNow(name string) (string, error) {
 	return ctrlProxyNow(addr, name)
 }
 
+// SetFront 固定探针里前置通道组的节点（FrontSwitcher 接口）。
+//
+// 测速时通常是探针在测（用户还连着 xray、家宽内核根本没跑），所以「换一个
+// 能承载家宽链的前置」必须换到探针身上 —— 换到家宽内核上对这次测速毫无影响。
+func (p *Prober) SetFront(group, name string) error {
+	p.mu.Lock()
+	running, addr := p.running, p.ctrlAddrLocked()
+	p.mu.Unlock()
+	if !running {
+		return fmt.Errorf("测速探针没在跑")
+	}
+	return ctrlPutProxy(addr, group, name)
+}
+
+// DelaysOf 读探针缓存里这些代理的最近延迟（不触发测速，DelayReader 接口）。
+func (p *Prober) DelaysOf(names []string) map[string]int {
+	p.mu.Lock()
+	running, addr := p.running, p.ctrlAddrLocked()
+	p.mu.Unlock()
+	if !running {
+		return nil
+	}
+	return ctrlProxyDelays(addr, nameSet(names))
+}
+
 // Delays 读探针缓存里这些节点的最近延迟（不触发测速）。
 // 探针里装的不是这些节点所属的分组时返回 nil。
 func (p *Prober) Delays(groupID string, names []string) map[string]int {
 	p.mu.Lock()
-	running, group, addr := p.running, p.groupID, p.ctrlAddrLocked()
+	running, group := p.running, p.groupID
 	p.mu.Unlock()
 	if !running || group != groupID {
 		return nil
 	}
-	known := make(map[string]bool, len(names))
-	for _, n := range names {
-		known[n] = true
-	}
-	return ctrlProxyDelays(addr, known)
+	return p.DelaysOf(names)
 }

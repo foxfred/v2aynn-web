@@ -278,24 +278,39 @@ func (m *Manager) Start() error {
 
 	// 异步把上次选中的节点重新应用一遍。mihomo 重启后策略组会回到配置里的
 	// 默认成员，不重放的话用户会发现「重启后自己选的节点被换回去了」。
+	//
+	// 前置通道也必须一起重放，所以这个 goroutine 与「有没有选中节点」无关 ——
+	// 内核启动时会自己按 url-test 给前置组挑一个，而那个判据与「能不能承载
+	// 家宽链」无关，挑错了家宽节点会集体失效（见 applyFront）。
 	want := m.activeName
-	if want != "" {
-		go func() {
-			if err := m.waitControl(25 * time.Second); err != nil {
-				log.Printf("mihomo 控制接口未就绪，跳过节点恢复: %v", err)
-				return
-			}
-			if err := m.applyNode(want); err != nil {
-				log.Printf("恢复家宽节点[%s]失败: %v", want, err)
-				return
-			}
-			log.Printf("已恢复家宽节点[%s]", want)
-		}()
-	}
+	go func() {
+		if err := m.waitControl(25 * time.Second); err != nil {
+			log.Printf("mihomo 控制接口未就绪，跳过节点恢复: %v", err)
+			return
+		}
+		m.restoreSelection(want)
+	}()
 
 	go m.watch(m.cmd)
 	log.Printf("mihomo 已启动 (节点 %d 个)", len(m.nodes))
 	return nil
+}
+
+// restoreSelection 内核就绪之后，把用户选的节点与测速验过的前置重新应用一遍。
+//
+// 单独抽出来是为了能被测试直接调用 —— 它整条都在跟内核说话，只有拆出来
+// 才测得到「两个重放都真的做了、顺序也对」。
+func (m *Manager) restoreSelection(want string) {
+	if want != "" {
+		if err := m.applyNode(want); err != nil {
+			log.Printf("恢复家宽节点[%s]失败: %v", want, err)
+		} else {
+			log.Printf("已恢复家宽节点[%s]", want)
+		}
+	}
+	if err := m.applyFront(); err != nil {
+		log.Printf("恢复前置通道失败: %v", err)
+	}
 }
 
 // watch 监控 mihomo 进程。家宽节点掉线由 mihomo 自己的 fallback 组负责往下换，
@@ -638,14 +653,84 @@ func (m *Manager) SubBody(groupID string) ([]byte, error) {
 	return readSubFile(m.dataDir, groupID)
 }
 
+// FrontInfo 读出某个分组的前置通道：组名 + 它的成员列表。
+//
+// 两样东西一起返回是因为调用方（web 层的测速流程）通常两样都要，而
+// 解析一遍 110 KB 的订阅原文并不便宜。取不到时两样都是零值。
+func (m *Manager) FrontInfo(groupID string) (name string, members []string) {
+	body, err := readSubFile(m.dataDir, groupID)
+	if err != nil {
+		return "", nil
+	}
+	info := parseSubscription(string(body))
+	return info.frontGroup, info.frontMembers
+}
+
 // FrontGroup 家宽订阅里 openvpn 节点链式转发所依赖的前置组名。
 // 取不到时返回空串（订阅结构变了，或这个分组还没拉过订阅）。
 func (m *Manager) FrontGroup(groupID string) string {
-	body, err := readSubFile(m.dataDir, groupID)
-	if err != nil {
-		return ""
+	name, _ := m.FrontInfo(groupID)
+	return name
+}
+
+// SetFront 把前置通道组固定到指定节点。
+//
+// 前置组在订阅里是 url-test，本来由内核按「自己访问测速地址快不快」自动选；
+// 这里用 PUT /proxies 把它固定住（内核侧是 ForceSet），因为那个判据与
+// 「能不能承载家宽链」无关 —— 实测证据见 web 层 ensureFrontUsable 的说明。
+func (m *Manager) SetFront(group, name string) error {
+	return m.putProxy(group, name)
+}
+
+// applyFront 把「测速时验过的那个前置节点」重新固定到前置组上。
+//
+// 为什么每次内核启动都要重放：前置组是 url-test，内核启动时会自己做一次
+// 健康检查、按「它自己访问 gstatic 快不快」挑一个。那个判据与「能不能承载
+// 一条 OpenVPN 长连接」无关（实测：自己 171ms 的带不动家宽链、197ms 的反而
+// 能），而且订阅没写 lazy、mihomo 默认 lazy=true，前置组没有直接流量就不再
+// 复查 —— 挑错了永远不会自己纠正。不重放的话就会出现「测速时明明好好的，
+// 选上没一会儿就失效」，因为测速用的是探针、用户点节点后跑的是内核，两边
+// 各自挑各自的前置。
+//
+// 没有记录、或记录的那个节点已经不在订阅里（订阅换节点很频繁）时什么都不做，
+// 让内核按订阅的自动选择走。
+func (m *Manager) applyFront() error {
+	node, front := m.pinnedFront()
+	if node == "" {
+		return nil
 	}
-	return FrontGroupOf(body)
+	if err := m.putProxy(front, node); err != nil {
+		return fmt.Errorf("固定前置通道[%s]到[%s]失败: %w", front, node, err)
+	}
+	return nil
+}
+
+// pinnedFront 读出「当前生效分组」记录的前置节点与它所属的前置组名。
+// 两者任一为空都表示没有可重放的记录。
+func (m *Manager) pinnedFront() (node, front string) {
+	groupID := m.LoadedGroup()
+	if groupID == "" || m.cfg == nil {
+		return "", ""
+	}
+	m.cfg.Lock()
+	if g := m.cfg.FindClashGroup(groupID); g != nil {
+		node = g.FrontNode
+	}
+	m.cfg.Unlock()
+	if node == "" {
+		return "", ""
+	}
+	// 记录必须仍然成立：订阅刷新后组名和成员都可能变
+	name, members := m.FrontInfo(groupID)
+	if name == "" {
+		return "", ""
+	}
+	for _, n := range members {
+		if n == node {
+			return node, name
+		}
+	}
+	return "", ""
 }
 
 // UnloadGroup 删除某个家宽分组留下的文件。
@@ -980,12 +1065,23 @@ type proxyInfo struct {
 // 这个调用不触发任何测速，只读缓存，所以可以放心在每次加载列表时调用。
 func (m *Manager) ProxyDelays() map[string]int {
 	m.mu.Lock()
-	known := make(map[string]bool, len(m.nodes))
-	for _, n := range m.nodes {
-		known[n] = true
-	}
+	names := append([]string(nil), m.nodes...)
 	m.mu.Unlock()
-	return ctrlProxyDelays(m.controlAddr(), known)
+	return m.DelaysOf(names)
+}
+
+// DelaysOf 读内核记录里这些代理的最近延迟（只读缓存，不触发测速）。
+func (m *Manager) DelaysOf(names []string) map[string]int {
+	return ctrlProxyDelays(m.controlAddr(), nameSet(names))
+}
+
+// nameSet 把名字列表转成集合，给 ctrlProxyDelays 过滤用。
+func nameSet(names []string) map[string]bool {
+	out := make(map[string]bool, len(names))
+	for _, n := range names {
+		out[n] = true
+	}
+	return out
 }
 
 // ctrlProxyDelays 读内核记录的各代理最近一次延迟。不触发测速，只读缓存。
@@ -1068,6 +1164,13 @@ func ctrlProxyDelay(addr, name string, timeoutMs int, testURL string) (int, erro
 // 单独一个接口而不是塞进 DelayTester：它只有诊断路径用得上，不是测速的必需能力。
 type GroupNowTester interface {
 	ProxyNow(name string) (string, error)
+}
+
+// DelayReader 能读出「内核记录的这些代理最近延迟」的后端（只读缓存，不触发测速）。
+//
+// 同样单独一个接口：只有「挑前置候选」用得上。
+type DelayReader interface {
+	DelaysOf(names []string) map[string]int
 }
 
 // ProxyNow 读内核里某个策略组当前选中的节点名。
@@ -1157,11 +1260,20 @@ func ctrlGroupDelay(addr, group string, timeoutMs int, known map[string]bool, te
 // putProxy 通过 external-controller 切换某个策略组的当前选择。
 // group 是组名（可能是中文或 emoji），必须做路径转义。
 func (m *Manager) putProxy(group, name string) error {
+	return ctrlPutProxy(m.controlAddr(), group, name)
+}
+
+// ctrlPutProxy 是 putProxy 的实现体。单独抽出来是为了让探针也能用 ——
+// 探针是另一个 mihomo 进程，控制口地址不一样，但协议完全相同。
+//
+// 内核侧这个调用走 ForceSet：会把 url-test / fallback 这类自动组的自动选择
+// 覆盖掉，直到下一次重启或显式清空。
+func ctrlPutProxy(addr, group, name string) error {
 	body, err := json.Marshal(map[string]string{"name": name})
 	if err != nil {
 		return err
 	}
-	u := fmt.Sprintf("http://%s/proxies/%s", m.controlAddr(), url.PathEscape(group))
+	u := fmt.Sprintf("http://%s/proxies/%s", addr, url.PathEscape(group))
 	req, err := http.NewRequest(http.MethodPut, u, bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -1265,6 +1377,8 @@ type subInfo struct {
 	// frontGroup 前置通道组名 —— openvpn 节点靠 dialer-proxy 指向它做链式转发。
 	// 全部家宽节点的出口都挤在这一个组上，所以它不通时所有家宽节点都不通。
 	frontGroup string
+	// frontMembers 前置组的成员列表。换前置时要从里面挑候选。
+	frontMembers []string
 	// groupURLs 各策略组自己声明的测速地址（组名 → url）。
 	// 测延迟时跟着订阅走，别自己写死 —— 见 TestURLOf。
 	groupURLs map[string]string
@@ -1400,6 +1514,16 @@ func parseSubscription(src string) subInfo {
 	for name, hits := range dialerHits {
 		if hits > bestHit {
 			info.frontGroup, bestHit = name, hits
+		}
+	}
+
+	// 1c) 前置组的成员 —— 换前置时要从里面挑候选。
+	if info.frontGroup != "" {
+		for i, n := range gNames {
+			if n == info.frontGroup {
+				info.frontMembers = append([]string(nil), gMembers[i]...)
+				break
+			}
 		}
 	}
 

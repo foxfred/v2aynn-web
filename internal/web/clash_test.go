@@ -44,6 +44,8 @@ proxy-groups:
     url: https://www.gstatic.com/generate_204
     proxies:
       - "优选域名-01"
+      - "联通-09"
+      - "联通-07"
   - name: "🏠 家宽节点"
     type: select
     proxies:
@@ -101,6 +103,15 @@ type fakeProber struct {
 	delays   map[string]int
 	// nows 各策略组「当前在用哪个节点」。真实内核里这是 /proxies/{组} 的 now 字段。
 	nows map[string]string
+	// probe 覆盖 ProxyDelay 的行为。nil 时按 delays 表查。
+	//
+	// 需要「前置选错 ⇒ 家宽节点全挂」这类因果链的用例用它 —— 直接写一个闭包，
+	// 比在替身里堆一堆开关清楚得多。
+	probe func(name string) (int, error)
+	// frontSet 记录 SetFront 的调用序列（含最后那次「拨回原样」）。
+	// front 是前置组当前被固定到的节点，空串表示没动过。
+	frontSet []string
+	front    string
 }
 
 func newFakeProber() *fakeProber {
@@ -115,6 +126,20 @@ func newFakeProber() *fakeProber {
 			"⚡ CF前置": "优选域名-01",
 		},
 	}
+}
+
+// currentFront 前置组此刻被固定到哪个节点（没动过时是空串）。
+func (f *fakeProber) currentFront() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.front
+}
+
+// frontCalls 返回 SetFront 的调用序列副本。
+func (f *fakeProber) frontCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.frontSet...)
 }
 
 func (f *fakeProber) Ensure(groupID string, resident bool) error {
@@ -147,12 +172,38 @@ func (f *fakeProber) IsRunning() bool {
 
 func (f *fakeProber) ProxyDelay(name string, timeoutMs int) (int, error) {
 	f.mu.Lock()
+	fn := f.probe
 	ms, ok := f.delays[name]
 	f.mu.Unlock()
+	if fn != nil {
+		return fn(name)
+	}
 	if !ok || ms <= 0 {
 		return 0, fmt.Errorf("节点无响应")
 	}
 	return ms, nil
+}
+
+// SetFront 对应真实内核的 PUT /proxies/{组}（内核侧是 ForceSet）。
+func (f *fakeProber) SetFront(group, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.frontSet = append(f.frontSet, name)
+	f.front = name
+	return nil
+}
+
+// DelaysOf 对应读内核缓存的 /proxies（只读，不触发测速）。
+func (f *fakeProber) DelaysOf(names []string) map[string]int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[string]int, len(names))
+	for _, n := range names {
+		if ms, ok := f.delays[n]; ok {
+			out[n] = ms
+		}
+	}
+	return out
 }
 
 // ProxyNow 对应真实内核 /proxies/{组} 的 now 字段。
@@ -589,15 +640,73 @@ func TestPingClashGroupNotBlockedByFrontProbe(t *testing.T) {
 	}
 }
 
-// 家宽节点一个都测不通、且前置通道当前用的那个节点也不通时，必须点名说是
-// 前置通道的问题 —— 家宽节点的出口全挤在它上面，先修它才有意义。
-func TestPingClashGroupBlamesFrontWhenAllNodesFail(t *testing.T) {
+// ★ 核心：前置通道被内核自动选成了一个「带不动家宽链」的节点时，整组测速
+// 必须自己换一个能用的，而不是把「全部超时」丢给用户。
+//
+// 这是用户报的「家宽测速测出来的活链接，选用后一会儿就失效了，再测全部家宽
+// 都是超时」的根因修复。全部家宽节点的出口都挤在前置通道组的同一个节点上，
+// 而那个组是 url-test —— 内核按「它自己访问 gstatic 快不快」挑，这个指标与
+// 「能不能承载一条 OpenVPN 长连接」毫无关系（盒子实测：自己 171ms 的带不动
+// 家宽链、197ms 的反而能）。选错了 70 多个节点一起陪葬。
+func TestPingClashGroupSwitchesToWorkingFront(t *testing.T) {
 	s, cfg, mhm, url := newClashTestServer(t)
 	seedClashGroup(t, cfg, mhm, "g1", "家宽", url)
 
 	f := s.prober.(*fakeProber)
 	f.mu.Lock()
-	f.delays = map[string]int{} // 全都不通，前置组当前用的节点同样不在表里
+	// 内核此刻用的是「优选域名-01」（延迟最低的那个），但它带不动家宽链；
+	// 「联通-09」自己稍慢，却能承载家宽链。
+	f.nows = map[string]string{"⚡ CF前置": "优选域名-01"}
+	f.delays = map[string]int{"优选域名-01": 120, "联通-09": 190, "联通-07": 260}
+	f.probe = func(name string) (int, error) {
+		if name == "🏠 JP-家宽-01" || name == "🏠 KR-家宽-01" {
+			if f.currentFront() == "联通-09" {
+				return 500, nil
+			}
+			return 0, errors.New("节点无响应")
+		}
+		return 120, nil
+	}
+	f.mu.Unlock()
+
+	req := httptest.NewRequest("POST", "/api/ping/group/g1", nil)
+	req.SetPathValue("id", "g1")
+	rec := httptest.NewRecorder()
+	s.apiPingGroup(rec, req)
+
+	var res []map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatalf("换前置之后应当照常返回节点结果, 实际 body=%s", rec.Body.String())
+	}
+	if len(res) != 2 {
+		t.Fatalf("应当返回 2 个节点的结果, 得到 %d (body=%s)", len(res), rec.Body.String())
+	}
+
+	// 候选按「内核记录的延迟从低到高」排，第一个就通，所以只该动一次
+	if calls := f.frontCalls(); len(calls) != 1 || calls[0] != "联通-09" {
+		t.Errorf("SetFront 调用序列 = %v, 期望只切一次到 联通-09", calls)
+	}
+	// 必须落盘：测速走的是探针，用户点节点后跑的是内核，不落盘内核会自己挑回错的
+	cfg.Lock()
+	pinned := cfg.FindClashGroup("g1").FrontNode
+	cfg.Unlock()
+	if pinned != "联通-09" {
+		t.Errorf("换好的前置没落盘, FrontNode = %q", pinned)
+	}
+}
+
+// 换遍了候选还是不通时，如实说清试过谁，并提示「换一批节点」——
+// 这种情况大概率是这批家宽节点集体掉线，而不是前置的问题。
+func TestPingClashGroupReportsWhenNoFrontWorks(t *testing.T) {
+	s, cfg, mhm, url := newClashTestServer(t)
+	seedClashGroup(t, cfg, mhm, "g1", "家宽", url)
+
+	f := s.prober.(*fakeProber)
+	f.mu.Lock()
+	f.nows = map[string]string{"⚡ CF前置": "优选域名-01"}
+	f.delays = map[string]int{"优选域名-01": 120}
+	// 不管换成哪个前置，家宽节点都连不上
+	f.probe = func(name string) (int, error) { return 0, errors.New("节点无响应") }
 	f.mu.Unlock()
 
 	req := httptest.NewRequest("POST", "/api/ping/group/g1", nil)
@@ -607,33 +716,39 @@ func TestPingClashGroupBlamesFrontWhenAllNodesFail(t *testing.T) {
 
 	var resp map[string]string
 	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
-	if !strings.Contains(resp["error"], "前置通道") {
-		t.Errorf("应当明确指出前置通道不通, 实际: %q", resp["error"])
+	msg := resp["error"]
+	for _, want := range []string{"优选域名-01", "联通-09", "联通-07", "更新"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("提示里应当包含 %q, 实际: %q", want, msg)
+		}
 	}
-	// 报的是「前置组当前用的那个节点」，不是拿组名去蒙的
-	if !strings.Contains(resp["error"], "优选域名-01") {
-		t.Errorf("应当点名前置通道当前用的节点, 实际: %q", resp["error"])
+	// 全都不行时要把前置拨回原来那个，别留下一个「我们随手挑的」状态
+	if got := f.currentFront(); got != "优选域名-01" {
+		t.Errorf("试遍候选都不行后应把前置拨回原样, 实际停在 %q", got)
 	}
 	// 全都不通时不该留下半截结果
 	cfg.Lock()
 	g := cfg.FindClashGroup("g1")
 	_, has := g.Probe("🏠 JP-家宽-01")
+	pinned := g.FrontNode
 	cfg.Unlock()
 	if has {
 		t.Error("全都不通时不该产出节点结果")
 	}
+	if pinned != "" {
+		t.Errorf("没验出可用前置时不该落盘, FrontNode = %q", pinned)
+	}
 }
 
-// 前置通道是好的、但家宽节点全挂（掉线是常态）时，别把锅甩给前置，
-// 该提示的是「换一批节点」。
-func TestPingClashGroupSuggestsRefreshWhenFrontIsFine(t *testing.T) {
+// 前置本来就是好的（样本里能连通）时什么都不动 —— 换前置是全局动作，
+// 没有真凭实据不能做。
+func TestPingClashGroupKeepsFrontWhenItWorks(t *testing.T) {
 	s, cfg, mhm, url := newClashTestServer(t)
 	seedClashGroup(t, cfg, mhm, "g1", "家宽", url)
 
 	f := s.prober.(*fakeProber)
 	f.mu.Lock()
-	// 家宽节点全挂，但前置组当前用的节点是通的
-	f.delays = map[string]int{"优选域名-01": 120}
+	f.probe = func(name string) (int, error) { return 500, nil }
 	f.mu.Unlock()
 
 	req := httptest.NewRequest("POST", "/api/ping/group/g1", nil)
@@ -641,13 +756,77 @@ func TestPingClashGroupSuggestsRefreshWhenFrontIsFine(t *testing.T) {
 	rec := httptest.NewRecorder()
 	s.apiPingGroup(rec, req)
 
-	var resp map[string]string
-	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
-	if !strings.Contains(resp["error"], "更新") {
-		t.Errorf("前置正常时应提示换一批节点, 实际: %q", resp["error"])
+	var res []map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatalf("解析响应失败: %v (body=%s)", err, rec.Body.String())
 	}
-	if strings.Contains(resp["error"], "前置通道") && strings.Contains(resp["error"], "也测不通") {
-		t.Errorf("前置明明是通的, 不该说它不通: %q", resp["error"])
+	if len(res) != 2 {
+		t.Fatalf("应当返回 2 个节点的结果, 得到 %d", len(res))
+	}
+	if calls := f.frontCalls(); len(calls) != 0 {
+		t.Errorf("前置正常时不该动它, 实际调用 %v", calls)
+	}
+	cfg.Lock()
+	pinned := cfg.FindClashGroup("g1").FrontNode
+	cfg.Unlock()
+	if pinned != "" {
+		t.Errorf("没换前置时不该落盘, FrontNode = %q", pinned)
+	}
+}
+
+// spreadSample 要等距取样：订阅里节点按地区聚堆排，取前 n 个会全落在同一个
+// 国家的同一个服务端上，那一批集体掉线时会被误判成「前置通道不通」。
+func TestSpreadSampleSpreadsAcrossRegions(t *testing.T) {
+	names := []string{
+		"🏠 JP-家宽-01", "🏠 JP-家宽-02", "🏠 JP-家宽-03",
+		"🏠 KR-家宽-01", "🏠 KR-家宽-02", "🏠 KR-家宽-03",
+		"🏠 TH-家宽-01", "🏠 TH-家宽-02", "🏠 TH-家宽-03",
+	}
+	got := spreadSample(names, 3)
+	if len(got) != 3 {
+		t.Fatalf("样本数 = %d, 期望 3 (%v)", len(got), got)
+	}
+	// 等距步长 3：0/3/6 —— 恰好覆盖三个地区
+	want := []string{"🏠 JP-家宽-01", "🏠 KR-家宽-01", "🏠 TH-家宽-01"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("样本[%d] = %q, 期望 %q（应当分散到不同地区）", i, got[i], want[i])
+		}
+	}
+
+	// 节点数比样本数还少时全给出来，不能返回空的
+	short := spreadSample([]string{"a", "b"}, 8)
+	if len(short) != 2 {
+		t.Errorf("节点不够时应当全给出来, 得到 %v", short)
+	}
+	if spreadSample(nil, 8) != nil {
+		t.Error("空列表应当返回 nil")
+	}
+}
+
+// 前置候选：按内核记录的延迟从低到高排，没测过的排最后，明确测过不通的丢掉，
+// 当前正在用的那个也排除掉（已经试过了）。
+func TestPickFrontCandidatesSkipsDeadAndCurrent(t *testing.T) {
+	members := []string{"优选域名-01", "联通-09", "联通-07", "挂了-01", "没测过-01"}
+	delays := map[string]int{
+		"优选域名-01": 120,
+		"联通-09":   260,
+		"联通-07":   190,
+		"挂了-01":   0, // 测过但不通
+	}
+	got := pickFrontCandidates(members, delays, "优选域名-01")
+	want := []string{"联通-07", "联通-09", "没测过-01"}
+	if len(got) != len(want) {
+		t.Fatalf("候选 = %v, 期望 %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("候选[%d] = %q, 期望 %q", i, got[i], want[i])
+		}
+	}
+	// 没有内核缓存时退化成订阅顺序，不能崩
+	if got := pickFrontCandidates(members, nil, ""); len(got) != len(members) {
+		t.Errorf("没有延迟数据时应当保留全部候选, 得到 %v", got)
 	}
 }
 

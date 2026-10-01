@@ -65,6 +65,19 @@ type Group struct {
 	// 免得混进 AllNodes() 被 xray 的故障转移当成候选节点。
 	Kind string `json:"kind,omitempty"`
 
+	// FrontNode 前置通道组被固定到哪个节点。
+	//
+	// 前置通道是家宽链的第一跳：全部家宽节点的出口都挤在它的同一个节点上。
+	// 它在订阅里是 url-test，内核按「它自己访问 gstatic 快不快」自动选 ——
+	// 而这个指标与「能不能承载一条 OpenVPN 长连接」毫无关系（盒子实测：
+	// 自己 171ms 的带不动家宽链，197ms 的反而能），并且订阅没写 lazy、
+	// mihomo 默认 lazy=true，前置组没有直接流量就不再复查，选错了永远不纠正。
+	//
+	// 所以测速时我们会拿真实的家宽节点试出「哪个前置能跑通」，记在这里，
+	// 内核每次启动时重新固定一遍。空串表示还没测出过可用的前置，按订阅的
+	// 自动选择走。
+	FrontNode string `json:"frontNode,omitempty"`
+
 	// Probes 家宽节点的测速结果，按节点名索引。只对家宽分组有意义。
 	//
 	// 为什么要单独一张表：家宽分组的 Nodes 恒为空，Node.Ping / Node.Speed

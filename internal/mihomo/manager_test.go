@@ -1,12 +1,17 @@
 package mihomo
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+
+	"v2aynn-web/internal/config"
 )
 
 // sampleSub 是脱敏后的 cfnew 家宽订阅样本，结构与真实订阅一致：
@@ -30,6 +35,11 @@ proxies:
     server: "example.com"
     port: 443
     network: ws
+  - name: "联通-09"
+    type: vless
+    server: "example.net"
+    port: 443
+    network: ws
   - name: "🏠 JP-家宽-01"
     type: openvpn
     server: 1.2.3.4
@@ -50,6 +60,7 @@ proxy-groups:
     interval: 300
     proxies:
       - "优选域名-01"
+      - "联通-09"
   - name: "🏠 家宽自动"
     type: fallback
     url: https://www.gstatic.com/generate_204
@@ -95,6 +106,20 @@ func TestParseSubscription(t *testing.T) {
 	}
 	if info.topGroup != "🚀 节点选择" {
 		t.Errorf("topGroup = %q, 期望 %q", info.topGroup, "🚀 节点选择")
+	}
+
+	// 前置通道组名与它的成员都要能取到 —— 换前置时要从成员里挑候选。
+	if info.frontGroup != "⚡ CF前置" {
+		t.Errorf("frontGroup = %q, 期望 %q", info.frontGroup, "⚡ CF前置")
+	}
+	wantMembers := []string{"优选域名-01", "联通-09"}
+	if len(info.frontMembers) != len(wantMembers) {
+		t.Fatalf("frontMembers = %v, 期望 %v", info.frontMembers, wantMembers)
+	}
+	for i, n := range wantMembers {
+		if info.frontMembers[i] != n {
+			t.Errorf("frontMembers[%d] = %q, 期望 %q", i, info.frontMembers[i], n)
+		}
 	}
 }
 
@@ -527,5 +552,176 @@ func TestNodeGroupAccessor(t *testing.T) {
 	m := newFakeKernel(t, func(rw http.ResponseWriter, r *http.Request) {})
 	if got := m.NodeGroup(); got != "🏠 家宽节点" {
 		t.Errorf("NodeGroup() = %q", got)
+	}
+}
+
+// --- 前置通道（家宽链的第一跳）相关测试 ---
+//
+// 全部家宽节点的出口都挤在前置通道组的同一个节点上。那个组在订阅里是
+// url-test，内核按「它自己访问 gstatic 快不快」挑 —— 这个判据与「能不能
+// 承载一条 OpenVPN 长连接」毫无关系，而且订阅没写 lazy、mihomo 默认
+// lazy=true，选错了也永远不自己纠正。
+//
+// 所以测速时会拿真实家宽节点试出可用的前置并落盘，内核每次启动重放一遍。
+// 不重放的话就是「测速时明明好好的，选上没一会儿就失效」—— 测速走探针、
+// 用户点节点后跑内核，两边各自挑各自的前置。
+
+// newFakeKernelWithSub 造一个带订阅原文与配置的假内核环境。
+func newFakeKernelWithSub(t *testing.T, frontNode string) (*Manager, *config.Config, *httptest.Server, *string) {
+	t.Helper()
+	dir := t.TempDir()
+	cfg, err := config.Load(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatalf("加载配置失败: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, subFileNameFor("g1")), []byte(sampleSub), 0644); err != nil {
+		t.Fatalf("写入订阅原文失败: %v", err)
+	}
+	cfg.Lock()
+	cfg.Groups = []config.Group{{
+		ID: "g1", Name: "家宽", Kind: config.GroupKindClash,
+		Nodes: []config.Node{}, FrontNode: frontNode,
+	}}
+	cfg.Unlock()
+
+	var mu sync.Mutex
+	lastPath := new(string)
+	fake := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		mu.Lock()
+		// 记原始请求行：r.URL.Path 已被服务端解码，验不了「组名里的 emoji
+		// 与空格有没有被正确转义」。
+		*lastPath = r.RequestURI
+		mu.Unlock()
+		rw.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(fake.Close)
+
+	m := NewManager(dir)
+	m.SetConfig(cfg)
+	m.mu.Lock()
+	m.loadedGroup = "g1"
+	m.nodes = []string{"🏠 JP-家宽-01", "🏠 KR-家宽-01"}
+	m.nodeGroup = "🏠 家宽节点"
+	m.topGroup = "🚀 节点选择"
+	m.ctrlAddr = strings.TrimPrefix(fake.URL, "http://")
+	m.mu.Unlock()
+	return m, cfg, fake, lastPath
+}
+
+// 测速验过的前置必须在内核启动后重放 —— 否则内核自己挑的那个（判据是错的）
+// 会把用户选中的家宽节点一起带死。
+func TestApplyFrontReplaysPinnedFront(t *testing.T) {
+	m, _, _, lastPath := newFakeKernelWithSub(t, "联通-09")
+
+	if err := m.applyFront(); err != nil {
+		t.Fatalf("applyFront 失败: %v", err)
+	}
+	// 组名带 emoji 与空格，必须转义后再拼进路径
+	want := "/proxies/" + url.PathEscape("⚡ CF前置")
+	if got := *lastPath; got != want {
+		t.Errorf("请求行 = %q, 期望 %q", got, want)
+	}
+}
+
+// 从没测出过可用的前置时不能乱动：让内核按订阅的自动选择走。
+func TestApplyFrontNoopWithoutPin(t *testing.T) {
+	m, _, _, lastPath := newFakeKernelWithSub(t, "")
+
+	if err := m.applyFront(); err != nil {
+		t.Fatalf("applyFront 失败: %v", err)
+	}
+	if *lastPath != "" {
+		t.Errorf("没有记录时不该发起任何请求, 实际 %q", *lastPath)
+	}
+}
+
+// 记录的那个节点已经不在订阅里（订阅换节点很频繁）时也要安静地跳过，
+// 否则 PUT 会被内核拒绝、日志里刷一条看不懂的错。
+func TestApplyFrontSkipsStalePin(t *testing.T) {
+	m, _, _, lastPath := newFakeKernelWithSub(t, "早就没了的节点")
+
+	if err := m.applyFront(); err != nil {
+		t.Fatalf("applyFront 失败: %v", err)
+	}
+	if *lastPath != "" {
+		t.Errorf("记录已失效时不该发起请求, 实际 %q", *lastPath)
+	}
+}
+
+// FrontInfo 一次把组名和成员都给出来 —— 测速流程两样都要，解析一遍就够。
+func TestFrontInfoReturnsNameAndMembers(t *testing.T) {
+	m, _, _, _ := newFakeKernelWithSub(t, "")
+
+	name, members := m.FrontInfo("g1")
+	if name != "⚡ CF前置" {
+		t.Errorf("组名 = %q", name)
+	}
+	if len(members) != 2 || members[0] != "优选域名-01" {
+		t.Errorf("成员 = %v", members)
+	}
+	if n, mem := m.FrontInfo("不存在"); n != "" || mem != nil {
+		t.Errorf("分组不存在时应返回零值, 得到 %q/%v", n, mem)
+	}
+}
+
+// SetFront 必须把节点名放进请求体（内核侧靠它做 ForceSet）。
+func TestSetFrontSendsName(t *testing.T) {
+	var gotBody string
+	fake := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		rw.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(fake.Close)
+
+	m := NewManager(t.TempDir())
+	m.mu.Lock()
+	m.ctrlAddr = strings.TrimPrefix(fake.URL, "http://")
+	m.mu.Unlock()
+
+	if err := m.SetFront("⚡ CF前置", "联通-09"); err != nil {
+		t.Fatalf("SetFront 失败: %v", err)
+	}
+	if !strings.Contains(gotBody, "联通-09") {
+		t.Errorf("请求体 = %q, 期望含节点名", gotBody)
+	}
+}
+
+// restoreSelection 必须把「用户选的节点」和「测速验过的前置」两样都重放，
+// 而且节点先、前置后 —— 前置是节点能通的先决条件，顺序反了会出现一小段
+// 「节点已切过去但前置还是错的」窗口。
+func TestRestoreSelectionReplaysNodeThenFront(t *testing.T) {
+	m, _, _, _ := newFakeKernelWithSub(t, "联通-09")
+
+	var mu sync.Mutex
+	var calls []string
+	fake := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		mu.Lock()
+		calls = append(calls, r.RequestURI)
+		mu.Unlock()
+		rw.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(fake.Close)
+	m.mu.Lock()
+	m.ctrlAddr = strings.TrimPrefix(fake.URL, "http://")
+	m.mu.Unlock()
+
+	m.restoreSelection("🏠 KR-家宽-01")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 3 {
+		t.Fatalf("应当有 3 次 PUT（手动组、顶层组、前置组）, 实际 %v", calls)
+	}
+	if !strings.Contains(calls[0], url.PathEscape("🏠 家宽节点")) {
+		t.Errorf("第 1 次应当切手动选择组, 实际 %q", calls[0])
+	}
+	if !strings.Contains(calls[1], url.PathEscape("🚀 节点选择")) {
+		t.Errorf("第 2 次应当切顶层主组, 实际 %q", calls[1])
+	}
+	if !strings.Contains(calls[2], url.PathEscape("⚡ CF前置")) {
+		t.Errorf("第 3 次应当重放前置, 实际 %q", calls[2])
 	}
 }

@@ -449,11 +449,9 @@ func (w *WebServer) writeClashNodes(rw http.ResponseWriter, groupID string) {
 
 // clashDelayTimeout 家宽节点测延迟的超时（毫秒）。
 // 比普通节点宽松得多：每个节点都要现场建立一条 OpenVPN over Cloudflare 隧道。
+// 「前置通道能不能用」的抽样判断也用这个上限 —— 抽样同样是现场建隧道，
+// 给更短的上限会把「隧道建得慢一点但确实能用」误判成不通。
 const clashDelayTimeout = 8000
-
-// clashFrontTimeout 测前置通道的超时（毫秒）。
-// 前置通道只有一跳、比节点本身快，给同样的上限足够。
-const clashFrontTimeout = 8000
 
 // pingClashNode 测单个家宽节点的延迟。
 //
@@ -512,6 +510,9 @@ func (w *WebServer) pingClashGroup(rw http.ResponseWriter, groupID string) {
 //     「前置不通」，另外两百多个明明好好的。
 //   - 订阅一刷新节点顺序就变，同一个分组一会儿能测一会儿不能测，
 //     表现出来就是「网关检测不稳定」。
+//
+// 现在换前置的判断不再是「前置节点自己延迟高不高」（那个指标与能不能承载家宽链
+// 无关），而是「拿真实的家宽节点试一下通不通」—— 见 ensureFrontUsable。
 func (w *WebServer) probeClashGroup(groupID string) (map[string]int, error) {
 	names := w.mhm.GroupNodes(groupID)
 	if len(names) == 0 {
@@ -522,6 +523,16 @@ func (w *WebServer) probeClashGroup(groupID string) (map[string]int, error) {
 		return nil, err
 	}
 
+	// 测速前先给前置通道做个体检，不行就换一个能用的。全部家宽节点的出口都挤在
+	// 它上面，它选错了 70 多个节点会一起失效 —— 那正是「测出来好好的、选上就失效」
+	// 的根因。体检只花几秒，能省掉后面整轮（约两分钟）白测。
+	front, members := w.mhm.FrontInfo(groupID)
+	frontNote := ""
+	if front != "" && len(members) > 0 {
+		frontNote = w.ensureFrontUsable(groupID, front, tester, members,
+			spreadSample(names, clashFrontSampleCount))
+	}
+
 	delays := mihomo.SweepDelay(tester, names, clashDelayTimeout, mihomo.ClashSweepConcurrency)
 
 	// 有节点能测通就正常返回 —— 家宽节点掉线是常态，掉几个不算故障，
@@ -529,9 +540,12 @@ func (w *WebServer) probeClashGroup(groupID string) (map[string]int, error) {
 	if !allUnreachable(delays) {
 		return delays, nil
 	}
-	// 一个都测不通才值得追究：家宽节点的出口全挤在同一条前置通道上，
-	// 前置不通时 70 多个节点会全超时，白等两分钟还看不出所以然。
-	return nil, w.diagnoseFront(groupID, tester)
+	// 一个都测不通才值得追究：把刚才给前置做的体检/抢修的结论告诉用户，
+	// 比笼统的「全都不通」有用得多。
+	if frontNote != "" {
+		return nil, fmt.Errorf("这批家宽节点全都连不上。%s", frontNote)
+	}
+	return nil, fmt.Errorf("这批家宽节点全都连不上 —— 家宽节点掉线是常态，点「更新」换一批再试")
 }
 
 // allUnreachable 结果里是不是一个测通的都没有。
@@ -545,27 +559,6 @@ func allUnreachable(delays map[string]int) bool {
 		}
 	}
 	return true
-}
-
-// diagnoseFront 家宽节点全都不通时，回头查一下前置通道，给一句能照着做的说明。
-func (w *WebServer) diagnoseFront(groupID string, tester mihomo.DelayTester) error {
-	front := w.mhm.FrontGroup(groupID)
-	if front == "" {
-		return fmt.Errorf("这批家宽节点全都连不上，点「更新」换一批再试")
-	}
-	// 先问内核「前置组此刻在用哪个节点」，再测那一个 —— 直接拿组名去测会被
-	// fast() 落到「成员列表第一个」，那代表不了前置通道当前的真实状态。
-	target := front
-	if nt, ok := tester.(mihomo.GroupNowTester); ok {
-		if now, err := nt.ProxyNow(front); err == nil && now != "" {
-			target = now
-		}
-	}
-	ms, err := tester.ProxyDelay(target, clashFrontTimeout)
-	if err != nil {
-		return fmt.Errorf("家宽节点全部不通，前置通道[%s]当前的节点[%s]也测不通 —— 先把它修好再测（家宽节点的出口都走它）", front, target)
-	}
-	return fmt.Errorf("前置通道[%s]正常（当前节点[%s]，%dms），但这批家宽节点全都连不上 —— 家宽节点掉线是常态，点「更新」换一批再试", front, target, ms)
 }
 
 // saveProbeMS 记下一个家宽节点的延迟
