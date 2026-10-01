@@ -624,6 +624,35 @@ func TestApplyFrontReplaysPinnedFront(t *testing.T) {
 	}
 }
 
+// 内核不采用我们固定的前置时，applyFront 只该记一条日志，不能报错 ——
+// 它是「启动时的尽力而为」，报错会让整个启动流程看起来是失败的。
+//
+// 为什么会不采用：url-test 组的固定只是「偏好」，被固定的节点若在内核自己的
+// 账本里是「不活」（判据 = 能不能直接访问订阅里写的那个测速地址），内核会静默
+// 忽略、继续用它自己挑的那个。盒子实测 216 个 CF 前置里约一半如此。
+func TestApplyFrontToleratesKernelIgnoringPin(t *testing.T) {
+	m, _, _, _ := newFakeKernelWithSub(t, "联通-09")
+
+	// 换一个「内核仍在用别的节点」的假控制口
+	fake := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if r.Method == http.MethodGet {
+			rw.Header().Set("Content-Type", "application/json")
+			_, _ = rw.Write([]byte(`{"now":"优选域名-01"}`))
+			return
+		}
+		rw.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(fake.Close)
+	m.mu.Lock()
+	m.ctrlAddr = strings.TrimPrefix(fake.URL, "http://")
+	m.mu.Unlock()
+
+	if err := m.applyFront(); err != nil {
+		t.Fatalf("内核不采用固定值时不该报错（那只是偏好）, 实际: %v", err)
+	}
+}
+
 // 从没测出过可用的前置时不能乱动：让内核按订阅的自动选择走。
 func TestApplyFrontNoopWithoutPin(t *testing.T) {
 	m, _, _, lastPath := newFakeKernelWithSub(t, "")
@@ -698,9 +727,13 @@ func TestRestoreSelectionReplaysNodeThenFront(t *testing.T) {
 	var calls []string
 	fake := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
-		mu.Lock()
-		calls = append(calls, r.RequestURI)
-		mu.Unlock()
+		// 只记 PUT：applyFront 在固定之后还会 GET 一次 /proxies/{前置组} 核实
+		// 「内核到底有没有采用」，那是读操作，不算一次「重放」。
+		if r.Method == http.MethodPut {
+			mu.Lock()
+			calls = append(calls, r.RequestURI)
+			mu.Unlock()
+		}
 		rw.WriteHeader(http.StatusNoContent)
 	}))
 	t.Cleanup(fake.Close)

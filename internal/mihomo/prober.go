@@ -121,18 +121,25 @@ func SweepDelay(t DelayTester, names []string, timeoutMs, concurrency int) map[s
 	return out
 }
 
-// AnyAlive 限并发地试这批节点，只要有一个能连通就立刻返回 true。
+// CountAlive 数这批节点里有几个能连通，数到 limit 个就立刻收工。
 //
 // 用途是「拿几个家宽节点当探针，判断前置通道此刻能不能承载家宽链」。
 // 与 SweepDelay 的两点差别：
 //   - 不取第二次。这里只问通不通，不关心真实延迟。
-//   - 一旦有一个通了就收工 —— 「通」是结论性证据，没必要把剩下的样本
-//     全等完。全都不通时才需要等满，那时每份样本都要耗到超时。
+//   - 数够 limit 就收工 —— 「够多」是结论性证据，没必要把剩下的样本全等完。
+//     全都不够时才需要等满，那时每份样本都要耗到超时。
+//
+// 返回 min(实际连通数, limit)。
+//
+// ★ 为什么不提供「有一个通就返回 true」的版本：盒子实测「联通-01」这个前置
+// 在同一批 6 个样本上通 0 个、整组 65 个节点只测出 6 个；换成「优选域名-04」
+// 同样 6 个样本能通 5 个。可见「勉强有 1 个通」和「能承载大半样本」差别巨大，
+// 判据必须看比例，不能看有无。
 //
 // 并发与错峰沿用整组测速那一套：样本虽小，也挤在同一条前置通道上。
-func AnyAlive(t DelayTester, names []string, timeoutMs, concurrency int) bool {
-	if len(names) == 0 {
-		return false
+func CountAlive(t DelayTester, names []string, limit, timeoutMs, concurrency int) int {
+	if len(names) == 0 || limit <= 0 {
+		return 0
 	}
 	if concurrency < 1 {
 		concurrency = 1
@@ -140,13 +147,13 @@ func AnyAlive(t DelayTester, names []string, timeoutMs, concurrency int) bool {
 	sem := make(chan struct{}, concurrency)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	alive := false
+	alive := 0
 	for _, n := range names {
-		// 先占名额再复查「已经通了没」：等名额期间可能有别的样本已经测通了，
+		// 先占名额再复查「够了没」：等名额期间可能有别的样本已经测通了，
 		// 这时该让出名额直接收工，而不是照样再打一发。
 		sem <- struct{}{}
 		mu.Lock()
-		stop := alive
+		stop := alive >= limit
 		mu.Unlock()
 		if stop {
 			<-sem
@@ -161,12 +168,15 @@ func AnyAlive(t DelayTester, names []string, timeoutMs, concurrency int) bool {
 			}
 			if _, err := t.ProxyDelay(name, timeoutMs); err == nil {
 				mu.Lock()
-				alive = true
+				alive++
 				mu.Unlock()
 			}
 		}(n)
 	}
 	wg.Wait()
+	if alive > limit {
+		alive = limit
+	}
 	return alive
 }
 

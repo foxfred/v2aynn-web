@@ -61,6 +61,23 @@ rules:
   - MATCH,🚀 节点选择
 `
 
+// clashSubWithNodes 造一份含 n 个家宽节点的精简订阅，组结构与 clashSubSample 一致。
+//
+// 用来测「按通过比例判断前置好不好」—— 样本太小（2 个节点）时比例没有意义。
+func clashSubWithNodes(n int) string {
+	var b strings.Builder
+	b.WriteString("mixed-port: 7890\nmode: rule\nexternal-controller: 127.0.0.1:9090\n\nproxies:\n")
+	for i := 1; i <= n; i++ {
+		fmt.Fprintf(&b, "  - name: \"🏠 N-%02d\"\n    type: openvpn\n    server: 10.0.0.%d\n    port: 1776\n    dialer-proxy: \"⚡ CF前置\"\n", i, i)
+	}
+	b.WriteString("proxy-groups:\n  - name: \"⚡ CF前置\"\n    type: url-test\n    url: https://www.gstatic.com/generate_204\n    proxies:\n      - \"优选域名-01\"\n      - \"联通-09\"\n      - \"联通-07\"\n  - name: \"🏠 家宽节点\"\n    type: select\n    proxies:\n")
+	for i := 1; i <= n; i++ {
+		fmt.Fprintf(&b, "      - \"🏠 N-%02d\"\n", i)
+	}
+	b.WriteString("  - name: \"🚀 节点选择\"\n    type: select\n    proxies:\n      - \"🏠 家宽节点\"\n      - DIRECT\n\nrules:\n  - MATCH,🚀 节点选择\n")
+	return b.String()
+}
+
 // newClashTestServerWith 造一个带家宽通道的 WebServer。
 //
 // payload 是假订阅源返回的内容，测「识别失败」的用例可以换成普通文本。
@@ -109,13 +126,26 @@ type fakeProber struct {
 	// 比在替身里堆一堆开关清楚得多。
 	probe func(name string) (int, error)
 	// frontSet 记录 SetFront 的调用序列（含最后那次「拨回原样」）。
-	// front 是前置组当前被固定到的节点，空串表示没动过。
+	// front 是「我们让它用哪个」，空串表示没动过。
 	frontSet []string
 	front    string
+	// refuse 记下「内核不会采用」的节点。
+	//
+	// 真实内核里 url-test 组的固定只是「偏好」：被固定的节点若在它自己的账本里
+	// 是「不活」（判据 = 能不能直接访问订阅里写的那个测速地址），PUT 过去 now
+	// 纹丝不动。盒子实测 216 个 CF 前置里约一半如此（2026-10-01）。
+	refuse map[string]bool
+	// probes 记录每次 ProxyDelay 的「内核当时实际在用哪个前置 + 被量的节点名」，
+	// 用 "<前置>|<节点>" 存。用来验「内核不采用的候选压根没去量」——
+	// 拒收时那次测量其实仍走在旧前置上，这个记录能把它抓出来。
+	probes []string
+	// frontGroup 前置组的组名（SetFront 时记下），拼 probes 时用。
+	frontGroup string
 }
 
 func newFakeProber() *fakeProber {
 	return &fakeProber{
+		frontGroup: "⚡ CF前置",
 		delays: map[string]int{
 			"🏠 JP-家宽-01": 480,
 			"🏠 KR-家宽-01": 620,
@@ -128,11 +158,23 @@ func newFakeProber() *fakeProber {
 	}
 }
 
-// currentFront 前置组此刻被固定到哪个节点（没动过时是空串）。
+// currentFront 「我们让它用哪个节点」（没动过时是空串）。
+// 注意它与 effectiveFront 的区别 —— 前者是意图，后者是内核的实际行为。
 func (f *fakeProber) currentFront() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.front
+}
+
+// effectiveFront 内核此刻**实际**在用哪个前置节点（对应真实内核 /proxies 的 now）。
+//
+// 与 currentFront 的区别正是本文件要测的那个坑：url-test 组固定节点时会先检查
+// 该节点在自己账本里活不活，不活就静默忽略、回退到它自己挑的那个。此时
+// currentFront 变了，effectiveFront 没变。
+func (f *fakeProber) effectiveFront(group string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.nows[group]
 }
 
 // frontCalls 返回 SetFront 的调用序列副本。
@@ -174,6 +216,7 @@ func (f *fakeProber) ProxyDelay(name string, timeoutMs int) (int, error) {
 	f.mu.Lock()
 	fn := f.probe
 	ms, ok := f.delays[name]
+	f.probes = append(f.probes, f.nows[f.frontGroup]+"|"+name)
 	f.mu.Unlock()
 	if fn != nil {
 		return fn(name)
@@ -184,12 +227,39 @@ func (f *fakeProber) ProxyDelay(name string, timeoutMs int) (int, error) {
 	return ms, nil
 }
 
+// probeCountUnder 数「测量发生时内核实际在用 front 这个前置」的次数。
+//
+// 内核拒收某个候选时，那一次测量其实仍走在旧前置上 —— 这个计数能把它抓出来。
+func (f *fakeProber) probeCountUnder(front string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, p := range f.probes {
+		if strings.HasPrefix(p, front+"|") {
+			n++
+		}
+	}
+	return n
+}
+
 // SetFront 对应真实内核的 PUT /proxies/{组}（内核侧是 ForceSet）。
+//
+// ★ 「固定」不等于「生效」：url-test 组只会在被固定的节点「活着」时才采用它，
+// 否则静默回退到自己挑的那个。refuse 里的节点用来模拟后者 —— 此时 frontSet
+// 记下了这次调用（PUT 确实发出去了），但 nows 不动（内核没采用）。
 func (f *fakeProber) SetFront(group, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.frontSet = append(f.frontSet, name)
+	f.frontGroup = group
 	f.front = name
+	if f.refuse[name] {
+		return nil
+	}
+	if f.nows == nil {
+		f.nows = map[string]string{}
+	}
+	f.nows[group] = name
 	return nil
 }
 
@@ -771,6 +841,170 @@ func TestPingClashGroupKeepsFrontWhenItWorks(t *testing.T) {
 	cfg.Unlock()
 	if pinned != "" {
 		t.Errorf("没换前置时不该落盘, FrontNode = %q", pinned)
+	}
+}
+
+// ★ 盒子实测出来的回归：前置「勉强能用」也必须换掉。
+//
+// 判据是**通过比例**，不是「有没有通」。盒子实测（2026-10-01）：
+//
+//	前置 = 联通-01（内核自动挑的）  同一批 6 个样本通 0 个，整组 65 个只测出 6 个
+//	前置 = 优选域名-03             同一批 6 个样本通 4 个
+//	前置 = 优选域名-04             同一批 6 个样本通 5 个
+//
+// 只要求「有一个通就算前置可用」，就会把 `联通-01` 这种放过去 ——
+// 表现出来就是「测速测出来的活节点没几个」，修复在最常见的场景下等于没生效。
+func TestPingClashGroupSwitchesWhenFrontIsBarelyUsable(t *testing.T) {
+	s, cfg, mhm, url := newClashTestServerWith(t, clashSubWithNodes(6))
+	seedClashGroup(t, cfg, mhm, "g1", "家宽", url)
+
+	f := s.prober.(*fakeProber)
+	f.mu.Lock()
+	f.nows = map[string]string{"⚡ CF前置": "优选域名-01"}
+	f.delays = map[string]int{"优选域名-01": 120}
+	f.probe = func(name string) (int, error) {
+		if !strings.HasPrefix(name, "🏠 ") {
+			return 120, nil // CF 节点自己的延迟，与家宽链无关
+		}
+		// 内核自动挑的那个前置：6 个样本只放 2 个过去（不到一半）
+		// 换成 联通-09 之后：全都通
+		if f.currentFront() == "联通-09" {
+			return 500, nil
+		}
+		if name == "🏠 N-01" || name == "🏠 N-02" {
+			return 500, nil
+		}
+		return 0, errors.New("节点无响应")
+	}
+	f.mu.Unlock()
+
+	req := httptest.NewRequest("POST", "/api/ping/group/g1", nil)
+	req.SetPathValue("id", "g1")
+	rec := httptest.NewRecorder()
+	s.apiPingGroup(rec, req)
+
+	var res []map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatalf("换前置之后应当照常返回节点结果, 实际 body=%s", rec.Body.String())
+	}
+	if len(res) != 6 {
+		t.Fatalf("应当返回 6 个节点的结果, 得到 %d (body=%s)", len(res), rec.Body.String())
+	}
+	if got := f.currentFront(); got != "联通-09" {
+		t.Errorf("前置只通 2/6（不到一半）时必须换掉, 实际停在 %q", got)
+	}
+	cfg.Lock()
+	pinned := cfg.FindClashGroup("g1").FrontNode
+	cfg.Unlock()
+	if pinned != "联通-09" {
+		t.Errorf("换好的前置没落盘, FrontNode = %q", pinned)
+	}
+}
+
+// ★ 盒子实测出来的第二个坑：url-test 组的「固定」只是偏好，不是强制。
+//
+// mihomo v1.19.31 adapter/outboundgroup/urltest.go 的 fast() 会先看被固定的节点
+// 在自己账本里活不活（判据 = 能不能直接访问订阅里写的那个测速地址），不活就
+// **静默忽略**、回退到它自己挑的那个。盒子实测 216 个 CF 前置里约一半 PUT 过去
+// now 纹丝不动（它们的延迟测试直接返回 503）。
+//
+// 不确认就会出大问题：「换上前置 c → 量样本」这一步量到的其实是内核回退后仍在
+// 用的那个节点，候选之间的比较全成噪声 —— 于是一个真正能用的前置可能被判成
+// 「没用」而放弃。所以内核不采用的候选必须跳过、继续试下一个。
+func TestPingClashGroupSkipsFrontKernelRefuses(t *testing.T) {
+	s, cfg, mhm, url := newClashTestServer(t)
+	seedClashGroup(t, cfg, mhm, "g1", "家宽", url)
+
+	f := s.prober.(*fakeProber)
+	f.mu.Lock()
+	f.nows = map[string]string{"⚡ CF前置": "优选域名-01"}
+	// 候选按内核记录的延迟从低到高排：联通-09(190) 在 联通-07(260) 前面
+	f.delays = map[string]int{"优选域名-01": 120, "联通-09": 190, "联通-07": 260}
+	// 内核不采用「联通-09」，只接受「联通-07」
+	f.refuse = map[string]bool{"联通-09": true}
+	f.probe = func(name string) (int, error) {
+		if !strings.HasPrefix(name, "🏠 ") {
+			return 120, nil
+		}
+		if f.effectiveFront("⚡ CF前置") == "联通-07" {
+			return 500, nil
+		}
+		return 0, errors.New("节点无响应")
+	}
+	f.mu.Unlock()
+
+	req := httptest.NewRequest("POST", "/api/ping/group/g1", nil)
+	req.SetPathValue("id", "g1")
+	rec := httptest.NewRecorder()
+	s.apiPingGroup(rec, req)
+
+	var res []map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatalf("应当照常返回节点结果, 实际 body=%s", rec.Body.String())
+	}
+	if len(res) != 2 {
+		t.Fatalf("应当返回 2 个节点的结果, 得到 %d (body=%s)", len(res), rec.Body.String())
+	}
+	if got := f.effectiveFront("⚡ CF前置"); got != "联通-07" {
+		t.Errorf("内核不采用的候选必须跳过、继续试下一个, 实际生效的是 %q", got)
+	}
+	cfg.Lock()
+	pinned := cfg.FindClashGroup("g1").FrontNode
+	cfg.Unlock()
+	if pinned != "联通-07" {
+		t.Errorf("真正生效的那个前置才该落盘, FrontNode = %q", pinned)
+	}
+	// ★ 被内核拒收的候选压根不该去量它的样本：量出来的是内核回退后仍在用的
+	// 那个节点（= 当前前置），除了白等十几秒、把「试过谁」的记录搞乱之外毫无意义。
+	// 判据是「在内核实际还用着旧前置时做了几次测量」—— 只有最初那一次体检该是
+	// 这个状态（样本 2 个 ⇒ 2 次）；漏掉这个判断就会多出一轮 = 4 次。
+	if n := f.probeCountUnder("优选域名-01"); n != 2 {
+		t.Errorf("内核实际仍用旧前置时测量了 %d 次, 期望 2 次 —— 内核不采用的候选不该被测量", n)
+	}
+}
+
+// 候选全都被内核拒收时，提示语要说清是「内核没用它们」，而不是「它们更差」——
+// 两者的处理建议完全不同（前者换一批前置，后者换一批家宽节点）。
+func TestPingClashGroupReportsWhenKernelRefusesAllCandidates(t *testing.T) {
+	s, cfg, mhm, url := newClashTestServer(t)
+	seedClashGroup(t, cfg, mhm, "g1", "家宽", url)
+
+	f := s.prober.(*fakeProber)
+	f.mu.Lock()
+	f.nows = map[string]string{"⚡ CF前置": "优选域名-01"}
+	f.delays = map[string]int{"优选域名-01": 120, "联通-09": 190, "联通-07": 260}
+	f.refuse = map[string]bool{"联通-09": true, "联通-07": true}
+	f.probe = func(name string) (int, error) { return 0, errors.New("节点无响应") }
+	f.mu.Unlock()
+
+	req := httptest.NewRequest("POST", "/api/ping/group/g1", nil)
+	req.SetPathValue("id", "g1")
+	rec := httptest.NewRecorder()
+	s.apiPingGroup(rec, req)
+
+	var resp map[string]string
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	msg := resp["error"]
+	for _, want := range []string{"内核一个都没采用", "联通-09", "联通-07"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("提示里应当包含 %q, 实际: %q", want, msg)
+		}
+	}
+	// 一个都没生效 ⇒ 不该落盘
+	cfg.Lock()
+	pinned := cfg.FindClashGroup("g1").FrontNode
+	cfg.Unlock()
+	if pinned != "" {
+		t.Errorf("没有候选真正生效时不该落盘, FrontNode = %q", pinned)
+	}
+}
+
+// 「够用」的门槛是样本的一半（向上取整）。
+func TestFrontMinAliveIsHalf(t *testing.T) {
+	for n, want := range map[int]int{0: 0, 1: 1, 2: 1, 3: 2, 4: 2, 6: 3, 8: 4} {
+		if got := frontMinAlive(n); got != want {
+			t.Errorf("frontMinAlive(%d) = %d, 期望 %d", n, got, want)
+		}
 	}
 }
 

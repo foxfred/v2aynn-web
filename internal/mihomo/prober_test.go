@@ -370,9 +370,9 @@ func TestDefaultTestURLIsHTTPS(t *testing.T) {
 	}
 }
 
-// AnyAlive 用来判断「前置通道此刻能不能承载家宽链」：拿几个真实家宽节点
-// 试一下，有一个通就说明前置可用。
-func TestAnyAliveReturnsTrueOnFirstSuccess(t *testing.T) {
+// CountAlive 用来判断「前置通道此刻能不能承载家宽链」：拿几个真实家宽节点
+// 试一下，按通过比例判断。
+func TestCountAliveStopsOnceEnough(t *testing.T) {
 	names := []string{"n0", "n1", "n2", "n3"}
 	var mu sync.Mutex
 	calls := map[string]int{}
@@ -380,46 +380,56 @@ func TestAnyAliveReturnsTrueOnFirstSuccess(t *testing.T) {
 		mu.Lock()
 		calls[name]++
 		mu.Unlock()
-		if name == "n0" {
+		if name == "n0" || name == "n1" {
 			return 300, nil
 		}
 		return 0, fmt.Errorf("节点无响应")
 	})
 
-	if !AnyAlive(d, names, 1000, 1) {
-		t.Fatal("有一个节点通时应当返回 true")
+	// 只需要 2 个：串行跑时数够就该收工，不该再等后面几个超时
+	if got := CountAlive(d, names, 2, 1000, 1); got != 2 {
+		t.Fatalf("CountAlive = %d, 期望 2", got)
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	// 串行跑（并发 1）时，n0 通了就该立刻收工，不该再等后面几个超时
-	if len(calls) != 1 {
-		t.Errorf("已经测通了还在继续测, 实际试过 %v", calls)
+	if len(calls) != 2 {
+		t.Errorf("已经数够了还在继续测, 实际试过 %v", calls)
 	}
 }
 
-// 一个都不通时必须返回 false —— 这正是「换前置」的触发条件。
-func TestAnyAliveFalseWhenAllDead(t *testing.T) {
+// 一个都不通时返回 0 —— 这正是「换前置」的触发条件。
+func TestCountAliveZeroWhenAllDead(t *testing.T) {
 	d := delayTesterFunc(func(name string, timeoutMs int) (int, error) {
 		return 0, fmt.Errorf("节点无响应")
 	})
-	if AnyAlive(d, []string{"n0", "n1"}, 1000, 2) {
-		t.Error("全都不通时应当返回 false")
+	if got := CountAlive(d, []string{"n0", "n1"}, 1, 1000, 2); got != 0 {
+		t.Errorf("全都不通时应当返回 0, 得到 %d", got)
 	}
 }
 
-// 样本为空时直接返回 false，不能因为「没有证据」就认定前置可用。
-func TestAnyAliveEmptySample(t *testing.T) {
+// 通得比 limit 多时只报到 limit —— 调用方只关心「够没够」。
+func TestCountAliveClampsToLimit(t *testing.T) {
+	d := delayTesterFunc(func(name string, timeoutMs int) (int, error) {
+		return 300, nil
+	})
+	if got := CountAlive(d, []string{"n0", "n1", "n2"}, 2, 1000, 3); got != 2 {
+		t.Errorf("CountAlive = %d, 期望被截到 2", got)
+	}
+}
+
+// 样本为空时直接返回 0，不能因为「没有证据」就认定前置可用。
+func TestCountAliveEmptySample(t *testing.T) {
 	d := delayTesterFunc(func(name string, timeoutMs int) (int, error) {
 		t.Error("样本为空时不该发起任何测量")
 		return 0, nil
 	})
-	if AnyAlive(d, nil, 1000, 2) {
-		t.Error("样本为空时应当返回 false")
+	if got := CountAlive(d, nil, 1, 1000, 2); got != 0 {
+		t.Errorf("样本为空时应当返回 0, 得到 %d", got)
 	}
 }
 
 // 抽样也要限并发：样本虽小，同样挤在同一条前置通道上。
-func TestAnyAliveRespectsConcurrency(t *testing.T) {
+func TestCountAliveRespectsConcurrency(t *testing.T) {
 	names := make([]string, 12)
 	for i := range names {
 		names[i] = fmt.Sprintf("n%02d", i)
@@ -440,7 +450,7 @@ func TestAnyAliveRespectsConcurrency(t *testing.T) {
 		return 0, fmt.Errorf("节点无响应")
 	})
 
-	AnyAlive(d, names, 1000, 3)
+	CountAlive(d, names, 6, 1000, 3)
 	if peak > 3 {
 		t.Errorf("并发峰值 = %d, 不应超过 3", peak)
 	}

@@ -702,6 +702,14 @@ func (m *Manager) applyFront() error {
 	if err := m.putProxy(front, node); err != nil {
 		return fmt.Errorf("固定前置通道[%s]到[%s]失败: %w", front, node, err)
 	}
+	// ★ 固定只是「偏好」，不是「强制」。内核 fast() 会先检查这个节点在它自己
+	// 的账本里活不活（判据是能不能直接访问订阅里写的那个测速地址），不活就
+	// 静默忽略、继续用它自己挑的那个 —— 盒子实测 216 个 CF 前置里约一半如此。
+	// 这里读一次 now 把结论写进日志，免得「明明固定了却没生效」变成查不出来的悬案。
+	if now, err := m.ProxyNow(front); err == nil && now != node {
+		log.Printf("前置通道[%s]已按记录固定到[%s]，但内核此刻仍在用[%s] —— 内核认为[%s]不活（它的判据是能不能直接访问订阅里的测速地址，与能否承载家宽链无关）",
+			front, node, now, node)
+	}
 	return nil
 }
 
