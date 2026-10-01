@@ -69,6 +69,33 @@ const (
 	// 拉订阅大概率失败，那就成死锁了。
 	legacySubFileName = "clash-sub.yaml"
 
+	// --- 普通节点健康看护（自动故障转移）的节奏 ---
+	//
+	// 普通节点配置里只有一个 select 组，而 select 组不会自己换节点 ——
+	// 当前节点挂了，mihomo 会老老实实继续用它，用户的网就是不通。
+	// xray 时代靠「节点不通 → 进程起不来 → 崩溃 4 次 → tryFailover」兜住，
+	// mihomo 加载配置时不校验节点连通性，这条链根本不存在，所以要自己看护。
+	//
+	// 节奏参考 xray 那套：它要等进程崩溃 4 次，实际也是几十秒到一分多钟才动作。
+	// 30 秒探一次、连续 3 次失败才换，等于给 90 秒的容忍窗口 ——
+	// 既不会因为一次网络抖动就换节点，也不会让用户干等太久。
+
+	// healthProbeInterval 两次探测之间的间隔。
+	healthProbeInterval = 30 * time.Second
+	// healthFailThreshold 连续失败几次才判定当前节点不可用。
+	healthFailThreshold = 3
+	// healthProbeTimeoutMs 单次探测的超时（毫秒），由内核侧计时。
+	healthProbeTimeoutMs = 6000
+	// healthMaxTry 一轮故障里最多尝试换几个节点，防止在坏节点之间反复横跳。
+	healthMaxTry = 3
+	// healthMaxTotalTry 一轮故障里累计最多试几个节点，超了就放弃等待人工介入。
+	//
+	// 没有这个上限的话，万一整份订阅都挂了（810 个节点全不通），程序会一个接一个
+	// 换下去，90 秒换一个、换满 20 个小时 —— 用户看到的就是「节点名自己在乱跳」。
+	// 试满 8 个还不通，基本可以断定不是节点的问题（订阅过期 / 本地断网），
+	// 停下来比继续折腾更有用。探测一旦成功就会自动复位，不会卡死。
+	healthMaxTotalTry = 8
+
 	// subFilePrefix / subFileSuffix 每个家宽分组各存一份订阅原文，便于排查与离线重载。
 	subFilePrefix = "clash-sub-"
 	subFileSuffix = ".yaml"
@@ -128,6 +155,16 @@ type Manager struct {
 	restartCount int
 	lastRestart  time.Time
 	restartMu    sync.Mutex
+
+	// --- 普通节点健康看护（自动故障转移）---
+	//
+	// healthMu 单独一把锁，不塞进 m.mu：探测本身要发 HTTP 请求，
+	// 持着内核锁做网络 IO 会把 Status()/Nodes() 这些读接口一起卡住。
+	healthMu   sync.Mutex
+	healthOn   bool            // 看护循环是否已启动（只启一次）
+	failCount  int             // 当前节点连续探测失败次数
+	failTried  map[string]bool // 本轮故障里已经试过的节点 ID，避免来回换同一个
+	failGaveUp bool            // 本轮已放弃，避免每 30 秒重复刷同一句日志
 
 	// ctrlAddr 覆盖 external-controller 的地址，仅测试用。
 	// 留空时用 127.0.0.1:ControlPort（生产路径永远走这个）。
@@ -316,8 +353,192 @@ func (m *Manager) Start() error {
 	}()
 
 	go m.watch(m.cmd)
+	m.ensureHealthLoop()
 	log.Printf("mihomo 已启动 (节点 %d 个)", len(m.nodes))
 	return nil
+}
+
+// ensureHealthLoop 启动普通节点健康看护，只会起一次。
+//
+// 放在 Start 而不是 NewManager：没启动过内核的 Manager（大量单元测试、
+// 以及未部署内核的环境）不该挂着一个每 30 秒醒一次的 goroutine。
+func (m *Manager) ensureHealthLoop() {
+	m.healthMu.Lock()
+	defer m.healthMu.Unlock()
+	if m.healthOn {
+		return
+	}
+	m.healthOn = true
+	go m.healthLoop()
+}
+
+// healthLoop 定期检查「当前普通节点还能不能用」，不行就自动换一个。
+func (m *Manager) healthLoop() {
+	t := time.NewTicker(healthProbeInterval)
+	defer t.Stop()
+	for range t.C {
+		m.healthTick()
+	}
+}
+
+// healthTick 一次健康检查。
+//
+// 探测走内核控制口的 /proxies/{节点名}/delay —— 那是内核**直连该节点**发一个
+// HEAD 请求，不经过规则分流。这一点很关键：走本程序的代理口去探测的话，
+// 像 www.gstatic.com 这种被墙内 DNS 污染成国内 IP 的目标会命中 GEOIP,CN,DIRECT
+// 走直连，节点明明是死的也会「探测成功」（2026-10-01 真机踩过）。
+func (m *Manager) healthTick() {
+	if m.cfg == nil {
+		return
+	}
+	m.cfg.Lock()
+	enabled := m.cfg.FailoverEnabled()
+	m.cfg.Unlock()
+	if !enabled {
+		m.clearFailover()
+		return
+	}
+	// 家宽模式不管：家宽配置是订阅原文，里面有内核自己的 url-test 组负责往下换。
+	// 内核没在跑时也不管：那时探测必然失败，会把失败计数刷满。
+	if !m.IsNormalMode() || !m.IsRunning() {
+		m.clearFailover()
+		return
+	}
+
+	name, ok := m.activeNormalName()
+	if !ok || name == "" {
+		return
+	}
+
+	_, err := ctrlProxyDelay(m.controlAddr(), name, healthProbeTimeoutMs, defaultTestURL)
+	if err == nil {
+		m.noteHealthy(name)
+		return
+	}
+
+	n := m.bumpFail(name, err)
+	if n < healthFailThreshold {
+		return
+	}
+	m.tryFailover()
+}
+
+// activeNormalName 当前普通节点在**内核里**的名字（不是界面上的 ID）。
+func (m *Manager) activeNormalName() (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.normalMode {
+		return "", false
+	}
+	return m.activeName, true
+}
+
+func (m *Manager) noteHealthy(name string) {
+	m.healthMu.Lock()
+	wasFailing := m.failCount > 0
+	m.failCount = 0
+	m.failTried = nil
+	m.failGaveUp = false
+	m.healthMu.Unlock()
+	if wasFailing {
+		log.Printf("节点[%s]已恢复", name)
+	}
+}
+
+// bumpFail 记一次失败并返回累计次数。只在刚达到阈值那一次写日志，
+// 之后每 30 秒重复刷同一句会把日志淹掉。
+func (m *Manager) bumpFail(name string, cause error) int {
+	m.healthMu.Lock()
+	m.failCount++
+	n := m.failCount
+	m.healthMu.Unlock()
+	if n == healthFailThreshold {
+		log.Printf("节点[%s]连续 %d 次探测失败(%v)，尝试自动故障转移", name, n, cause)
+	}
+	return n
+}
+
+// clearFailover 清掉看护状态（用户关了开关、切到家宽、内核停了）。
+func (m *Manager) clearFailover() {
+	m.healthMu.Lock()
+	m.failCount = 0
+	m.failTried = nil
+	m.failGaveUp = false
+	m.healthMu.Unlock()
+}
+
+// tryFailover 当前节点连续失败后，自动切换到其他可用节点。
+//
+// 与 xray 那套的差别：xray 是「进程起不来」触发，这里是「内核探测不通」触发；
+// 候选排序（可达优先 → 延迟升序）与最多尝试次数保持一致，都走 config.FailoverOrder。
+func (m *Manager) tryFailover() {
+	m.healthMu.Lock()
+	if m.failGaveUp {
+		m.healthMu.Unlock()
+		return
+	}
+	if len(m.failTried) >= healthMaxTotalTry {
+		m.failGaveUp = true
+		m.healthMu.Unlock()
+		log.Printf("自动故障转移: 已连续试过 %d 个节点都不通，停止自动切换，请检查订阅或网络后手动选择节点",
+			healthMaxTotalTry)
+		return
+	}
+	tried := make(map[string]bool, len(m.failTried)+healthMaxTry)
+	for id := range m.failTried {
+		tried[id] = true
+	}
+	m.healthMu.Unlock()
+
+	m.cfg.Lock()
+	all := m.cfg.NormalNodes()
+	cur := m.cfg.ActiveNode
+	m.cfg.Unlock()
+
+	// 把「正在失败的这个」也记进已试列表。只记切换目标是不够的：
+	// 换走之后再挑候选时，原节点会重新回到候选里，于是又换回去，
+	// 在两个坏节点之间来回横跳（单测 TestFailoverMovesOnToUntriedNodes 抓到过）。
+	if cur != "" {
+		m.markTried(cur)
+	}
+
+	cands := config.FailoverOrder(all, cur, tried)
+	if len(cands) == 0 {
+		m.healthMu.Lock()
+		m.failGaveUp = true
+		m.healthMu.Unlock()
+		log.Printf("自动故障转移: 已经没有没试过的节点了，停止自动切换，请手动选择节点")
+		return
+	}
+
+	if len(cands) > healthMaxTry {
+		cands = cands[:healthMaxTry]
+	}
+	for _, n := range cands {
+		m.markTried(n.ID)
+		log.Printf("自动故障转移: 尝试切换到[%s]", n.Name)
+		if err := m.SwitchNormalNode(n.ID); err != nil {
+			log.Printf("自动故障转移: 切到[%s]失败: %v", n.Name, err)
+			continue
+		}
+		log.Printf("自动故障转移成功 -> [%s]", n.Name)
+		// 只清失败计数，**不清 failTried** —— 新节点还没验证过，
+		// 万一是坏的，下一轮要从「没试过的」里接着挑，而不是又回到刚才那个。
+		m.healthMu.Lock()
+		m.failCount = 0
+		m.healthMu.Unlock()
+		return
+	}
+	log.Printf("自动故障转移失败: 本轮尝试的 %d 个节点都没切成功", len(cands))
+}
+
+func (m *Manager) markTried(id string) {
+	m.healthMu.Lock()
+	if m.failTried == nil {
+		m.failTried = map[string]bool{}
+	}
+	m.failTried[id] = true
+	m.healthMu.Unlock()
 }
 
 // restoreSelection 内核就绪之后，把用户选的节点与测速验过的前置重新应用一遍。
@@ -414,6 +635,9 @@ func (m *Manager) Stop() {
 	}
 	m.running = false
 	m.cmd = nil
+	// 内核停了就没有「当前节点通不通」可言，把看护状态清干净 ——
+	// 否则下次启动会带着上一次的失败计数，可能刚起来就误判并换节点。
+	m.clearFailover()
 }
 
 // SwitchNode 切换家宽节点。name 为订阅里的节点名。

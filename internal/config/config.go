@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -239,6 +240,40 @@ func (c *Config) NormalNodes() []Node {
 // FailoverEnabled 自动故障转移是否开启（未显式设置时默认开启）
 func (c *Config) FailoverEnabled() bool {
 	return c.AutoFailover == nil || *c.AutoFailover
+}
+
+// FailoverOrder 按「可达优先 → 延迟升序」排出替补候选，排除 exclude 与 skip 里的节点。
+//
+// 放在 config 包而不是各自的 manager 里，是因为有两个调用方：
+// xray 的进程看护循环（v2ray.Manager.tryFailover）和 mihomo 的节点看护循环
+// （mihomo.Manager.tryFailover）。两处的挑选标准必须一致，否则会出现
+// 「进程看护挑的和节点看护挑的不是同一个」这种莫名其妙的行为。
+//
+// skip 传 nil 表示不排除任何节点。调用方需自行持有 c 的锁。
+func FailoverOrder(all []Node, exclude string, skip map[string]bool) []Node {
+	cands := make([]Node, 0, len(all))
+	for _, n := range all {
+		if n.ID == exclude {
+			continue
+		}
+		if skip != nil && skip[n.ID] {
+			continue
+		}
+		cands = append(cands, n)
+	}
+	// 可达节点优先，其次按延迟升序
+	sort.SliceStable(cands, func(i, j int) bool {
+		pi, pj := cands[i].Ping, cands[j].Ping
+		vi, vj := pi > 0, pj > 0
+		if vi != vj {
+			return vi
+		}
+		if !vi {
+			return false
+		}
+		return pi < pj
+	})
+	return cands
 }
 
 // FindNode 按ID在所有分组中查找节点

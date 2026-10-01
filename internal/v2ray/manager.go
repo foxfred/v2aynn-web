@@ -7,7 +7,6 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"sort"
 	"sync"
 	"time"
 
@@ -212,31 +211,12 @@ type nodePick struct {
 
 // failoverOrder 按「可达优先 → 延迟升序」排出候选节点，排除 exclude。
 //
-// 抽出来是因为有两个调用方：tryFailover（节点反复崩溃时换人）和
-// Start（开机时发现原节点已消失）。两处的挑选标准必须一致，否则会出现
-// 「开机挑的和故障转移挑的不是同一个」这种莫名其妙的行为。
+// 实现已挪到 config.FailoverOrder —— mihomo 侧的节点看护循环也要用同一套挑选标准，
+// 两处各写一份迟早会漂移。这里保留函数名只是为了不动调用点。
 //
 // 调用方需自行持有 cfg 锁。
 func failoverOrder(all []config.Node, exclude string) []config.Node {
-	cands := make([]config.Node, 0, len(all))
-	for _, n := range all {
-		if n.ID != exclude {
-			cands = append(cands, n)
-		}
-	}
-	// 可达节点优先，其次按延迟升序
-	sort.SliceStable(cands, func(i, j int) bool {
-		pi, pj := cands[i].Ping, cands[j].Ping
-		vi, vj := pi > 0, pj > 0
-		if vi != vj {
-			return vi
-		}
-		if !vi {
-			return false
-		}
-		return pi < pj
-	})
-	return cands
+	return config.FailoverOrder(all, exclude, nil)
 }
 
 // pickFailoverNodeLocked 挑一个替补节点。与 tryFailover 的区别是它只读配置、
